@@ -50,12 +50,6 @@ def detect_source(path: Path):
     data = json.loads(path.read_text())
     return "chatgpt" if "mapping" in data[0] else "claude" if "chat_messages" in data[0] else "chatgpt"
 
-def parse_source(path: Path, source: Optional[str] = None) -> ParseResult:
-    parsers = {"chatgpt": parse_chatgpt, "claude": parse_claude, "claude-code": parse_claude_code, "codex": parse_codex}
-    src = source or detect_source(path)
-    if src not in parsers: raise ValueError(f"Unknown source: {src}")
-    return parsers[src](path)
-
 def latest_mtime(path: Path, glob: str = "*.jsonl"):
     return max((p.stat().st_mtime for p in path.rglob(glob)), default=0)
 
@@ -244,6 +238,12 @@ class ParseResult:
     def __init__(self, convs=None, msgs=None, tools=None, attachs=None, artifacts=None, edits=None):
         self.convs, self.msgs, self.tools = convs or [], msgs or [], tools or []
         self.attachs, self.artifacts, self.edits = attachs or [], artifacts or [], edits or []
+
+def parse_source(path: Path, source: Optional[str] = None) -> ParseResult:
+    parsers = {"chatgpt": parse_chatgpt, "claude": parse_claude, "claude-code": parse_claude_code, "codex": parse_codex}
+    src = source or detect_source(path)
+    if src not in parsers: raise ValueError(f"Unknown source: {src}")
+    return parsers[src](path)
 
 # ---- web fetchers ----
 def fetch_chatgpt(browser: str = "safari", limit: int = 0) -> ParseResult:
