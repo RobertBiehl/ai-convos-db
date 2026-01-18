@@ -2,7 +2,7 @@
 set -euo pipefail
 
 repo="https://github.com/RobertBiehl/ai-convos-db.git"
-script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]-$0}")" && pwd)"
 repo_root="$(cd "$script_dir/.." && pwd)"
 install_dir="${CONVOS_INSTALL_DIR:-$HOME/.local/share/ai-convos-db}"
 bin_dir="${CONVOS_BIN_DIR:-$HOME/.local/bin}"
