@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+venv="$root/.venv/bin/python"
+
+if [ ! -x "$venv" ]; then
+  if command -v uv >/dev/null 2>&1; then
+    echo "Setting up venv with uv..."
+    (cd "$root" && uv sync) || { echo "uv sync failed; run it manually outside sandbox."; exit 1; }
+  else
+    echo "Missing venv and uv. Install uv, then run: uv sync" >&2
+    echo "See: https://github.com/astral-sh/uv" >&2
+    exit 1
+  fi
+fi
+
+exec "$venv" -m ai_convos "$@"

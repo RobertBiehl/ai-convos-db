@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+set -euo pipefail
+root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+export UV_CACHE_DIR="${UV_CACHE_DIR:-$root/.uv-cache}"
+exec uv "$@"
