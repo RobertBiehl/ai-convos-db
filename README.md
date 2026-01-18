@@ -6,7 +6,7 @@
 
 ## Quick install
 ```bash
-wget -qO- https://raw.githubusercontent.com/RobertBiehl/ai-convos-db/main/scripts/install.sh | bash
+wget -qO- https://raw.githubusercontent.com/RobertBiehl/ai-convos-db/master/scripts/install.sh | bash
 ```
 
 Local-first, searchable archive for ChatGPT, Claude, and Codex conversations. One file, one DB, fast full-text search.
@@ -31,7 +31,7 @@ Local-first, searchable archive for ChatGPT, Claude, and Codex conversations. On
 One-line install (adds `convos` to PATH):
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/RobertBiehl/ai-convos-db/main/scripts/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/RobertBiehl/ai-convos-db/master/scripts/install.sh | bash
 ```
 
 Install skills (Codex + Claude Code):

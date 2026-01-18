@@ -501,13 +501,20 @@ def parse_codex(codex_dir: Path, files: list[Path] | None = None) -> ParseResult
         tools=[t for s in sessions for t in s["tools"]], edits=[e for s in sessions for e in s["edits"]])
 
 def upsert(conn, r: ParseResult):
+    cids, mids = [c["id"] for c in r.convs], [m["id"] for m in r.msgs]
+    cur = conn.execute
+    existing = set(cur(f"SELECT id FROM conversations WHERE id IN ({','.join(['?']*len(cids))})", cids).fetchall()) if cids else set()
+    existing_msgs = set(cur(f"SELECT id FROM messages WHERE id IN ({','.join(['?']*len(mids))})", mids).fetchall()) if mids else set()
+    new_convs = set(cids) - {x[0] for x in existing}
+    new_msgs = set(mids) - {x[0] for x in existing_msgs}
+    updated = {m["conversation_id"] for m in r.msgs if m["id"] in new_msgs} - new_convs
     for c in r.convs: conn.execute("INSERT OR REPLACE INTO conversations VALUES (?,?,?,?,?,?,?,?,?,?)", list(c.values()))
     for m in r.msgs: conn.execute("INSERT OR REPLACE INTO messages VALUES (?,?,?,?,?,?,?,?)", list(m.values()))
     for t in r.tools: conn.execute("INSERT OR REPLACE INTO tool_calls VALUES (?,?,?,?,?,?,?,?)", list(t.values()))
     for a in r.attachs: conn.execute("INSERT OR REPLACE INTO attachments VALUES (?,?,?,?,?,?,?,?)", list(a.values()))
     for a in r.artifacts: conn.execute("INSERT OR REPLACE INTO artifacts VALUES (?,?,?,?,?,?,?,?)", list(a.values()))
     for e in r.edits: conn.execute("INSERT OR REPLACE INTO file_edits VALUES (?,?,?,?,?,?)", list(e.values()))
-    return len(r.convs), len(r.msgs), len(r.tools), len(r.attachs), len(r.edits)
+    return len(r.convs), len(r.msgs), len(r.tools), len(r.attachs), len(r.edits), len(new_convs), len(updated)
 
 # ---- commands ----
 @app.command()
@@ -781,12 +788,12 @@ def sync(watch: bool = typer.Option(False, "-w"), interval: int = typer.Option(3
         errors = []
         for b in [x for x in order if x]:
             try:
-                head = probe(b)
-                if head is not None and head == pref.get("head"): set_state("web", name, {"browser": b, "head": head}); return None
+                head = probe(b); lu = head.split(":", 1)[1] if (name == "claude" and head and ":" in head) else None
+                if head is not None and head == pref.get("head"):
+                    set_state("web", name, {"browser": b, "head": head, **({"last_updated": lu} if lu else {})}); return None
                 last = pref.get("last_updated")
                 since = ts_from_iso(last) if (name == "claude" and last) else None
-                last_updated = head.split(":", 1)[1] if (name == "claude" and head and ":" in head) else None
-                st = {"browser": b, "head": head, **({"last_updated": last_updated} if last_updated else {})}
+                st = {"browser": b, "head": head, **({"last_updated": lu} if lu else {})}
                 func = (lambda b=b, since=since: fetcher(b, since=since)) if name == "claude" else (lambda b=b: fetcher(b))
                 return dict(name=name, label=name.title(), source=name, func=func, state=("web", name, st))
             except Exception as e:
@@ -800,7 +807,7 @@ def sync(watch: bool = typer.Option(False, "-w"), interval: int = typer.Option(3
         return dict(name=f"import:{path}", label=f"import:{path}", func=lambda p=path: parse_source(p), state=("imports", str(path), {"mtime": mtime}))
     def do_sync():
         nonlocal dirty
-        t0 = time.perf_counter(); dirty, total, changed, jobs = False, [0]*5, False, []
+        t0 = time.perf_counter(); dirty, total, changed, jobs, newc, updc = False, [0]*5, False, [], 0, 0
         cur = counts_by_source(conn); fmt = lambda v: f"{v[0]} convs, {v[1]} msgs, {v[2]} tools, {v[3]} attachs, {v[4]} edits"
         start = lambda label, src=None: typer.echo(f"Syncing {label}" if not src else f"Syncing {label} ({fmt(cur.setdefault(src, [0]*5))})")
         if paths := [Path(p).expanduser() for p in os.environ.get("CONVOS_IMPORT_PATHS", "").split(",") if p.strip()]:
@@ -820,20 +827,21 @@ def sync(watch: bool = typer.Option(False, "-w"), interval: int = typer.Option(3
                     j = futs[fut]
                     try: r = fut.result()
                     except Exception as e: typer.echo(f"{j['name']} failed: {e}"); continue
-                    c, m, t, a, e = upsert(conn, r)
+                    c, m, t, a, e, n, u = upsert(conn, r)
                     total = [total[i]+v for i, v in enumerate([c, m, t, a, e])]
+                    newc, updc = newc+n, updc+u
                     changed |= any([c, m, t, a, e])
                     if st := j.get("state"): set_state(*st)
-                    if src := j.get("source"): typer.echo(f"Synced {j['label']} ({fmt([c, m, t, a, e])} processed){' in %.2fs' % (time.perf_counter()-j['t']) if verbose else ''}")
+                    if src := j.get("source"): typer.echo(f"Updated {j['label']} ({n} new, {u} updated convs; {fmt([c, m, t, a, e])} processed){' in %.2fs' % (time.perf_counter()-j['t']) if verbose else ''}")
         if changed: rebuild_fts_index(conn)
         if dirty: save_state(state)
         verbose and typer.echo(f"Total sync time {time.perf_counter()-t0:.2f}s")
-        return total
+        return total, newc, updc
     if watch:
         typer.echo(f"Daemon mode (interval: {interval}s)")
-        while True: r = do_sync(); typer.echo(f"[{datetime.now().isoformat()}] {r[0]} convs, {r[1]} msgs, {r[2]} tools, {r[3]} attachs, {r[4]} edits"); time.sleep(interval)
+        while True: r, n, u = do_sync(); typer.echo(f"[{datetime.now().isoformat()}] {n} new, {u} updated convs; {r[1]} msgs, {r[2]} tools, {r[3]} attachs, {r[4]} edits"); time.sleep(interval)
     else:
-        r = do_sync(); typer.echo(f"Synced {r[0]} convs, {r[1]} msgs, {r[2]} tools, {r[3]} attachs, {r[4]} edits")
+        r, n, u = do_sync(); typer.echo(f"Updated {n} new, {u} updated convs; {r[1]} msgs, {r[2]} tools, {r[3]} attachs, {r[4]} edits")
         cur = counts_by_source(conn); fmt = lambda v: f"{v[0]} convs, {v[1]} msgs, {v[2]} tools, {v[3]} attachs, {v[4]} edits"; total = [sum(v[i] for v in cur.values()) for i in range(5)]; typer.echo(f"Total: {fmt(total)}"); conn.close()
 
 @app.command()
