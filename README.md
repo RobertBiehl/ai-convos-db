@@ -88,6 +88,40 @@ convos export out.json -f json
 convos export out.csv -f csv -s claude
 ```
 
+## Example output
+
+```bash
+convos sync
+```
+```text
+Syncing Claude Code (2 convs, 118 msgs, 12 tools, 0 attachs, 4 edits)
+Syncing Codex (8 convs, 214 msgs, 19 tools, 0 attachs, 0 edits)
+Syncing ChatGPT (142 convs, 1734 msgs, 97 tools, 12 attachs, 0 edits)
+Syncing Claude (96 convs, 842 msgs, 0 tools, 5 attachs, 0 edits)
+Updated Codex (0 new, 1 updated convs; 0 convs, 9 msgs, 0 tools, 0 attachs, 0 edits processed)
+Updated 0 new, 1 updated convs; 9 msgs, 0 tools, 0 attachs, 0 edits
+Total: 248 convs, 2908 msgs, 128 tools, 17 attachs, 4 edits
+```
+
+```bash
+convos search "vector database" -s chatgpt -d 30
+```
+```text
+f2b9c5a9  ChatGPT  "Indexing embeddings with DuckDB"  2026-01-14T09:22:11Z
+8a1d0c3e  ChatGPT  "Choosing ANN libraries"           2026-01-10T18:03:42Z
+```
+
+```bash
+convos show f2b9c5a9 --tools --thinking
+```
+```text
+ChatGPT  Indexing embeddings with DuckDB  2026-01-14T09:22:11Z
+user: How do I store vectors in DuckDB?
+assistant: Use a table with a FLOAT[] column and an HNSW index...
+tool: web.search {"q":"duckdb hnsw index"}
+assistant: Here's a minimal schema and index setup...
+```
+
 ## Data model
 
 Data lives in `data/convos.db` (DuckDB) with these core tables:
