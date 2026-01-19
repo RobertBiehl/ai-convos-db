@@ -406,9 +406,15 @@ def parse_claude(path: Path) -> ParseResult:
     return ParseResult(convs=[p["conv"] for p in parsed], msgs=[m for p in parsed for m in p["msgs"]],
                       attachs=[a for p in parsed for a in p["attachs"]])
 
+def load_jsonl(path: Path) -> list[dict]:
+    def loads(line):
+        try: return json.loads(line)
+        except Exception: return None
+    return [e for line in path.read_text().splitlines() if line.strip() and (e := loads(line))]
+
 def parse_claude_code_session(jsonl: Path) -> dict:
     """Parse single Claude Code session, returns dict with conv, msgs, tools, edits or None if empty."""
-    events = [json.loads(line) for line in jsonl.read_text().splitlines() if line.strip()]
+    events = load_jsonl(jsonl)
     if not events: return None
     cid, src = gen_id("claude-code", str(jsonl)), "claude-code"
     timestamps = [ts_from_iso(e["timestamp"]) for e in events if "timestamp" in e]
@@ -454,7 +460,7 @@ def parse_claude_code(projects_dir: Path, files: list[Path] | None = None) -> Pa
 
 def parse_codex_session(jsonl: Path) -> dict | None:
     """Parse single Codex session, returns dict with conv, msgs, tools, edits or None if empty."""
-    events = [json.loads(line) for line in jsonl.read_text().splitlines() if line.strip()]
+    events = load_jsonl(jsonl)
     if not events: return None
     cid, src = gen_id("codex", str(jsonl)), "codex"
     timestamps = [ts_from_iso(e["timestamp"]) for e in events if "timestamp" in e]
@@ -463,6 +469,8 @@ def parse_codex_session(jsonl: Path) -> dict | None:
 
     def extract_msg_text(p):
         return "\n".join(b["text"] for b in p.get("content", []) if isinstance(b, dict) and b.get("type") in ("input_text", "output_text", "text") and b.get("text"))
+    def norm_args(p):
+        return json.loads(a) if isinstance((a := p.get("arguments", {})), str) else a
 
     msgs = [dict(id=gen_id(src, f"{cid}:{i}"), conversation_id=cid, role=p["role"], content=text.strip(),
                 thinking=None, created_at=timestamps[i] if i < len(timestamps) else None, model=None, metadata="{}")
@@ -470,20 +478,21 @@ def parse_codex_session(jsonl: Path) -> dict | None:
     if not msgs: return None
 
     tools = [dict(id=gen_id(src, f"tool:{cid}:{i}"), message_id=gen_id(src, f"{cid}:{i}"), tool_name=p["name"],
-                 input=json.dumps(p.get("arguments", {})), output="{}", status="pending", duration_ms=None,
+                 input=json.dumps(args), output="{}", status="pending", duration_ms=None,
                  created_at=timestamps[i] if i < len(timestamps) else None)
-            for i, p in items if p.get("type") == "function_call"] + \
+            for i, p in items if p.get("type") == "function_call" and (args := norm_args(p))] + \
            [dict(id=gen_id(src, f"toolout:{cid}:{i}"), message_id=gen_id(src, f"{cid}:{i}"), tool_name=p.get("call_id"),
                  input="{}", output=json.dumps(p.get("output", "")), status="complete", duration_ms=None,
                  created_at=timestamps[i] if i < len(timestamps) else None)
             for i, p in items if p.get("type") == "function_call_output"]
 
     edits = [dict(id=gen_id(src, f"edit:{cid}:{i}:{j}"), message_id=gen_id(src, f"{cid}:{i}"),
-                 file_path=m.group(1), edit_type="shell", content=p["arguments"]["command"],
+                 file_path=m.group(1), edit_type="shell", content=cmd,
                  created_at=timestamps[i] if i < len(timestamps) else None)
             for i, p in items if p.get("type") == "function_call" and p.get("name") == "shell"
+            and (args := norm_args(p)) and (c := args.get("command")) and (cmd := " ".join(c) if isinstance(c, list) else c)
             for j, pat in enumerate([r'(?:cat|echo).*[>].*?([^\s>]+)', r'(?:sed|awk).*?([^\s]+)$'])
-            if (m := re.search(pat, p.get("arguments", {}).get("command", "")))]
+            if (m := re.search(pat, cmd))]
 
     return {
         "conv": dict(id=cid, source=src, title=meta.get("cwd") or jsonl.stem,
