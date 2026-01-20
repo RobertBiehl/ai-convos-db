@@ -220,7 +220,8 @@ def chrome_cookie_domains(profile: str | None = None):
 def chrome_profiles() -> list[str]:
     base = Path.home() / "Library/Application Support/Google/Chrome"
     if not base.exists(): return []
-    return [p.name for p in base.iterdir() if p.is_dir() and (p.name == "Default" or p.name.startswith("Profile "))]
+    return [p.name for p in base.iterdir()
+            if p.is_dir() and ((p / "Cookies").exists() or (p / "Network/Cookies").exists())]
 
 def chatgpt_profiles(browser: str) -> list[str | None]:
     if browser != "chrome": return [None]
