@@ -161,9 +161,10 @@ def read_safari_cookies(domain: str) -> dict[str, str]:
         ) from e
     return cookies
 
-def read_chrome_cookies(domain: str) -> dict[str, str]:
-    db_path = Path.home() / "Library/Application Support/Google/Chrome/Default/Cookies"
-    if not db_path.exists(): db_path = Path.home() / "Library/Application Support/Google/Chrome/Default/Network/Cookies"
+def read_chrome_cookies(domain: str, profile: str | None = None) -> dict[str, str]:
+    profile = profile or os.environ.get("CONVOS_CHROME_PROFILE", "Default")
+    db_path = Path.home() / "Library/Application Support/Google/Chrome" / profile / "Cookies"
+    if not db_path.exists(): db_path = Path.home() / "Library/Application Support/Google/Chrome" / profile / "Network/Cookies"
     if not db_path.exists(): return {}
     result = subprocess.run(["security", "find-generic-password", "-w", "-a", "Chrome", "-s", "Chrome Safe Storage"], capture_output=True, text=True)
     if result.returncode != 0: return {}
@@ -178,12 +179,12 @@ def read_chrome_cookies(domain: str) -> dict[str, str]:
     conn.close()
     return cookies
 
-def get_cookies(domain: str, browser: str = "safari") -> dict[str, str]:
-    return read_safari_cookies(domain) if browser == "safari" else read_chrome_cookies(domain)
+def get_cookies(domain: str, browser: str = "safari", profile: str | None = None) -> dict[str, str]:
+    return read_safari_cookies(domain) if browser == "safari" else read_chrome_cookies(domain, profile=profile)
 
-def get_cookies_any(domains: list[str], browser: str = "safari") -> dict[str, str]:
+def get_cookies_any(domains: list[str], browser: str = "safari", profile: str | None = None) -> dict[str, str]:
     cookies = {}
-    for d in domains: cookies.update(get_cookies(d, browser))
+    for d in domains: cookies.update(get_cookies(d, browser, profile=profile))
     return cookies
 
 def safari_cookie_domains():
@@ -206,14 +207,46 @@ def safari_cookie_domains():
                 if end != -1: domains.add(page[off+url_off:end].decode('utf-8', errors='ignore'))
     return domains
 
-def chrome_cookie_domains():
-    db_path = Path.home() / "Library/Application Support/Google/Chrome/Default/Cookies"
-    if not db_path.exists(): db_path = Path.home() / "Library/Application Support/Google/Chrome/Default/Network/Cookies"
+def chrome_cookie_domains(profile: str | None = None):
+    profile = profile or os.environ.get("CONVOS_CHROME_PROFILE", "Default")
+    db_path = Path.home() / "Library/Application Support/Google/Chrome" / profile / "Cookies"
+    if not db_path.exists(): db_path = Path.home() / "Library/Application Support/Google/Chrome" / profile / "Network/Cookies"
     if not db_path.exists(): return set()
     conn = sqlite3.connect(f"file:{db_path}?mode=ro&nolock=1", uri=True)
     domains = {r[0] for r in conn.execute("SELECT DISTINCT host_key FROM cookies")}
     conn.close()
     return domains
+
+def chrome_profiles() -> list[str]:
+    base = Path.home() / "Library/Application Support/Google/Chrome"
+    if not base.exists(): return []
+    return [p.name for p in base.iterdir() if p.is_dir() and ((p / "Cookies").exists() or (p / "Network/Cookies").exists())]
+
+def chatgpt_profiles(browser: str) -> list[str | None]:
+    if browser != "chrome": return [None]
+    if prof := os.environ.get("CONVOS_CHROME_PROFILE"): return [prof]
+    return chrome_profiles() or [None]
+
+def chatgpt_cookie_base(browser: str, hosts: list[tuple[str, list[str]]], profile: str | None):
+    for url, domains in hosts:
+        if c := get_cookies_any(domains, browser, profile=profile): return c, url
+    raise ValueError(f"No ChatGPT cookies found in {browser}" + (f" profile {profile}" if profile else ""))
+
+def chatgpt_headers(cookies, base, ua, debug_profile: str | None = None):
+    headers = {"Origin": base, "Referer": f"{base}/", "User-Agent": ua, "Accept": "application/json",
+               "Accept-Language": "en-US,en;q=0.9", "Sec-Fetch-Site": "same-origin", "Sec-Fetch-Mode": "cors",
+               "Sec-Fetch-Dest": "empty"}
+    try:
+        session = fetch_json(f"{base}/api/auth/session", cookies, headers)
+        if token := session.get("accessToken"): headers["Authorization"] = f"Bearer {token}"
+        if aid := session.get("account", {}).get("id"): headers["ChatGPT-Account-ID"] = aid
+        if debug_profile: typer.echo(f"  chatgpt chrome profile={debug_profile} user={session.get('user', {}).get('email')}", flush=True)
+    except Exception:
+        pass
+    return headers
+
+def merge_results(dst: "ParseResult", src: "ParseResult"):
+    dst.convs += src.convs; dst.msgs += src.msgs; dst.tools += src.tools; dst.attachs += src.attachs
 
 def fetch_json(url: str, cookies: dict[str, str], headers: dict = None, timeout: int = 30, retries: int = 2) -> dict:
     parts = []
@@ -239,6 +272,18 @@ class ParseResult:
         self.convs, self.msgs, self.tools = convs or [], msgs or [], tools or []
         self.attachs, self.artifacts, self.edits = attachs or [], artifacts or [], edits or []
 
+def log_parse_error(context: str, err: Exception):
+    if not os.environ.get("CONVOS_PARSE_LOG"):
+        return
+    typer.echo(f"  parse error ({context}): {type(err).__name__}: {err}", err=True)
+
+def safe_parse(context: str, fn, *args, **kwargs):
+    try:
+        return fn(*args, **kwargs)
+    except Exception as e:
+        log_parse_error(context, e)
+        return None
+
 def parse_source(path: Path, source: Optional[str] = None) -> ParseResult:
     parsers = {"chatgpt": parse_chatgpt, "claude": parse_claude, "claude-code": parse_claude_code, "codex": parse_codex}
     src = source or detect_source(path)
@@ -249,66 +294,65 @@ def parse_source(path: Path, source: Optional[str] = None) -> ParseResult:
 def fetch_chatgpt(browser: str = "safari", limit: int = 0) -> ParseResult:
     hosts = [("https://chatgpt.com", ["chatgpt.com"]),
              ("https://chat.openai.com", ["chat.openai.com", "openai.com"])]
-    cookies, base = None, None
-    for url, domains in hosts:
-        if c := get_cookies_any(domains, browser): cookies, base = c, url; break
-    if not cookies: raise ValueError(f"No ChatGPT cookies found in {browser}")
+    debug = os.environ.get("CONVOS_CHATGPT_DEBUG")
     ua = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15"
           if browser == "safari" else
           "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
-    headers = {"Origin": base, "Referer": f"{base}/", "User-Agent": ua, "Accept": "application/json",
-               "Accept-Language": "en-US,en;q=0.9", "Sec-Fetch-Site": "same-origin", "Sec-Fetch-Mode": "cors",
-               "Sec-Fetch-Dest": "empty"}
-    try:
-        session = fetch_json(f"{base}/api/auth/session", cookies, headers)
-        if token := session.get("accessToken"): headers["Authorization"] = f"Bearer {token}"
-    except Exception:
-        pass
-    r = ParseResult()
-    def parse_item(item):
-        cid = gen_id("chatgpt", item["id"])
-        gizmo = item.get("gizmo_id")
-        conv = fetch_json(f"{base}/backend-api/conversation/{item['id']}", cookies, headers, timeout=60)
-        msgs, tools, attachs = [], [], []
-        for nid, node in conv.get("mapping", {}).items():
-            if not (msg := node.get("message")): continue
-            mid = gen_id("chatgpt", f"{cid}:{nid}")
-            role, meta = msg.get("author", {}).get("role", "unknown"), msg.get("metadata", {})
-            ts, model = ts_from_epoch(msg.get("create_time")), meta.get("model_slug")
-            if role == "tool" or meta.get("invoked_plugin"):
-                tools.append(dict(id=gen_id("chatgpt", f"tool:{mid}"), message_id=mid, tool_name=meta.get("invoked_plugin", {}).get("namespace", role),
-                                  input=json.dumps(meta.get("args", {})), output=json.dumps(msg.get("content", {})), status="complete", duration_ms=None, created_at=ts))
-            for i, part in enumerate(msg.get("content", {}).get("parts", []) if msg.get("content") else []):
-                if isinstance(part, dict) and part.get("content_type") in ("image_asset_pointer", "file"):
-                    attachs.append(dict(id=gen_id("chatgpt", f"attach:{mid}:{i}"), message_id=mid, filename=part.get("name", ""),
-                                        mime_type=part.get("content_type"), size=part.get("size"), path=None, url=part.get("asset_pointer"), created_at=ts))
-                elif isinstance(part, str) and part.strip():
-                    msgs.append(dict(id=mid, conversation_id=cid, role=role, content=part.strip(), thinking=None, created_at=ts, model=model, metadata=json.dumps(meta)))
-        return dict(conv=dict(id=cid, source="chatgpt", title=item.get("title"), created_at=ts_from_epoch(item.get("create_time")),
-                              updated_at=ts_from_epoch(item.get("update_time")), model=item.get("model"), cwd=None, git_branch=None,
-                              project_id=gizmo, metadata=json.dumps({"gizmo_id": gizmo}) if gizmo else "{}"),
-                    msgs=msgs, tools=tools, attachs=attachs)
-    offset, total, fetched, seen = 0, None, 0, set()
-    debug = os.environ.get("CONVOS_CHATGPT_DEBUG")
-    while True:
-        data = fetch_json(f"{base}/backend-api/conversations?offset={offset}&limit=100", cookies, headers, timeout=60)
-        if total is None: total = data.get("total")
-        items = data.get("items", [])
-        if debug: print(f"  chatgpt page offset={offset} items={len(items)} total={total} keys={','.join(data.keys())}", flush=True)
-        if not items: break
-        page = [it for it in items if it["id"] not in seen][: (limit - fetched) if limit > 0 else len(items)]
-        for it in page: seen.add(it["id"])
-        with ThreadPoolExecutor(max_workers=min(4, len(page))) as ex:
-            results = list(ex.map(parse_item, page)) if page else []
-        r.convs += [x["conv"] for x in results]; r.msgs += [m for x in results for m in x["msgs"]]
-        r.tools += [t for x in results for t in x["tools"]]; r.attachs += [a for x in results for a in x["attachs"]]
-        fetched += len(results)
-        offset += len(items)
-        if not page: break
-        if limit > 0 and fetched >= limit: break
-        if total and fetched > total: total = None
-        typer.echo(f"  fetched {fetched}{'/' + str(total) if total else ''}")
-    return r
+
+    def fetch_with_profile(profile: str | None) -> ParseResult:
+        cookies, base = chatgpt_cookie_base(browser, hosts, profile)
+        headers = chatgpt_headers(cookies, base, ua, debug_profile=profile if debug else None)
+        r = ParseResult()
+        def parse_item_raw(item):
+            cid = gen_id("chatgpt", item["id"])
+            gizmo = item.get("gizmo_id")
+            conv = fetch_json(f"{base}/backend-api/conversation/{item['id']}", cookies, headers, timeout=60)
+            msgs, tools, attachs = [], [], []
+            for nid, node in conv.get("mapping", {}).items():
+                if not (msg := node.get("message")): continue
+                mid = gen_id("chatgpt", f"{cid}:{nid}")
+                role, meta = msg.get("author", {}).get("role", "unknown"), msg.get("metadata", {})
+                ts, model = ts_from_epoch(msg.get("create_time")), meta.get("model_slug")
+                if role == "tool" or meta.get("invoked_plugin"):
+                    tools.append(dict(id=gen_id("chatgpt", f"tool:{mid}"), message_id=mid, tool_name=meta.get("invoked_plugin", {}).get("namespace", role),
+                                      input=json.dumps(meta.get("args", {})), output=json.dumps(msg.get("content", {})), status="complete", duration_ms=None, created_at=ts))
+                for i, part in enumerate(msg.get("content", {}).get("parts", []) if msg.get("content") else []):
+                    if isinstance(part, dict) and part.get("content_type") in ("image_asset_pointer", "file"):
+                        attachs.append(dict(id=gen_id("chatgpt", f"attach:{mid}:{i}"), message_id=mid, filename=part.get("name", ""),
+                                            mime_type=part.get("content_type"), size=part.get("size"), path=None, url=part.get("asset_pointer"), created_at=ts))
+                    elif isinstance(part, str) and part.strip():
+                        msgs.append(dict(id=mid, conversation_id=cid, role=role, content=part.strip(), thinking=None, created_at=ts, model=model, metadata=json.dumps(meta)))
+            return dict(conv=dict(id=cid, source="chatgpt", title=item.get("title"), created_at=ts_from_epoch(item.get("create_time")),
+                                  updated_at=ts_from_epoch(item.get("update_time")), model=item.get("model"), cwd=None, git_branch=None,
+                                  project_id=gizmo, metadata=json.dumps({"gizmo_id": gizmo}) if gizmo else "{}"),
+                        msgs=msgs, tools=tools, attachs=attachs)
+        def parse_item(item): return safe_parse(f"chatgpt web conv {item.get('id') if isinstance(item, dict) else 'unknown'}", parse_item_raw, item)
+        offset, total, fetched, seen = 0, None, 0, set()
+        while True:
+            data = fetch_json(f"{base}/backend-api/conversations?offset={offset}&limit=100", cookies, headers, timeout=60)
+            total = total if total is not None else data.get("total")
+            items, keys = data.get("items", []), ",".join(data.keys())
+            if debug: print(f"  chatgpt page offset={offset} items={len(items)} total={total} keys={keys}", flush=True)
+            if not items: break
+            page = [it for it in items if it["id"] not in seen][: (limit - fetched) if limit > 0 else len(items)]
+            for it in page: seen.add(it["id"])
+            with ThreadPoolExecutor(max_workers=min(4, len(page))) as ex:
+                results = [x for x in ex.map(parse_item, page) if x] if page else []
+            r.convs += [x["conv"] for x in results]; r.msgs += [m for x in results for m in x["msgs"]]
+            r.tools += [t for x in results for t in x["tools"]]; r.attachs += [a for x in results for a in x["attachs"]]
+            fetched += len(results)
+            offset += len(items)
+            if not page: break
+            if limit > 0 and fetched >= limit: break
+            if total and fetched > total: total = None
+            typer.echo(f"  fetched {fetched}{'/' + str(total) if total else ''}")
+        return r
+    out = ParseResult()
+    for profile in chatgpt_profiles(browser):
+        try: merge_results(out, fetch_with_profile(profile))
+        except Exception as e:
+            if debug: typer.echo(f"  chatgpt chrome profile={profile} failed: {e}", err=True)
+    return out
 
 def fetch_claude(browser: str = "safari", limit: int = 0, since: datetime = None) -> ParseResult:
     cookies = get_cookies("claude.ai", browser)
@@ -326,11 +370,11 @@ def fetch_claude(browser: str = "safari", limit: int = 0, since: datetime = None
     items = data if limit == 0 else data[:limit]
     if items: print(f"  claude total {len(items)}", flush=True)
     fetched, step = 0, max(1, len(items)//10)
-    for idx, item in enumerate(items):
+    def parse_item_raw(item):
+        nonlocal fetched
         updated = ts_from_iso(item.get("updated_at") or item.get("created_at"))
         if since and updated and updated <= since:
-            if idx == len(items)-1 or (idx+1) % step == 0: print(f"  claude fetched {fetched}/{len(items)}", flush=True)
-            continue
+            return False
         cid = gen_id("claude", item["uuid"])
         project = item.get("project_uuid")
         r.convs.append(dict(id=cid, source="claude", title=item.get("name"), created_at=ts_from_iso(item.get("created_at")),
@@ -358,6 +402,13 @@ def fetch_claude(browser: str = "safari", limit: int = 0, since: datetime = None
             if text := "\n".join(text_parts).strip():
                 r.msgs.append(dict(id=mid, conversation_id=cid, role=m.get("sender", "unknown"), content=text, thinking=None, created_at=ts, model=None, metadata="{}"))
         fetched += 1
+        return True
+    for idx, item in enumerate(items):
+        cid = item.get("uuid") if isinstance(item, dict) else "unknown"
+        did_fetch = safe_parse(f"claude web conv {cid}", parse_item_raw, item)
+        if did_fetch is False:
+            if idx == len(items)-1 or (idx+1) % step == 0: print(f"  claude fetched {fetched}/{len(items)}", flush=True)
+            continue
         if idx == len(items)-1 or (idx+1) % step == 0: print(f"  claude fetched {fetched}/{len(items)}", flush=True)
     return r
 
@@ -365,24 +416,30 @@ def fetch_claude(browser: str = "safari", limit: int = 0, since: datetime = None
 def parse_chatgpt(path: Path) -> ParseResult:
     data = json.load(zipfile.ZipFile(path).open('conversations.json')) if path.suffix == ".zip" else json.loads(path.read_text())
     r = ParseResult()
-    for c in data:
+    def parse_conv(c):
         cid, gizmo = gen_id("chatgpt", c.get("id", "")), c.get("gizmo_id")
-        r.convs.append(dict(id=cid, source="chatgpt", title=c.get("title"), created_at=ts_from_epoch(c.get("create_time")),
-                           updated_at=ts_from_epoch(c.get("update_time")), model=c.get("default_model_slug"), cwd=None, git_branch=None,
-                           project_id=gizmo, metadata=json.dumps({"gizmo_id": gizmo}) if gizmo else "{}"))
+        conv = dict(id=cid, source="chatgpt", title=c.get("title"), created_at=ts_from_epoch(c.get("create_time")),
+                    updated_at=ts_from_epoch(c.get("update_time")), model=c.get("default_model_slug"), cwd=None, git_branch=None,
+                    project_id=gizmo, metadata=json.dumps({"gizmo_id": gizmo}) if gizmo else "{}")
+        msgs, tools, attachs = [], [], []
         for nid, node in c.get("mapping", {}).items():
             if not (msg := node.get("message")): continue
             mid, role, meta = gen_id("chatgpt", f"{cid}:{nid}"), msg.get("author", {}).get("role", "unknown"), msg.get("metadata", {})
             ts, model = ts_from_epoch(msg.get("create_time")), meta.get("model_slug")
             if role == "tool" or meta.get("invoked_plugin"):
-                r.tools.append(dict(id=gen_id("chatgpt", f"tool:{mid}"), message_id=mid, tool_name=meta.get("invoked_plugin", {}).get("namespace", role),
-                                   input=json.dumps(meta.get("args", {})), output=json.dumps(msg.get("content", {})), status="complete", duration_ms=None, created_at=ts))
+                tools.append(dict(id=gen_id("chatgpt", f"tool:{mid}"), message_id=mid, tool_name=meta.get("invoked_plugin", {}).get("namespace", role),
+                                  input=json.dumps(meta.get("args", {})), output=json.dumps(msg.get("content", {})), status="complete", duration_ms=None, created_at=ts))
             for i, part in enumerate(msg.get("content", {}).get("parts", []) if msg.get("content") else []):
                 if isinstance(part, dict) and part.get("content_type") in ("image_asset_pointer", "file"):
-                    r.attachs.append(dict(id=gen_id("chatgpt", f"attach:{mid}:{i}"), message_id=mid, filename=part.get("name", ""),
-                                         mime_type=part.get("content_type"), size=part.get("size"), path=None, url=part.get("asset_pointer"), created_at=ts))
+                    attachs.append(dict(id=gen_id("chatgpt", f"attach:{mid}:{i}"), message_id=mid, filename=part.get("name", ""),
+                                       mime_type=part.get("content_type"), size=part.get("size"), path=None, url=part.get("asset_pointer"), created_at=ts))
                 elif isinstance(part, str) and part.strip():
-                    r.msgs.append(dict(id=mid, conversation_id=cid, role=role, content=part.strip(), thinking=None, created_at=ts, model=model, metadata=json.dumps(meta)))
+                    msgs.append(dict(id=mid, conversation_id=cid, role=role, content=part.strip(), thinking=None, created_at=ts, model=model, metadata=json.dumps(meta)))
+        return dict(conv=conv, msgs=msgs, tools=tools, attachs=attachs)
+    for idx, c in enumerate(data):
+        cid = c.get("id") if isinstance(c, dict) else idx
+        if p := safe_parse(f"chatgpt export conv {cid}", parse_conv, c):
+            r.convs.append(p["conv"]); r.msgs += p["msgs"]; r.tools += p["tools"]; r.attachs += p["attachs"]
     return r
 
 def parse_claude(path: Path) -> ParseResult:
@@ -402,15 +459,20 @@ def parse_claude(path: Path) -> ParseResult:
                             filename=a.get("file_name"), mime_type=a.get("file_type"), size=a.get("file_size"),
                             path=None, url=a.get("url"), created_at=ts_from_iso(m.get("created_at")))
                        for m in msgs_data for i, a in enumerate(m.get("attachments", []))]}
-    parsed = [parse_conv(c) for c in data]
+    parsed = [p for idx, c in enumerate(data)
+              if (p := safe_parse(f"claude export conv {c.get('uuid') if isinstance(c, dict) else idx}", parse_conv, c))]
     return ParseResult(convs=[p["conv"] for p in parsed], msgs=[m for p in parsed for m in p["msgs"]],
                       attachs=[a for p in parsed for a in p["attachs"]])
 
 def load_jsonl(path: Path) -> list[dict]:
-    def loads(line):
-        try: return json.loads(line)
-        except Exception: return None
-    return [e for line in path.read_text().splitlines() if line.strip() and (e := loads(line))]
+    out = []
+    for i, line in enumerate(path.read_text().splitlines(), start=1):
+        if not line.strip(): continue
+        try:
+            out.append(json.loads(line))
+        except Exception as e:
+            log_parse_error(f"jsonl {path} line {i}", e)
+    return out
 
 def parse_claude_code_session(jsonl: Path) -> dict:
     """Parse single Claude Code session, returns dict with conv, msgs, tools, edits or None if empty."""
@@ -453,7 +515,8 @@ def parse_claude_code_session(jsonl: Path) -> dict:
         "edits": [ed for idx, (i, e) in enumerate(msg_events) for ed in make_edits(idx, i, e)]}
 
 def parse_claude_code(projects_dir: Path, files: list[Path] | None = None) -> ParseResult:
-    sessions = [s for jsonl in (files or projects_dir.rglob("*.jsonl")) if (s := parse_claude_code_session(jsonl))]
+    sessions = [s for jsonl in (files or projects_dir.rglob("*.jsonl"))
+                if (s := safe_parse(f"claude-code session {jsonl}", parse_claude_code_session, jsonl))]
     return ParseResult(
         convs=[s["conv"] for s in sessions], msgs=[m for s in sessions for m in s["msgs"]],
         tools=[t for s in sessions for t in s["tools"]], edits=[e for s in sessions for e in s["edits"]])
@@ -504,7 +567,8 @@ def parse_codex_session(jsonl: Path) -> dict | None:
 def parse_codex(codex_dir: Path, files: list[Path] | None = None) -> ParseResult:
     sessions_dir = codex_dir / "sessions"
     if not sessions_dir.exists(): return ParseResult()
-    sessions = [s for jsonl in (files or sessions_dir.rglob("*.jsonl")) if (s := parse_codex_session(jsonl))]
+    sessions = [s for jsonl in (files or sessions_dir.rglob("*.jsonl"))
+                if (s := safe_parse(f"codex session {jsonl}", parse_codex_session, jsonl))]
     return ParseResult(
         convs=[s["conv"] for s in sessions], msgs=[m for s in sessions for m in s["msgs"]],
         tools=[t for s in sessions for t in s["tools"]], edits=[e for s in sessions for e in s["edits"]])
@@ -756,26 +820,21 @@ def sync(watch: bool = typer.Option(False, "-w"), interval: int = typer.Option(3
     def probe_chatgpt(browser):
         hosts = [("https://chatgpt.com", ["chatgpt.com"]),
                  ("https://chat.openai.com", ["chat.openai.com", "openai.com"])]
+        profiles = chatgpt_profiles(browser)
         errors = []
-        for base, domains in hosts:
-            cookies = get_cookies_any(domains, browser)
-            if not cookies: errors.append(f"{'/'.join(domains)}: no cookies"); continue
-            ua = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15"
-                  if browser == "safari" else
-                  "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
-            headers = {"Origin": base, "Referer": f"{base}/", "User-Agent": ua, "Accept": "application/json",
-                       "Accept-Language": "en-US,en;q=0.9", "Sec-Fetch-Site": "same-origin", "Sec-Fetch-Mode": "cors",
-                       "Sec-Fetch-Dest": "empty"}
+        heads = []
+        ua = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15"
+              if browser == "safari" else
+              "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+        for profile in profiles:
             try:
-                session = fetch_json(f"{base}/api/auth/session", cookies, headers)
-                if not session or not session.get("user"): raise ValueError("not authenticated")
-                if token := session.get("accessToken"): headers["Authorization"] = f"Bearer {token}"
+                cookies, base = chatgpt_cookie_base(browser, hosts, profile)
+                headers = chatgpt_headers(cookies, base, ua)
                 items = fetch_json(f"{base}/backend-api/conversations?offset=0&limit=1", cookies, headers)["items"]
-                if not items: return ""
-                item = items[0]
-                return f"{item['id']}:{item.get('update_time')}"
+                if items: heads.append(f"{profile or 'default'}:{items[0]['id']}:{items[0].get('update_time')}")
             except Exception as e:
-                errors.append(f"{'/'.join(domains)}: {e}")
+                errors.append(f"chatgpt.com{f'/{profile}' if profile else ''}: {e}")
+        if heads: return "|".join(heads)
         raise ValueError(f"ChatGPT request failed in {browser}: " + " | ".join(errors)) if errors else ValueError("ChatGPT request failed")
     def probe_claude(browser):
         cookies = get_cookies("claude.ai", browser)
@@ -793,7 +852,8 @@ def sync(watch: bool = typer.Option(False, "-w"), interval: int = typer.Option(3
         return f"{item['uuid']}:{item.get('updated_at') or item.get('created_at')}"
     def plan_web(name, fetcher, probe):
         pref = web.get(name, {})
-        order = [pref.get("browser")] + [b for b in ("safari", "chrome") if b != pref.get("browser")]
+        forced = os.environ.get(f"CONVOS_{name.upper()}_BROWSER")
+        order = [forced] if forced else [pref.get("browser")] + [b for b in ("safari", "chrome") if b != pref.get("browser")]
         errors = []
         for b in [x for x in order if x]:
             try:
