@@ -162,8 +162,9 @@ def read_safari_cookies(domain: str) -> dict[str, str]:
     return cookies
 
 def read_chrome_cookies(domain: str) -> dict[str, str]:
-    db_path = Path.home() / "Library/Application Support/Google/Chrome/Default/Cookies"
-    if not db_path.exists(): db_path = Path.home() / "Library/Application Support/Google/Chrome/Default/Network/Cookies"
+    profile = os.environ.get("CONVOS_CHROME_PROFILE", "Default")
+    db_path = Path.home() / "Library/Application Support/Google/Chrome" / profile / "Cookies"
+    if not db_path.exists(): db_path = Path.home() / "Library/Application Support/Google/Chrome" / profile / "Network/Cookies"
     if not db_path.exists(): return {}
     result = subprocess.run(["security", "find-generic-password", "-w", "-a", "Chrome", "-s", "Chrome Safe Storage"], capture_output=True, text=True)
     if result.returncode != 0: return {}
@@ -207,8 +208,9 @@ def safari_cookie_domains():
     return domains
 
 def chrome_cookie_domains():
-    db_path = Path.home() / "Library/Application Support/Google/Chrome/Default/Cookies"
-    if not db_path.exists(): db_path = Path.home() / "Library/Application Support/Google/Chrome/Default/Network/Cookies"
+    profile = os.environ.get("CONVOS_CHROME_PROFILE", "Default")
+    db_path = Path.home() / "Library/Application Support/Google/Chrome" / profile / "Cookies"
+    if not db_path.exists(): db_path = Path.home() / "Library/Application Support/Google/Chrome" / profile / "Network/Cookies"
     if not db_path.exists(): return set()
     conn = sqlite3.connect(f"file:{db_path}?mode=ro&nolock=1", uri=True)
     domains = {r[0] for r in conn.execute("SELECT DISTINCT host_key FROM cookies")}
@@ -239,6 +241,18 @@ class ParseResult:
         self.convs, self.msgs, self.tools = convs or [], msgs or [], tools or []
         self.attachs, self.artifacts, self.edits = attachs or [], artifacts or [], edits or []
 
+def log_parse_error(context: str, err: Exception):
+    if not os.environ.get("CONVOS_PARSE_LOG"):
+        return
+    typer.echo(f"  parse error ({context}): {type(err).__name__}: {err}", err=True)
+
+def safe_parse(context: str, fn, *args, **kwargs):
+    try:
+        return fn(*args, **kwargs)
+    except Exception as e:
+        log_parse_error(context, e)
+        return None
+
 def parse_source(path: Path, source: Optional[str] = None) -> ParseResult:
     parsers = {"chatgpt": parse_chatgpt, "claude": parse_claude, "claude-code": parse_claude_code, "codex": parse_codex}
     src = source or detect_source(path)
@@ -262,10 +276,11 @@ def fetch_chatgpt(browser: str = "safari", limit: int = 0) -> ParseResult:
     try:
         session = fetch_json(f"{base}/api/auth/session", cookies, headers)
         if token := session.get("accessToken"): headers["Authorization"] = f"Bearer {token}"
+        if aid := session.get("account", {}).get("id"): headers["ChatGPT-Account-ID"] = aid
     except Exception:
         pass
     r = ParseResult()
-    def parse_item(item):
+    def parse_item_raw(item):
         cid = gen_id("chatgpt", item["id"])
         gizmo = item.get("gizmo_id")
         conv = fetch_json(f"{base}/backend-api/conversation/{item['id']}", cookies, headers, timeout=60)
@@ -288,6 +303,9 @@ def fetch_chatgpt(browser: str = "safari", limit: int = 0) -> ParseResult:
                               updated_at=ts_from_epoch(item.get("update_time")), model=item.get("model"), cwd=None, git_branch=None,
                               project_id=gizmo, metadata=json.dumps({"gizmo_id": gizmo}) if gizmo else "{}"),
                     msgs=msgs, tools=tools, attachs=attachs)
+    def parse_item(item):
+        cid = item.get("id") if isinstance(item, dict) else "unknown"
+        return safe_parse(f"chatgpt web conv {cid}", parse_item_raw, item)
     offset, total, fetched, seen = 0, None, 0, set()
     debug = os.environ.get("CONVOS_CHATGPT_DEBUG")
     while True:
@@ -299,7 +317,7 @@ def fetch_chatgpt(browser: str = "safari", limit: int = 0) -> ParseResult:
         page = [it for it in items if it["id"] not in seen][: (limit - fetched) if limit > 0 else len(items)]
         for it in page: seen.add(it["id"])
         with ThreadPoolExecutor(max_workers=min(4, len(page))) as ex:
-            results = list(ex.map(parse_item, page)) if page else []
+            results = [x for x in ex.map(parse_item, page) if x] if page else []
         r.convs += [x["conv"] for x in results]; r.msgs += [m for x in results for m in x["msgs"]]
         r.tools += [t for x in results for t in x["tools"]]; r.attachs += [a for x in results for a in x["attachs"]]
         fetched += len(results)
@@ -326,11 +344,11 @@ def fetch_claude(browser: str = "safari", limit: int = 0, since: datetime = None
     items = data if limit == 0 else data[:limit]
     if items: print(f"  claude total {len(items)}", flush=True)
     fetched, step = 0, max(1, len(items)//10)
-    for idx, item in enumerate(items):
+    def parse_item_raw(item):
+        nonlocal fetched
         updated = ts_from_iso(item.get("updated_at") or item.get("created_at"))
         if since and updated and updated <= since:
-            if idx == len(items)-1 or (idx+1) % step == 0: print(f"  claude fetched {fetched}/{len(items)}", flush=True)
-            continue
+            return False
         cid = gen_id("claude", item["uuid"])
         project = item.get("project_uuid")
         r.convs.append(dict(id=cid, source="claude", title=item.get("name"), created_at=ts_from_iso(item.get("created_at")),
@@ -358,6 +376,13 @@ def fetch_claude(browser: str = "safari", limit: int = 0, since: datetime = None
             if text := "\n".join(text_parts).strip():
                 r.msgs.append(dict(id=mid, conversation_id=cid, role=m.get("sender", "unknown"), content=text, thinking=None, created_at=ts, model=None, metadata="{}"))
         fetched += 1
+        return True
+    for idx, item in enumerate(items):
+        cid = item.get("uuid") if isinstance(item, dict) else "unknown"
+        did_fetch = safe_parse(f"claude web conv {cid}", parse_item_raw, item)
+        if did_fetch is False:
+            if idx == len(items)-1 or (idx+1) % step == 0: print(f"  claude fetched {fetched}/{len(items)}", flush=True)
+            continue
         if idx == len(items)-1 or (idx+1) % step == 0: print(f"  claude fetched {fetched}/{len(items)}", flush=True)
     return r
 
@@ -365,24 +390,30 @@ def fetch_claude(browser: str = "safari", limit: int = 0, since: datetime = None
 def parse_chatgpt(path: Path) -> ParseResult:
     data = json.load(zipfile.ZipFile(path).open('conversations.json')) if path.suffix == ".zip" else json.loads(path.read_text())
     r = ParseResult()
-    for c in data:
+    def parse_conv(c):
         cid, gizmo = gen_id("chatgpt", c.get("id", "")), c.get("gizmo_id")
-        r.convs.append(dict(id=cid, source="chatgpt", title=c.get("title"), created_at=ts_from_epoch(c.get("create_time")),
-                           updated_at=ts_from_epoch(c.get("update_time")), model=c.get("default_model_slug"), cwd=None, git_branch=None,
-                           project_id=gizmo, metadata=json.dumps({"gizmo_id": gizmo}) if gizmo else "{}"))
+        conv = dict(id=cid, source="chatgpt", title=c.get("title"), created_at=ts_from_epoch(c.get("create_time")),
+                    updated_at=ts_from_epoch(c.get("update_time")), model=c.get("default_model_slug"), cwd=None, git_branch=None,
+                    project_id=gizmo, metadata=json.dumps({"gizmo_id": gizmo}) if gizmo else "{}")
+        msgs, tools, attachs = [], [], []
         for nid, node in c.get("mapping", {}).items():
             if not (msg := node.get("message")): continue
             mid, role, meta = gen_id("chatgpt", f"{cid}:{nid}"), msg.get("author", {}).get("role", "unknown"), msg.get("metadata", {})
             ts, model = ts_from_epoch(msg.get("create_time")), meta.get("model_slug")
             if role == "tool" or meta.get("invoked_plugin"):
-                r.tools.append(dict(id=gen_id("chatgpt", f"tool:{mid}"), message_id=mid, tool_name=meta.get("invoked_plugin", {}).get("namespace", role),
-                                   input=json.dumps(meta.get("args", {})), output=json.dumps(msg.get("content", {})), status="complete", duration_ms=None, created_at=ts))
+                tools.append(dict(id=gen_id("chatgpt", f"tool:{mid}"), message_id=mid, tool_name=meta.get("invoked_plugin", {}).get("namespace", role),
+                                  input=json.dumps(meta.get("args", {})), output=json.dumps(msg.get("content", {})), status="complete", duration_ms=None, created_at=ts))
             for i, part in enumerate(msg.get("content", {}).get("parts", []) if msg.get("content") else []):
                 if isinstance(part, dict) and part.get("content_type") in ("image_asset_pointer", "file"):
-                    r.attachs.append(dict(id=gen_id("chatgpt", f"attach:{mid}:{i}"), message_id=mid, filename=part.get("name", ""),
-                                         mime_type=part.get("content_type"), size=part.get("size"), path=None, url=part.get("asset_pointer"), created_at=ts))
+                    attachs.append(dict(id=gen_id("chatgpt", f"attach:{mid}:{i}"), message_id=mid, filename=part.get("name", ""),
+                                       mime_type=part.get("content_type"), size=part.get("size"), path=None, url=part.get("asset_pointer"), created_at=ts))
                 elif isinstance(part, str) and part.strip():
-                    r.msgs.append(dict(id=mid, conversation_id=cid, role=role, content=part.strip(), thinking=None, created_at=ts, model=model, metadata=json.dumps(meta)))
+                    msgs.append(dict(id=mid, conversation_id=cid, role=role, content=part.strip(), thinking=None, created_at=ts, model=model, metadata=json.dumps(meta)))
+        return dict(conv=conv, msgs=msgs, tools=tools, attachs=attachs)
+    for idx, c in enumerate(data):
+        cid = c.get("id") if isinstance(c, dict) else idx
+        if p := safe_parse(f"chatgpt export conv {cid}", parse_conv, c):
+            r.convs.append(p["conv"]); r.msgs += p["msgs"]; r.tools += p["tools"]; r.attachs += p["attachs"]
     return r
 
 def parse_claude(path: Path) -> ParseResult:
@@ -402,15 +433,23 @@ def parse_claude(path: Path) -> ParseResult:
                             filename=a.get("file_name"), mime_type=a.get("file_type"), size=a.get("file_size"),
                             path=None, url=a.get("url"), created_at=ts_from_iso(m.get("created_at")))
                        for m in msgs_data for i, a in enumerate(m.get("attachments", []))]}
-    parsed = [parse_conv(c) for c in data]
+    parsed = []
+    for idx, c in enumerate(data):
+        cid = c.get("uuid") if isinstance(c, dict) else idx
+        if p := safe_parse(f"claude export conv {cid}", parse_conv, c):
+            parsed.append(p)
     return ParseResult(convs=[p["conv"] for p in parsed], msgs=[m for p in parsed for m in p["msgs"]],
                       attachs=[a for p in parsed for a in p["attachs"]])
 
 def load_jsonl(path: Path) -> list[dict]:
-    def loads(line):
-        try: return json.loads(line)
-        except Exception: return None
-    return [e for line in path.read_text().splitlines() if line.strip() and (e := loads(line))]
+    out = []
+    for i, line in enumerate(path.read_text().splitlines(), start=1):
+        if not line.strip(): continue
+        try:
+            out.append(json.loads(line))
+        except Exception as e:
+            log_parse_error(f"jsonl {path} line {i}", e)
+    return out
 
 def parse_claude_code_session(jsonl: Path) -> dict:
     """Parse single Claude Code session, returns dict with conv, msgs, tools, edits or None if empty."""
@@ -453,7 +492,10 @@ def parse_claude_code_session(jsonl: Path) -> dict:
         "edits": [ed for idx, (i, e) in enumerate(msg_events) for ed in make_edits(idx, i, e)]}
 
 def parse_claude_code(projects_dir: Path, files: list[Path] | None = None) -> ParseResult:
-    sessions = [s for jsonl in (files or projects_dir.rglob("*.jsonl")) if (s := parse_claude_code_session(jsonl))]
+    sessions = []
+    for jsonl in (files or projects_dir.rglob("*.jsonl")):
+        if s := safe_parse(f"claude-code session {jsonl}", parse_claude_code_session, jsonl):
+            sessions.append(s)
     return ParseResult(
         convs=[s["conv"] for s in sessions], msgs=[m for s in sessions for m in s["msgs"]],
         tools=[t for s in sessions for t in s["tools"]], edits=[e for s in sessions for e in s["edits"]])
@@ -504,7 +546,10 @@ def parse_codex_session(jsonl: Path) -> dict | None:
 def parse_codex(codex_dir: Path, files: list[Path] | None = None) -> ParseResult:
     sessions_dir = codex_dir / "sessions"
     if not sessions_dir.exists(): return ParseResult()
-    sessions = [s for jsonl in (files or sessions_dir.rglob("*.jsonl")) if (s := parse_codex_session(jsonl))]
+    sessions = []
+    for jsonl in (files or sessions_dir.rglob("*.jsonl")):
+        if s := safe_parse(f"codex session {jsonl}", parse_codex_session, jsonl):
+            sessions.append(s)
     return ParseResult(
         convs=[s["conv"] for s in sessions], msgs=[m for s in sessions for m in s["msgs"]],
         tools=[t for s in sessions for t in s["tools"]], edits=[e for s in sessions for e in s["edits"]])
@@ -770,6 +815,7 @@ def sync(watch: bool = typer.Option(False, "-w"), interval: int = typer.Option(3
                 session = fetch_json(f"{base}/api/auth/session", cookies, headers)
                 if not session or not session.get("user"): raise ValueError("not authenticated")
                 if token := session.get("accessToken"): headers["Authorization"] = f"Bearer {token}"
+                if aid := session.get("account", {}).get("id"): headers["ChatGPT-Account-ID"] = aid
                 items = fetch_json(f"{base}/backend-api/conversations?offset=0&limit=1", cookies, headers)["items"]
                 if not items: return ""
                 item = items[0]
@@ -793,7 +839,8 @@ def sync(watch: bool = typer.Option(False, "-w"), interval: int = typer.Option(3
         return f"{item['uuid']}:{item.get('updated_at') or item.get('created_at')}"
     def plan_web(name, fetcher, probe):
         pref = web.get(name, {})
-        order = [pref.get("browser")] + [b for b in ("safari", "chrome") if b != pref.get("browser")]
+        forced = os.environ.get(f"CONVOS_{name.upper()}_BROWSER")
+        order = [forced] if forced else [pref.get("browser")] + [b for b in ("safari", "chrome") if b != pref.get("browser")]
         errors = []
         for b in [x for x in order if x]:
             try:

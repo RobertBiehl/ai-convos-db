@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.2
+- Fix ChatGPT web sync for workspace accounts.
+- Add optional parse error logging and Chrome profile selection.
+
 ## 0.1.1
 - Sync output: per-service updated/new convo counts, totals, and timings with -v.
 - Fix Claude no-op sync to avoid full re-fetch when unchanged.
