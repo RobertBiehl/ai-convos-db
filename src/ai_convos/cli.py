@@ -220,8 +220,7 @@ def chrome_cookie_domains(profile: str | None = None):
 def chrome_profiles() -> list[str]:
     base = Path.home() / "Library/Application Support/Google/Chrome"
     if not base.exists(): return []
-    profiles = [p.name for p in base.iterdir() if p.is_dir() and (p.name == "Default" or p.name.startswith("Profile "))]
-    return profiles
+    return [p.name for p in base.iterdir() if p.is_dir() and (p.name == "Default" or p.name.startswith("Profile "))]
 
 def fetch_json(url: str, cookies: dict[str, str], headers: dict = None, timeout: int = 30, retries: int = 2) -> dict:
     parts = []
