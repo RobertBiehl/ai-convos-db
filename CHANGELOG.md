@@ -1,5 +1,8 @@
 # Changelog
 
+## 0.1.3
+- Auto-discover Chrome profiles for ChatGPT sync.
+
 ## 0.1.2
 - Fix ChatGPT web sync for workspace accounts.
 - Add optional parse error logging and Chrome profile selection.
