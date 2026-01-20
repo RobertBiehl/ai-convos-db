@@ -222,6 +222,32 @@ def chrome_profiles() -> list[str]:
     if not base.exists(): return []
     return [p.name for p in base.iterdir() if p.is_dir() and (p.name == "Default" or p.name.startswith("Profile "))]
 
+def chatgpt_profiles(browser: str) -> list[str | None]:
+    if browser != "chrome": return [None]
+    if prof := os.environ.get("CONVOS_CHROME_PROFILE"): return [prof]
+    return chrome_profiles() or [None]
+
+def chatgpt_cookie_base(browser: str, hosts: list[tuple[str, list[str]]], profile: str | None):
+    for url, domains in hosts:
+        if c := get_cookies_any(domains, browser, profile=profile): return c, url
+    raise ValueError(f"No ChatGPT cookies found in {browser}" + (f" profile {profile}" if profile else ""))
+
+def chatgpt_headers(cookies, base, ua, debug_profile: str | None = None):
+    headers = {"Origin": base, "Referer": f"{base}/", "User-Agent": ua, "Accept": "application/json",
+               "Accept-Language": "en-US,en;q=0.9", "Sec-Fetch-Site": "same-origin", "Sec-Fetch-Mode": "cors",
+               "Sec-Fetch-Dest": "empty"}
+    try:
+        session = fetch_json(f"{base}/api/auth/session", cookies, headers)
+        if token := session.get("accessToken"): headers["Authorization"] = f"Bearer {token}"
+        if aid := session.get("account", {}).get("id"): headers["ChatGPT-Account-ID"] = aid
+        if debug_profile: typer.echo(f"  chatgpt chrome profile={debug_profile} user={session.get('user', {}).get('email')}", flush=True)
+    except Exception:
+        pass
+    return headers
+
+def merge_results(dst: "ParseResult", src: "ParseResult"):
+    dst.convs += src.convs; dst.msgs += src.msgs; dst.tools += src.tools; dst.attachs += src.attachs
+
 def fetch_json(url: str, cookies: dict[str, str], headers: dict = None, timeout: int = 30, retries: int = 2) -> dict:
     parts = []
     for k, v in cookies.items():
@@ -269,26 +295,13 @@ def fetch_chatgpt(browser: str = "safari", limit: int = 0) -> ParseResult:
     hosts = [("https://chatgpt.com", ["chatgpt.com"]),
              ("https://chat.openai.com", ["chat.openai.com", "openai.com"])]
     debug = os.environ.get("CONVOS_CHATGPT_DEBUG")
+    ua = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15"
+          if browser == "safari" else
+          "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
 
     def fetch_with_profile(profile: str | None) -> ParseResult:
-        cookies, base = None, None
-        for url, domains in hosts:
-            if c := get_cookies_any(domains, browser, profile=profile): cookies, base = c, url; break
-        if not cookies: raise ValueError(f"No ChatGPT cookies found in {browser}" + (f" profile {profile}" if profile else ""))
-        ua = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15"
-              if browser == "safari" else
-              "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
-        headers = {"Origin": base, "Referer": f"{base}/", "User-Agent": ua, "Accept": "application/json",
-                   "Accept-Language": "en-US,en;q=0.9", "Sec-Fetch-Site": "same-origin", "Sec-Fetch-Mode": "cors",
-                   "Sec-Fetch-Dest": "empty"}
-        try:
-            session = fetch_json(f"{base}/api/auth/session", cookies, headers)
-            if token := session.get("accessToken"): headers["Authorization"] = f"Bearer {token}"
-            if aid := session.get("account", {}).get("id"): headers["ChatGPT-Account-ID"] = aid
-            if debug and profile:
-                typer.echo(f"  chatgpt chrome profile={profile} user={session.get('user', {}).get('email')}", flush=True)
-        except Exception:
-            pass
+        cookies, base = chatgpt_cookie_base(browser, hosts, profile)
+        headers = chatgpt_headers(cookies, base, ua, debug_profile=profile if debug else None)
         r = ParseResult()
         def parse_item_raw(item):
             cid = gen_id("chatgpt", item["id"])
@@ -313,15 +326,13 @@ def fetch_chatgpt(browser: str = "safari", limit: int = 0) -> ParseResult:
                                   updated_at=ts_from_epoch(item.get("update_time")), model=item.get("model"), cwd=None, git_branch=None,
                                   project_id=gizmo, metadata=json.dumps({"gizmo_id": gizmo}) if gizmo else "{}"),
                         msgs=msgs, tools=tools, attachs=attachs)
-        def parse_item(item):
-            cid = item.get("id") if isinstance(item, dict) else "unknown"
-            return safe_parse(f"chatgpt web conv {cid}", parse_item_raw, item)
+        def parse_item(item): return safe_parse(f"chatgpt web conv {item.get('id') if isinstance(item, dict) else 'unknown'}", parse_item_raw, item)
         offset, total, fetched, seen = 0, None, 0, set()
         while True:
             data = fetch_json(f"{base}/backend-api/conversations?offset={offset}&limit=100", cookies, headers, timeout=60)
-            if total is None: total = data.get("total")
-            items = data.get("items", [])
-            if debug: print(f"  chatgpt page offset={offset} items={len(items)} total={total} keys={','.join(data.keys())}", flush=True)
+            total = total if total is not None else data.get("total")
+            items, keys = data.get("items", []), ",".join(data.keys())
+            if debug: print(f"  chatgpt page offset={offset} items={len(items)} total={total} keys={keys}", flush=True)
             if not items: break
             page = [it for it in items if it["id"] not in seen][: (limit - fetched) if limit > 0 else len(items)]
             for it in page: seen.add(it["id"])
@@ -336,19 +347,12 @@ def fetch_chatgpt(browser: str = "safari", limit: int = 0) -> ParseResult:
             if total and fetched > total: total = None
             typer.echo(f"  fetched {fetched}{'/' + str(total) if total else ''}")
         return r
-
-    if browser == "chrome" and not os.environ.get("CONVOS_CHROME_PROFILE"):
-        out = ParseResult()
-        profiles = chrome_profiles()
-        if not profiles: raise ValueError("No Chrome profiles found")
-        for profile in profiles:
-            try:
-                r = fetch_with_profile(profile)
-                out.convs += r.convs; out.msgs += r.msgs; out.tools += r.tools; out.attachs += r.attachs
-            except Exception as e:
-                if debug: typer.echo(f"  chatgpt chrome profile={profile} failed: {e}", err=True)
-        return out
-    return fetch_with_profile(os.environ.get("CONVOS_CHROME_PROFILE") if browser == "chrome" else None)
+    out = ParseResult()
+    for profile in chatgpt_profiles(browser):
+        try: merge_results(out, fetch_with_profile(profile))
+        except Exception as e:
+            if debug: typer.echo(f"  chatgpt chrome profile={profile} failed: {e}", err=True)
+    return out
 
 def fetch_claude(browser: str = "safari", limit: int = 0, since: datetime = None) -> ParseResult:
     cookies = get_cookies("claude.ai", browser)
@@ -816,30 +820,20 @@ def sync(watch: bool = typer.Option(False, "-w"), interval: int = typer.Option(3
     def probe_chatgpt(browser):
         hosts = [("https://chatgpt.com", ["chatgpt.com"]),
                  ("https://chat.openai.com", ["chat.openai.com", "openai.com"])]
-        profiles = chrome_profiles() if browser == "chrome" and not os.environ.get("CONVOS_CHROME_PROFILE") else [None]
+        profiles = chatgpt_profiles(browser)
         errors = []
         heads = []
+        ua = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15"
+              if browser == "safari" else
+              "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
         for profile in profiles:
-            for base, domains in hosts:
-                cookies = get_cookies_any(domains, browser, profile=profile)
-                if not cookies: errors.append(f"{'/'.join(domains)}{f'/{profile}' if profile else ''}: no cookies"); continue
-                ua = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15"
-                      if browser == "safari" else
-                      "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
-                headers = {"Origin": base, "Referer": f"{base}/", "User-Agent": ua, "Accept": "application/json",
-                           "Accept-Language": "en-US,en;q=0.9", "Sec-Fetch-Site": "same-origin", "Sec-Fetch-Mode": "cors",
-                           "Sec-Fetch-Dest": "empty"}
-                try:
-                    session = fetch_json(f"{base}/api/auth/session", cookies, headers)
-                    if not session or not session.get("user"): raise ValueError("not authenticated")
-                    if token := session.get("accessToken"): headers["Authorization"] = f"Bearer {token}"
-                    if aid := session.get("account", {}).get("id"): headers["ChatGPT-Account-ID"] = aid
-                    items = fetch_json(f"{base}/backend-api/conversations?offset=0&limit=1", cookies, headers)["items"]
-                    if not items: continue
-                    item = items[0]
-                    heads.append(f"{profile or 'default'}:{item['id']}:{item.get('update_time')}")
-                except Exception as e:
-                    errors.append(f"{'/'.join(domains)}{f'/{profile}' if profile else ''}: {e}")
+            try:
+                cookies, base = chatgpt_cookie_base(browser, hosts, profile)
+                headers = chatgpt_headers(cookies, base, ua)
+                items = fetch_json(f"{base}/backend-api/conversations?offset=0&limit=1", cookies, headers)["items"]
+                if items: heads.append(f"{profile or 'default'}:{items[0]['id']}:{items[0].get('update_time')}")
+            except Exception as e:
+                errors.append(f"chatgpt.com{f'/{profile}' if profile else ''}: {e}")
         if heads: return "|".join(heads)
         raise ValueError(f"ChatGPT request failed in {browser}: " + " | ".join(errors)) if errors else ValueError("ChatGPT request failed")
     def probe_claude(browser):
