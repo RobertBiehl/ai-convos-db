@@ -456,11 +456,8 @@ def parse_claude(path: Path) -> ParseResult:
                             filename=a.get("file_name"), mime_type=a.get("file_type"), size=a.get("file_size"),
                             path=None, url=a.get("url"), created_at=ts_from_iso(m.get("created_at")))
                        for m in msgs_data for i, a in enumerate(m.get("attachments", []))]}
-    parsed = []
-    for idx, c in enumerate(data):
-        cid = c.get("uuid") if isinstance(c, dict) else idx
-        if p := safe_parse(f"claude export conv {cid}", parse_conv, c):
-            parsed.append(p)
+    parsed = [p for idx, c in enumerate(data)
+              if (p := safe_parse(f"claude export conv {c.get('uuid') if isinstance(c, dict) else idx}", parse_conv, c))]
     return ParseResult(convs=[p["conv"] for p in parsed], msgs=[m for p in parsed for m in p["msgs"]],
                       attachs=[a for p in parsed for a in p["attachs"]])
 
@@ -515,10 +512,8 @@ def parse_claude_code_session(jsonl: Path) -> dict:
         "edits": [ed for idx, (i, e) in enumerate(msg_events) for ed in make_edits(idx, i, e)]}
 
 def parse_claude_code(projects_dir: Path, files: list[Path] | None = None) -> ParseResult:
-    sessions = []
-    for jsonl in (files or projects_dir.rglob("*.jsonl")):
-        if s := safe_parse(f"claude-code session {jsonl}", parse_claude_code_session, jsonl):
-            sessions.append(s)
+    sessions = [s for jsonl in (files or projects_dir.rglob("*.jsonl"))
+                if (s := safe_parse(f"claude-code session {jsonl}", parse_claude_code_session, jsonl))]
     return ParseResult(
         convs=[s["conv"] for s in sessions], msgs=[m for s in sessions for m in s["msgs"]],
         tools=[t for s in sessions for t in s["tools"]], edits=[e for s in sessions for e in s["edits"]])
@@ -569,10 +564,8 @@ def parse_codex_session(jsonl: Path) -> dict | None:
 def parse_codex(codex_dir: Path, files: list[Path] | None = None) -> ParseResult:
     sessions_dir = codex_dir / "sessions"
     if not sessions_dir.exists(): return ParseResult()
-    sessions = []
-    for jsonl in (files or sessions_dir.rglob("*.jsonl")):
-        if s := safe_parse(f"codex session {jsonl}", parse_codex_session, jsonl):
-            sessions.append(s)
+    sessions = [s for jsonl in (files or sessions_dir.rglob("*.jsonl"))
+                if (s := safe_parse(f"codex session {jsonl}", parse_codex_session, jsonl))]
     return ParseResult(
         convs=[s["conv"] for s in sessions], msgs=[m for s in sessions for m in s["msgs"]],
         tools=[t for s in sessions for t in s["tools"]], edits=[e for s in sessions for e in s["edits"]])
