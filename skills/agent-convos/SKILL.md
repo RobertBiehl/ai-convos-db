@@ -33,3 +33,9 @@ Behavior:
 - Use `CONVOS_IMPORT_PATHS` for export paths (comma-separated).
 - If `convos` is not on PATH, use the repo wrapper: `bin/convos`.
 - Use shell commands only; do not use MCP resources for this skill.
+
+Storage:
+- DB file: `<root>/data/convos.db`
+- Sync state: `<root>/data/sync_state.json`
+- Default root: `~/.convos`
+- Override root: set `CONVOS_PROJECT_ROOT`
