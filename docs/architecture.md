@@ -76,6 +76,8 @@ Full-text search uses DuckDB's FTS extension with BM25 scoring. The index covers
 
 ## File Layout
 
+User data (DuckDB + state) lives under `~/.convos` by default (override with `CONVOS_PROJECT_ROOT`).
+
 ```
 ai-convos-db/
 ├── src/ai_convos/

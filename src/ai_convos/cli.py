@@ -14,9 +14,7 @@ import duckdb, typer
 app = typer.Typer(help="AI Conversations DB - searchable archive for Claude, ChatGPT, and Codex")
 def find_root():
     if r := os.environ.get("CONVOS_PROJECT_ROOT"): return Path(r).expanduser()
-    if p := next((p for p in (Path.cwd(), *Path.cwd().parents) if (p / "pyproject.toml").exists()), None): return p
-    if (p := Path.home() / ".local/share/ai-convos-db").joinpath("pyproject.toml").exists(): return p
-    return Path(__file__).resolve().parents[2]
+    return Path.home() / ".convos"
 PROJECT_ROOT = find_root()
 DATA_DIR, DB_PATH = PROJECT_ROOT / "data", PROJECT_ROOT / "data" / "convos.db"
 STATE_PATH = DATA_DIR / "sync_state.json"

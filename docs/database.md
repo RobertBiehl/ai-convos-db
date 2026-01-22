@@ -9,7 +9,7 @@ read_when:
 
 # Database Schema
 
-DuckDB database at `data/convos.db`.
+DuckDB database at `<root>/data/convos.db`. Default root is `~/.convos` (override with `CONVOS_PROJECT_ROOT`).
 
 ## Tables
 

@@ -124,7 +124,7 @@ assistant: Here's a minimal schema and index setup...
 
 ## Data model
 
-Data lives in `data/convos.db` (DuckDB) with these core tables:
+Data lives in `<root>/data/convos.db` (DuckDB). Default root is `~/.convos` (override with `CONVOS_PROJECT_ROOT`).
 
 - `conversations`
 - `messages`
@@ -146,10 +146,10 @@ Q: Why is fetch failing on Safari?
 A: macOS blocks access to Safari cookies without Full Disk Access. Use `-b chrome` or grant access.
 
 Q: Where is the database stored?
-A: `data/convos.db` in the repo.
+A: `~/.convos/data/convos.db` by default (override with `CONVOS_PROJECT_ROOT`).
 
 Q: Can I reset the DB?
-A: Delete `data/convos.db` and re-run `convos init`.
+A: Delete `~/.convos/data/convos.db` (or `<root>/data/convos.db`) and re-run `convos init`.
 
 ## Contributing
 
