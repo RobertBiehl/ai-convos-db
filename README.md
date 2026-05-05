@@ -21,6 +21,7 @@ Local-first, searchable archive for ChatGPT, Claude, and Codex conversations. On
 ## Features
 
 - Fast full-text search with filters (source, days, role, thinking)
+- Hybrid semantic search (BM25 + embeddings + Qwen3 reranker) via `convos query`
 - Fetch from ChatGPT and Claude using browser cookies
 - Import exports from ChatGPT, Claude, Claude Code, and Codex
 - Sync Claude Code + Codex sessions on a schedule
@@ -55,9 +56,18 @@ If Safari cookies are protected by macOS privacy, `sync` will fall back to Chrom
 Search:
 
 ```bash
-convos search "vector database" -s chatgpt -d 30
+convos search "vector database" -s chatgpt -d 30   # BM25 only
 convos search "reasoning" --thinking
+convos embed                                      # backfill embeddings, no web sync
+convos query "how do I store vectors in duckdb"    # hybrid: BM25 + embeddings + rerank
 ```
+
+Hybrid search is opt-in. Install with `pip install ai-convos-db[hybrid]` (pulls
+`llama-cpp-python` + `huggingface-hub`). Run `convos embed` or `convos sync`
+after install to backfill embeddings with a progress bar; subsequent syncs only
+embed new/changed messages. Models used: `embeddinggemma-300m-qat-q8_0` for
+embeddings (768d) and `Qwen3-Reranker-0.6B` for reranking. Both are GGUF and
+run on Apple Silicon via Metal.
 
 Show a conversation:
 

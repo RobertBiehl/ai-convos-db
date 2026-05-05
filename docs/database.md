@@ -44,6 +44,7 @@ Individual messages within conversations. Has FTS index.
 | created_at | TIMESTAMP | Message timestamp |
 | model | VARCHAR | Model for this specific message |
 | metadata | JSON | Source-specific extra fields |
+| embedding | FLOAT[768] | embeddinggemma vector for hybrid search (NULL until embedded) |
 
 ### tool_calls
 
@@ -118,6 +119,25 @@ FROM messages m
 WHERE score IS NOT NULL
 ORDER BY score DESC
 ```
+
+## Hybrid Search
+
+`convos query` combines FTS (BM25) with vector similarity over the
+`embedding` column using DuckDB's built-in `array_cosine_similarity`. Top-50
+from each source is fused with Reciprocal Rank Fusion (`SUM(1/(60+rank))`),
+the top-30 fused docs are reranked with Qwen3-Reranker-0.6B, and final order
+is a position-tier blend of retrieval rank and reranker score: ranks 0-2 use
+0.75/0.25, ranks 3-9 use 0.6/0.4, the rest use 0.4/0.6.
+
+Embeddings are produced by embeddinggemma-300M (768d) with the
+`task: search result | document:` prefix at index time and `query:` at query
+time. Truncation only — no chunking — at 1600 chars.
+
+Use `convos embed` to backfill missing embeddings without fetching from web
+APIs. `convos sync` also embeds new or changed messages after upsert.
+
+The `embedding` column is preserved across upserts when message `content`
+is unchanged, so sync only re-embeds new or edited messages.
 
 ## ID Generation
 

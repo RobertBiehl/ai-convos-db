@@ -1,5 +1,3 @@
-"""Playwright-based browser automation for fetching from web APIs."""
-
 import json, asyncio
 from pathlib import Path
 from playwright.async_api import async_playwright, Browser, BrowserContext
@@ -9,18 +7,15 @@ CLAUDE_AI_URL = "https://claude.ai"
 CHATGPT_URL = "https://chat.openai.com"
 
 async def get_browser_context(browser: Browser, storage_state: Path | None = None) -> BrowserContext:
-    """Create browser context, optionally loading saved auth state."""
     if storage_state and storage_state.exists():
         return await browser.new_context(storage_state=str(storage_state))
     return await browser.new_context()
 
 async def save_auth_state(context: BrowserContext, path: Path):
-    """Save browser auth state for reuse."""
     path.parent.mkdir(parents=True, exist_ok=True)
     await context.storage_state(path=str(path))
 
 async def capture_api_responses(context: BrowserContext, url: str, api_pattern: str, timeout: int = 30000) -> list[dict]:
-    """Navigate to URL and capture API responses matching pattern."""
     responses = []
     page = await context.new_page()
 
@@ -38,11 +33,6 @@ async def capture_api_responses(context: BrowserContext, url: str, api_pattern: 
     return responses
 
 async def fetch_claude_code_web_sessions(storage_state: Path | None = None, headless: bool = True) -> list[dict]:
-    """Fetch Claude Code web sessions using playwright.
-
-    Returns list of session objects with structure similar to local Claude Code sessions.
-    Uses browser automation to capture API responses from claude.ai/code.
-    """
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=headless)
         context = await get_browser_context(browser, storage_state)
@@ -69,7 +59,6 @@ async def fetch_claude_code_web_sessions(storage_state: Path | None = None, head
         return sessions
 
 async def fetch_with_login(url: str, api_pattern: str, storage_state: Path | None = None) -> list[dict]:
-    """Fetch API data, prompting for login if needed (non-headless)."""
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=False)
         context = await get_browser_context(browser, storage_state)
@@ -101,7 +90,6 @@ async def fetch_with_login(url: str, api_pattern: str, storage_state: Path | Non
         return responses
 
 def fetch_claude_code_web_sync(storage_state: Path | None = None, headless: bool = True) -> list[dict]:
-    """Synchronous wrapper for fetch_claude_code_web_sessions."""
     return asyncio.run(fetch_claude_code_web_sessions(storage_state, headless))
 
 # API response schemas for testing - these document expected API structures
@@ -139,7 +127,6 @@ EXPECTED_SCHEMAS = {
 }
 
 def validate_schema(data: dict | list, schema_name: str) -> tuple[bool, str]:
-    """Basic schema validation for API responses."""
     schema = EXPECTED_SCHEMAS.get(schema_name)
     if not schema:
         return False, f"Unknown schema: {schema_name}"

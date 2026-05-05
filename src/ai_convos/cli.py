@@ -1,7 +1,5 @@
 #!/usr/bin/env python3
-"""DuckDB-backed searchable archive for Claude, ChatGPT, and Codex conversations."""
-
-import json, time, zipfile, hashlib, struct, sqlite3, subprocess, ssl, urllib.request, re, os, sysconfig
+import json, time, zipfile, hashlib, struct, sqlite3, subprocess, ssl, urllib.request, re, os, sysconfig, math
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -57,7 +55,9 @@ def init_schema(conn):
         model VARCHAR, cwd VARCHAR, git_branch VARCHAR, project_id VARCHAR, metadata JSON)""")
     conn.execute("""CREATE TABLE IF NOT EXISTS messages (
         id VARCHAR PRIMARY KEY, conversation_id VARCHAR NOT NULL, role VARCHAR NOT NULL, content VARCHAR,
-        thinking VARCHAR, created_at TIMESTAMP, model VARCHAR, metadata JSON)""")
+        thinking VARCHAR, created_at TIMESTAMP, model VARCHAR, metadata JSON, embedding FLOAT[768])""")
+    if not conn.execute("SELECT 1 FROM information_schema.columns WHERE table_name='messages' AND column_name='embedding'").fetchone():
+        conn.execute("ALTER TABLE messages ADD COLUMN embedding FLOAT[768]")
     conn.execute("""CREATE TABLE IF NOT EXISTS tool_calls (
         id VARCHAR PRIMARY KEY, message_id VARCHAR NOT NULL, tool_name VARCHAR, input JSON, output JSON,
         status VARCHAR, duration_ms INTEGER, created_at TIMESTAMP)""")
@@ -114,7 +114,6 @@ def ts_from_epoch(t):
 def ts_from_iso(t): return datetime.fromisoformat(t.replace("Z", "+00:00")) if t else None
 
 def extract_content(content) -> dict:
-    """Extract all content types from a message content field. Returns dict with text, thinking, tools, attachments."""
     if isinstance(content, str): return {"text": content, "thinking": None, "tools": [], "attachments": []}
     if not isinstance(content, list): return {"text": "", "thinking": None, "tools": [], "attachments": []}
     blocks = [b for b in content if isinstance(b, dict)]
@@ -473,7 +472,6 @@ def load_jsonl(path: Path) -> list[dict]:
     return out
 
 def parse_claude_code_session(jsonl: Path) -> dict:
-    """Parse single Claude Code session, returns dict with conv, msgs, tools, edits or None if empty."""
     events = load_jsonl(jsonl)
     if not events: return None
     cid, src = gen_id("claude-code", str(jsonl)), "claude-code"
@@ -520,7 +518,6 @@ def parse_claude_code(projects_dir: Path, files: list[Path] | None = None) -> Pa
         tools=[t for s in sessions for t in s["tools"]], edits=[e for s in sessions for e in s["edits"]])
 
 def parse_codex_session(jsonl: Path) -> dict | None:
-    """Parse single Codex session, returns dict with conv, msgs, tools, edits or None if empty."""
     events = load_jsonl(jsonl)
     if not events: return None
     cid, src = gen_id("codex", str(jsonl)), "codex"
@@ -571,6 +568,8 @@ def parse_codex(codex_dir: Path, files: list[Path] | None = None) -> ParseResult
         convs=[s["conv"] for s in sessions], msgs=[m for s in sessions for m in s["msgs"]],
         tools=[t for s in sessions for t in s["tools"]], edits=[e for s in sessions for e in s["edits"]])
 
+_MSG_UPS = "INSERT INTO messages VALUES (?,?,?,?,?,?,?,?,NULL) ON CONFLICT(id) DO UPDATE SET conversation_id=excluded.conversation_id, role=excluded.role, content=excluded.content, thinking=excluded.thinking, created_at=excluded.created_at, model=excluded.model, metadata=excluded.metadata, embedding=CASE WHEN messages.content IS DISTINCT FROM excluded.content THEN NULL ELSE messages.embedding END"
+
 def upsert(conn, r: ParseResult):
     cids, mids = [c["id"] for c in r.convs], [m["id"] for m in r.msgs]
     cur = conn.execute
@@ -580,14 +579,66 @@ def upsert(conn, r: ParseResult):
     new_msgs = set(mids) - {x[0] for x in existing_msgs}
     updated = {m["conversation_id"] for m in r.msgs if m["id"] in new_msgs} - new_convs
     for c in r.convs: conn.execute("INSERT OR REPLACE INTO conversations VALUES (?,?,?,?,?,?,?,?,?,?)", list(c.values()))
-    for m in r.msgs: conn.execute("INSERT OR REPLACE INTO messages VALUES (?,?,?,?,?,?,?,?)", list(m.values()))
+    for m in r.msgs: conn.execute(_MSG_UPS, list(m.values()))
     for t in r.tools: conn.execute("INSERT OR REPLACE INTO tool_calls VALUES (?,?,?,?,?,?,?,?)", list(t.values()))
     for a in r.attachs: conn.execute("INSERT OR REPLACE INTO attachments VALUES (?,?,?,?,?,?,?,?)", list(a.values()))
     for a in r.artifacts: conn.execute("INSERT OR REPLACE INTO artifacts VALUES (?,?,?,?,?,?,?,?)", list(a.values()))
     for e in r.edits: conn.execute("INSERT OR REPLACE INTO file_edits VALUES (?,?,?,?,?,?)", list(e.values()))
     return len(r.convs), len(r.msgs), len(r.tools), len(r.attachs), len(r.edits), len(new_convs), len(updated)
 
+# ---- embeddings ----
+_MODELS, _MCFG = {}, {"emb": dict(repo_id="ggml-org/embeddinggemma-300m-qat-q8_0-GGUF", filename="embeddinggemma-300m-qat-Q8_0.gguf", embedding=True, n_ctx=16384, n_batch=2048, n_ubatch=2048, n_seq_max=8, n_gpu_layers=-1), "rr": dict(repo_id="ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF", filename="qwen3-reranker-0.6b-q8_0.gguf", n_ctx=4096, logits_all=True, n_gpu_layers=-1)}
+def _llama(role: str):
+    if role not in _MODELS:
+        from llama_cpp import Llama
+        cfg = _MCFG[role].copy(); nseq = cfg.pop("n_seq_max", 0)
+        if nseq:
+            import llama_cpp.llama_cpp as lc; orig = lc.llama_context_default_params
+            lc.llama_context_default_params = lambda o=orig, n=nseq: (setattr(p := o(), "n_seq_max", n) or p)
+        try: _MODELS[role] = Llama.from_pretrained(**cfg, verbose=False)
+        finally:
+            if nseq: lc.llama_context_default_params = orig
+    return _MODELS[role]
+def embed_texts(ss: list[str], doc: bool = False) -> list[list[float]]:
+    p = "task: search result | document: " if doc else "task: search result | query: "
+    return [d["embedding"] for d in _llama("emb").create_embedding([p + (s or "")[:1600] for s in ss])["data"]]
+def embed_text(s: str, doc: bool = False) -> list[float]:
+    return embed_texts([s], doc)[0]
+RR_PROMPT = '<|im_start|>system\nJudge whether the Document meets the requirements based on the Query and the Instruct provided. Note that the answer can only be "yes" or "no".<|im_end|>\n<|im_start|>user\n<Instruct>: Given a search query, find conversation messages relevant to it.\n<Query>: {q}\n<Document>: {d}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n'
+def rerank(query: str, docs: list[str]) -> list[float]:
+    rr, qq = _llama("rr"), query[:512]
+    return [(lambda l: (math.exp(l.get("yes",-100))/(math.exp(l.get("yes",-100))+math.exp(l.get("no",-100)))) if math.exp(l.get("yes",-100))+math.exp(l.get("no",-100))>0 else 0.0)(rr.create_completion(RR_PROMPT.format(q=qq, d=(d or "")[:3000]), max_tokens=1, temperature=0.0, logprobs=10)["choices"][0]["logprobs"]["top_logprobs"][0]) for d in docs]
+def embed_pending(conn, batch: int = 32):
+    Q = "FROM messages WHERE embedding IS NULL AND content IS NOT NULL AND content != ''"
+    if not (n := conn.execute(f"SELECT COUNT(*) {Q}").fetchone()[0]): return
+    typer.echo(f"Embedding {n} messages..."); done = 0
+    while rows := conn.execute(f"SELECT id, content {Q} ORDER BY LEAST(length(content),1600) LIMIT ?", [batch]).fetchall():
+        for ch in [rows[i:i+_MCFG["emb"]["n_seq_max"]] for i in range(0, len(rows), _MCFG["emb"]["n_seq_max"])]:
+            conn.executemany("UPDATE messages SET embedding=? WHERE id=?", [(e, mid) for (mid, _), e in zip(ch, embed_texts([c for _, c in ch], doc=True))])
+        done += len(rows); typer.echo(f"  {done}/{n}\r", nl=False)
+    typer.echo()
+
 # ---- commands ----
+def _ro():
+    c = get_db(read_only=True)
+    if c is None: typer.echo("Database not found. Run `convos init` or `convos sync`."); return None
+    if not ensure_db_ready(c): c.close(); return None
+    return c
+def _hybrid_ro():
+    if (c := _ro()) is None: return None
+    if c.execute("SELECT 1 FROM information_schema.columns WHERE table_name='messages' AND column_name='embedding'").fetchone(): return c
+    c.close(); c = get_db(); init_schema(c); c.close(); return _ro()
+def _filt(source, days, role):
+    w, p = [], []
+    if source: w.append("c.source = ?"); p.append(source)
+    if days: w.append("m.created_at > ?"); p.append(datetime.now() - timedelta(days=days))
+    if role: w.append("m.role = ?"); p.append(role)
+    return w, p
+def _fmt_hit(content, ts, role, title, src, cid, cwd, q, ctx, meta):
+    p = (content or "")[:ctx] + ("..." if content and len(content) > ctx else "")
+    for w in q.split(): p = re.sub(f"({re.escape(w)})", r"\033[1;33m\1\033[0m", p, flags=re.I)
+    typer.echo(f"\n{'='*60}\n[{src}] {title or 'Untitled'}{f' @ {cwd}' if cwd else ''} ({cid[:8]})\n{role} @ {ts or '?'} ({meta})\n{'-'*40}\n{p}")
+
 @app.command()
 def init():
     conn = get_db(); init_schema(conn); rebuild_fts_index(conn); conn.close()
@@ -595,105 +646,85 @@ def init():
     typer.echo(f"Database initialized at {DB_PATH}")
 
 @app.command()
-def search(query: str, source: Optional[str] = typer.Option(None, "-s"), days: Optional[int] = typer.Option(None, "-d"),
-           role: Optional[str] = typer.Option(None, "-r"), thinking: bool = typer.Option(False, "--thinking", "-t"),
-           limit: int = typer.Option(20, "-n"), context: int = typer.Option(300, "-c")):
-    """Full-text search with filters. Use --thinking to include reasoning."""
-    conn = get_db(read_only=True)
-    if conn is None: typer.echo("Database not found. Run `convos init` or `convos sync`."); return
-    if not ensure_db_ready(conn): conn.close(); return
-    try:
-        load_fts(conn)
-    except ValueError as e:
-        conn.close(); typer.echo(str(e)); return
-    exists = conn.execute(
-        "SELECT 1 FROM information_schema.tables WHERE table_name = 'fts_main_messages'"
-    ).fetchone()
-    if not exists:
-        conn.close()
-        try:
-            wconn = get_db()
-            init_schema(wconn); rebuild_fts_index(wconn); wconn.close()
-            conn = get_db(read_only=True)
-            load_fts(conn)
-        except Exception:
-            typer.echo("FTS index missing and DB is locked. Try again after the writer finishes.")
-            return
-    where_parts, params = ["score IS NOT NULL"], [query]
-    if source: where_parts.append("c.source = ?"); params.append(source)
-    if days: where_parts.append("m.created_at > ?"); params.append(datetime.now() - timedelta(days=days))
-    if role: where_parts.append("m.role = ?"); params.append(role)
-    params.append(limit)
-    results = conn.execute(f"""
-        SELECT m.content, m.thinking, m.role, m.created_at, fts_main_messages.match_bm25(m.id, ?) as score, c.title, c.source, c.id, c.cwd
-        FROM messages m JOIN conversations c ON m.conversation_id = c.id WHERE {' AND '.join(where_parts)} ORDER BY score DESC LIMIT ?
-    """, params).fetchall()
+def search(query: str, source: Optional[str] = typer.Option(None, "-s"), days: Optional[int] = typer.Option(None, "-d"), role: Optional[str] = typer.Option(None, "-r"), thinking: bool = typer.Option(False, "--thinking", "-t"), limit: int = typer.Option(20, "-n"), context: int = typer.Option(300, "-c")):
+    if (conn := _ro()) is None: return
+    try: load_fts(conn)
+    except ValueError as e: conn.close(); typer.echo(str(e)); return
+    w, p = _filt(source, days, role)
+    results = conn.execute(f"""SELECT m.content, m.thinking, m.role, m.created_at, fts_main_messages.match_bm25(m.id, ?) as score, c.title, c.source, c.id, c.cwd
+        FROM messages m JOIN conversations c ON m.conversation_id = c.id WHERE score IS NOT NULL{' AND ' + ' AND '.join(w) if w else ''} ORDER BY score DESC LIMIT ?""", [query] + p + [limit]).fetchall()
     conn.close()
     if not results: typer.echo("No results"); return
-    for content, think, role, ts, score, title, src, cid, cwd in results:
-        preview = content[:context] + "..." if len(content) > context else content
-        for word in query.split(): preview = re.sub(f"({re.escape(word)})", r"\033[1;33m\1\033[0m", preview, flags=re.I)
-        loc = f" @ {cwd}" if cwd else ""
-        typer.echo(f"\n{'='*60}\n[{src}] {title or 'Untitled'}{loc} ({cid[:8]})\n{role} @ {ts or '?'} (score: {score:.2f})\n{'-'*40}\n{preview}")
+    for content, think, r, ts, score, title, src, cid, cwd in results:
+        _fmt_hit(content, ts, r, title, src, cid, cwd, query, context, f"score: {score:.2f}")
         if thinking and think: typer.echo(f"\n[THINKING]\n{think[:500]}{'...' if len(think)>500 else ''}")
     typer.echo(f"\n{len(results)} results")
 
+@app.command("query")
+def query_cmd(q: str, source: Optional[str] = typer.Option(None, "-s"), days: Optional[int] = typer.Option(None, "-d"), role: Optional[str] = typer.Option(None, "-r"), limit: int = typer.Option(10, "-n"), context: int = typer.Option(300, "-c")):
+    if (conn := _hybrid_ro()) is None: return
+    if not conn.execute("SELECT COUNT(*) FROM messages WHERE embedding IS NOT NULL").fetchone()[0]:
+        conn.close(); typer.echo("No embeddings yet. Run `pip install ai-convos-db[hybrid]` and `convos embed`, or use `convos search` for BM25 only.", err=True); return
+    try: load_fts(conn)
+    except ValueError as e: conn.close(); typer.echo(str(e)); return
+    try: qv = embed_text(q, doc=False)
+    except Exception as e: conn.close(); typer.echo(f"Hybrid embedding failed: {e}", err=True); return
+    w, p = _filt(source, days, role)
+    rows = conn.execute(f"""WITH qe AS (SELECT ?::FLOAT[768] AS v),
+        fts AS (SELECT id, ROW_NUMBER() OVER (ORDER BY score DESC) AS r FROM (SELECT id, fts_main_messages.match_bm25(id, ?) AS score FROM messages) s WHERE score IS NOT NULL LIMIT 50),
+        vec AS (SELECT m.id, ROW_NUMBER() OVER (ORDER BY array_cosine_similarity(m.embedding, qe.v) DESC) AS r FROM messages m, qe WHERE m.embedding IS NOT NULL LIMIT 50),
+        fused AS (SELECT id, SUM(1.0/(60+r)) AS rrf FROM (SELECT id, r FROM fts UNION ALL SELECT id, r FROM vec) GROUP BY id)
+        SELECT m.role, m.content, m.created_at, c.title, c.source, c.id, c.cwd FROM fused JOIN messages m ON m.id = fused.id JOIN conversations c ON c.id = m.conversation_id
+        WHERE 1=1{' AND ' + ' AND '.join(w) if w else ''} ORDER BY fused.rrf DESC LIMIT 30""", [qv, q] + p).fetchall()
+    conn.close()
+    if not rows: typer.echo("No results"); return
+    try: rrs = rerank(q, [r[1] or "" for r in rows])
+    except Exception as e: typer.echo(f"Hybrid rerank failed: {e}", err=True); return
+    W = lambda i: (0.75, 0.25) if i < 3 else (0.6, 0.4) if i < 10 else (0.4, 0.6)
+    ranked = sorted([(W(i)[0]*(1.0/(i+1)) + W(i)[1]*rr, row, rr) for i, (row, rr) in enumerate(zip(rows, rrs))], reverse=True, key=lambda x: x[0])
+    for score, (r, content, ts, title, src, cid, cwd), rr in ranked[:limit]: _fmt_hit(content, ts, r, title, src, cid, cwd, q, context, f"score: {score:.3f}, rerank: {rr:.2f}")
+    typer.echo(f"\n{min(len(ranked), limit)} results")
+
+@app.command("embed")
+def embed_cmd(batch: int = typer.Option(32, "-b")):
+    conn = get_db(); init_schema(conn)
+    try: embed_pending(conn, batch); typer.echo("Embeddings ready")
+    except Exception as e: typer.echo(f"Embedding failed: {e}", err=True)
+    conn.close()
+
 @app.command("list")
-def list_convos(source: Optional[str] = typer.Option(None, "-s"), days: Optional[int] = typer.Option(None, "-d"),
-                cwd: Optional[str] = typer.Option(None, "--cwd"), limit: int = typer.Option(50, "-n")):
-    conn = get_db(read_only=True)
-    if conn is None: typer.echo("Database not found. Run `convos init` or `convos sync`."); return
-    if not ensure_db_ready(conn): conn.close(); return
-    where_parts, params = [], []
-    if source: where_parts.append("source = ?"); params.append(source)
-    if days: where_parts.append("created_at > ?"); params.append(datetime.now() - timedelta(days=days))
-    if cwd: where_parts.append("cwd LIKE ?"); params.append(f"%{cwd}%")
-    where = f"WHERE {' AND '.join(where_parts)}" if where_parts else ""
-    params.append(limit)
-    rows = conn.execute(f"""SELECT id, source, title, created_at, cwd, git_branch, (SELECT COUNT(*) FROM messages WHERE conversation_id = c.id)
-        FROM conversations c {where} ORDER BY created_at DESC LIMIT ?""", params).fetchall()
+def list_convos(source: Optional[str] = typer.Option(None, "-s"), days: Optional[int] = typer.Option(None, "-d"), cwd: Optional[str] = typer.Option(None, "--cwd"), limit: int = typer.Option(50, "-n")):
+    if (conn := _ro()) is None: return
+    wp, params = [], []
+    if source: wp.append("source = ?"); params.append(source)
+    if days: wp.append("created_at > ?"); params.append(datetime.now() - timedelta(days=days))
+    if cwd: wp.append("cwd LIKE ?"); params.append(f"%{cwd}%")
+    rows = conn.execute(f"""SELECT id, source, title, created_at, cwd, git_branch, (SELECT COUNT(*) FROM messages WHERE conversation_id = c.id) FROM conversations c {('WHERE ' + ' AND '.join(wp)) if wp else ''} ORDER BY created_at DESC LIMIT ?""", params + [limit]).fetchall()
     conn.close()
     for cid, src, title, ts, cwd, branch, cnt in rows:
-        loc = f" [{cwd}]" if cwd else ""
-        br = f" ({branch})" if branch else ""
-        typer.echo(f"{cid[:8]}  [{src:12}]  {str(ts)[:16] if ts else '?':16}  {cnt:3} msgs  {(title or 'Untitled')[:30]}{loc}{br}")
+        typer.echo(f"{cid[:8]}  [{src:12}]  {str(ts)[:16] if ts else '?':16}  {cnt:3} msgs  {(title or 'Untitled')[:30]}{f' [{cwd}]' if cwd else ''}{f' ({branch})' if branch else ''}")
     typer.echo(f"\n{len(rows)} conversations")
 
 @app.command()
 def show(conv_id: str, tools_: bool = typer.Option(False, "--tools", "-t"), thinking: bool = typer.Option(False, "--thinking")):
-    conn = get_db(read_only=True)
-    if conn is None: typer.echo("Database not found. Run `convos init` or `convos sync`."); return
-    if not ensure_db_ready(conn): conn.close(); return
+    if (conn := _ro()) is None: return
     conv = conn.execute("SELECT id, source, title, created_at, model, cwd, git_branch, project_id FROM conversations WHERE id LIKE ?", [f"{conv_id}%"]).fetchone()
     if not conv: typer.echo("Not found"); return
     cid, src, title, ts, model, cwd, branch, proj = conv
-    typer.echo(f"{'='*60}\n[{src}] {title or 'Untitled'}\nID: {cid}\nCreated: {ts}\nModel: {model}")
-    if cwd: typer.echo(f"Directory: {cwd}")
-    if branch: typer.echo(f"Branch: {branch}")
-    if proj: typer.echo(f"Project: {proj}")
-    typer.echo(f"{'='*60}\n")
-
-    msgs = conn.execute("SELECT role, content, thinking, created_at, model FROM messages WHERE conversation_id = ? ORDER BY created_at", [cid]).fetchall()
-    for role, content, think, mts, mmodel in msgs:
-        model_str = f" [{mmodel}]" if mmodel else ""
-        typer.echo(f"\n--- {role.upper()}{model_str} @ {mts or '?'} ---\n{content}")
+    extras = "".join(f"\n{k}: {v}" for k, v in [("Directory", cwd), ("Branch", branch), ("Project", proj)] if v)
+    typer.echo(f"{'='*60}\n[{src}] {title or 'Untitled'}\nID: {cid}\nCreated: {ts}\nModel: {model}{extras}\n{'='*60}\n")
+    for role, content, think, mts, mmodel in conn.execute("SELECT role, content, thinking, created_at, model FROM messages WHERE conversation_id = ? ORDER BY created_at", [cid]).fetchall():
+        typer.echo(f"\n--- {role.upper()}{f' [{mmodel}]' if mmodel else ''} @ {mts or '?'} ---\n{content}")
         if thinking and think: typer.echo(f"\n[THINKING]\n{think}")
-
-    if tools_:
-        tcs = conn.execute("SELECT tool_name, input, output, status, duration_ms FROM tool_calls tc JOIN messages m ON tc.message_id = m.id WHERE m.conversation_id = ?", [cid]).fetchall()
-        if tcs:
-            typer.echo(f"\n{'='*60}\nTOOL CALLS ({len(tcs)})\n{'='*60}")
-            for name, inp, out, status, dur in tcs:
-                dur_str = f" ({dur}ms)" if dur else ""
-                typer.echo(f"\n{name} [{status}]{dur_str}\nIn: {inp[:200]}{'...' if len(inp)>200 else ''}\nOut: {out[:200]}{'...' if len(out)>200 else ''}")
+    if tools_ and (tcs := conn.execute("SELECT tool_name, input, output, status, duration_ms FROM tool_calls tc JOIN messages m ON tc.message_id = m.id WHERE m.conversation_id = ?", [cid]).fetchall()):
+        typer.echo(f"\n{'='*60}\nTOOL CALLS ({len(tcs)})\n{'='*60}")
+        for name, inp, out, status, dur in tcs:
+            typer.echo(f"\n{name} [{status}]{f' ({dur}ms)' if dur else ''}\nIn: {inp[:200]}{'...' if len(inp)>200 else ''}\nOut: {out[:200]}{'...' if len(out)>200 else ''}")
     conn.close()
 
 @app.command()
-def get(conv_id: str, since: Optional[str] = typer.Option(None, "--since"), after: Optional[str] = typer.Option(None, "--after"),
-        limit: int = typer.Option(50, "-n"), thinking: bool = typer.Option(False, "--thinking")):
-    conn = get_db(read_only=True)
-    if conn is None: typer.echo("Database not found. Run `convos init` or `convos sync`."); return
-    if not ensure_db_ready(conn): conn.close(); return
+def get(conv_id: str, since: Optional[str] = typer.Option(None, "--since"), after: Optional[str] = typer.Option(None, "--after"), limit: int = typer.Option(50, "-n"), thinking: bool = typer.Option(False, "--thinking")):
+    if (conn := _ro()) is None: return
     conv = conn.execute("SELECT id, source, title FROM conversations WHERE id LIKE ?", [f"{conv_id}%"]).fetchone()
     if not conv: typer.echo("Not found"); return
     cid, src, title = conv
@@ -703,44 +734,30 @@ def get(conv_id: str, since: Optional[str] = typer.Option(None, "--since"), afte
         row = conn.execute("SELECT created_at FROM messages WHERE id LIKE ? AND conversation_id = ? ORDER BY created_at LIMIT 1", [f"{after}%", cid]).fetchone()
         if not row or not row[0]: conn.close(); typer.echo("After message not found or missing timestamp"); return
         where.append("created_at > ?"); params.append(row[0])
-    params.append(limit)
-    msgs = conn.execute(f"SELECT id, role, content, thinking, created_at, model FROM messages WHERE {' AND '.join(where)} ORDER BY created_at LIMIT ?", params).fetchall()
+    msgs = conn.execute(f"SELECT id, role, content, thinking, created_at, model FROM messages WHERE {' AND '.join(where)} ORDER BY created_at LIMIT ?", params + [limit]).fetchall()
     conn.close()
     typer.echo(f"{'='*60}\n[{src}] {title or 'Untitled'}\nID: {cid}\n{'='*60}\n")
     for mid, role, content, think, mts, mmodel in msgs:
-        model_str = f" [{mmodel}]" if mmodel else ""
-        typer.echo(f"\n--- {role.upper()}{model_str} @ {mts or '?'} ({mid[:8]}) ---\n{content}")
+        typer.echo(f"\n--- {role.upper()}{f' [{mmodel}]' if mmodel else ''} @ {mts or '?'} ({mid[:8]}) ---\n{content}")
         if thinking and think: typer.echo(f"\n[THINKING]\n{think}")
     typer.echo(f"\n{len(msgs)} messages")
 
 @app.command()
 def edits(path: Optional[str] = typer.Argument(None), limit: int = typer.Option(30, "-n")):
-    """List file edits."""
-    conn = get_db(read_only=True)
-    if conn is None: typer.echo("Database not found. Run `convos init` or `convos sync`."); return
-    if not ensure_db_ready(conn): conn.close(); return
-    if path:
-        results = conn.execute("SELECT file_path, edit_type, content, created_at FROM file_edits WHERE file_path LIKE ? ORDER BY created_at DESC LIMIT ?", [f"%{path}%", limit]).fetchall()
-    else:
-        results = conn.execute("SELECT file_path, edit_type, content, created_at FROM file_edits ORDER BY created_at DESC LIMIT ?", [limit]).fetchall()
+    if (conn := _ro()) is None: return
+    where, prm = ("WHERE file_path LIKE ?", [f"%{path}%", limit]) if path else ("", [limit])
+    results = conn.execute(f"SELECT file_path, edit_type, content, created_at FROM file_edits {where} ORDER BY created_at DESC LIMIT ?", prm).fetchall()
     conn.close()
-    for fp, et, content, ts in results:
-        typer.echo(f"\n{'-'*40}\n{fp} [{et}] @ {ts}\n{content[:200]}{'...' if len(content)>200 else ''}")
+    for fp, et, content, ts in results: typer.echo(f"\n{'-'*40}\n{fp} [{et}] @ {ts}\n{content[:200]}{'...' if len(content)>200 else ''}")
     typer.echo(f"\n{len(results)} edits")
 
 @app.command()
 def tools(query: Optional[str] = typer.Argument(None), limit: int = typer.Option(30, "-n")):
-    conn = get_db(read_only=True)
-    if conn is None: typer.echo("Database not found. Run `convos init` or `convos sync`."); return
-    if not ensure_db_ready(conn): conn.close(); return
-    if query:
-        results = conn.execute("SELECT tool_name, input, output, status, created_at FROM tool_calls WHERE tool_name ILIKE ? OR input ILIKE ? OR output ILIKE ? ORDER BY created_at DESC LIMIT ?",
-                              [f"%{query}%"]*3 + [limit]).fetchall()
-    else:
-        results = conn.execute("SELECT tool_name, input, output, status, created_at FROM tool_calls ORDER BY created_at DESC LIMIT ?", [limit]).fetchall()
+    if (conn := _ro()) is None: return
+    where, prm = ("WHERE tool_name ILIKE ? OR input ILIKE ? OR output ILIKE ?", [f"%{query}%"]*3 + [limit]) if query else ("", [limit])
+    results = conn.execute(f"SELECT tool_name, input, output, status, created_at FROM tool_calls {where} ORDER BY created_at DESC LIMIT ?", prm).fetchall()
     conn.close()
-    for name, inp, out, status, ts in results:
-        typer.echo(f"\n{'-'*40}\n{name} [{status}] @ {ts}\nIn: {inp[:100]}{'...' if len(inp)>100 else ''}\nOut: {out[:100]}{'...' if len(out)>100 else ''}")
+    for name, inp, out, status, ts in results: typer.echo(f"\n{'-'*40}\n{name} [{status}] @ {ts}\nIn: {inp[:100]}{'...' if len(inp)>100 else ''}\nOut: {out[:100]}{'...' if len(out)>100 else ''}")
     typer.echo(f"\n{len(results)} tool calls")
 
 @app.command()
@@ -776,9 +793,7 @@ def install_skills():
 
 @app.command()
 def export(output: Path, fmt: str = typer.Option("json", "-f"), source: Optional[str] = typer.Option(None, "-s")):
-    conn = get_db(read_only=True)
-    if conn is None: typer.echo("Database not found. Run `convos init` or `convos sync`."); return
-    if not ensure_db_ready(conn): conn.close(); return
+    if (conn := _ro()) is None: return
     where = f"WHERE c.source = '{source}'" if source else ""
     if fmt == "json":
         rows = conn.execute(f"SELECT c.id, c.source, c.title, c.created_at, c.updated_at, c.model, c.cwd, c.git_branch, c.project_id FROM conversations c {where}").fetchall()
@@ -901,6 +916,8 @@ def sync(watch: bool = typer.Option(False, "-w"), interval: int = typer.Option(3
                     if st := j.get("state"): set_state(*st)
                     if src := j.get("source"): typer.echo(f"Updated {j['label']} ({n} new, {u} updated convs; {fmt([c, m, t, a, e])} processed){' in %.2fs' % (time.perf_counter()-j['t']) if verbose else ''}")
         if changed: rebuild_fts_index(conn)
+        try: embed_pending(conn)
+        except ImportError: pass
         if dirty: save_state(state)
         verbose and typer.echo(f"Total sync time {time.perf_counter()-t0:.2f}s")
         return total, newc, updc
@@ -913,9 +930,7 @@ def sync(watch: bool = typer.Option(False, "-w"), interval: int = typer.Option(3
 
 @app.command()
 def stats():
-    conn = get_db(read_only=True)
-    if conn is None: typer.echo("Database not found. Run `convos init` or `convos sync`."); return
-    if not ensure_db_ready(conn): conn.close(); return
+    if (conn := _ro()) is None: return
     typer.echo(f"Conversations: {conn.execute('SELECT COUNT(*) FROM conversations').fetchone()[0]}")
     typer.echo(f"Messages: {conn.execute('SELECT COUNT(*) FROM messages').fetchone()[0]}")
     typer.echo(f"Tool calls: {conn.execute('SELECT COUNT(*) FROM tool_calls').fetchone()[0]}")
