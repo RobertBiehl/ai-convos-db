@@ -38,7 +38,7 @@ Single-file CLI that normalizes conversations from multiple AI providers into a 
 
 ### Single File
 
-All logic lives in `src/ai_convos/cli.py`. This keeps the codebase simple and avoids import complexity. The file is ~600 lines.
+All logic lives in `src/ai_convos/cli.py`. This keeps the codebase simple and avoids import complexity. The file (and total `src/ai_convos/`) is held under the 1000-line budget enforced by `tests/test_budget.py`.
 
 ### ParseResult Normalization
 
@@ -66,6 +66,21 @@ Web fetchers extract cookies from Safari or Chrome to authenticate with APIs. No
 ### FTS via DuckDB
 
 Full-text search uses DuckDB's FTS extension with BM25 scoring. The index covers `content` and `thinking` columns. Index is rebuilt after each sync.
+
+### Hybrid Semantic Search (optional)
+
+`convos query` adds vector retrieval on top of BM25. Embeddings live in
+`messages.embedding` (FLOAT[768], NULL until embedded). Vector similarity is
+computed brute-force via DuckDB's `array_cosine_similarity` — at the current
+scale (tens of thousands of messages) this is fast enough that a vector index
+(VSS/HNSW) would only add complexity.
+
+Pipeline: BM25 top-50 ∪ cosine top-50 → Reciprocal Rank Fusion → Qwen3-Reranker
+top-30 → position-tier blend (rank 0-2: 0.75/0.25, 3-9: 0.6/0.4, 10+: 0.4/0.6).
+Models load lazily, so users without `[hybrid]` extras pay zero overhead.
+
+The `[hybrid]` extra pulls `llama-cpp-python` + `huggingface-hub`. Both models
+are GGUF, downloaded on first call and cached by huggingface-hub.
 
 ## Data Flow
 

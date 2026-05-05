@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.2.0
+- Add opt-in hybrid semantic search with `convos query`: BM25 + local embeddings + Qwen3 reranking.
+- Add `convos embed` to backfill embeddings without fetching new web conversations.
+- Preserve existing embeddings during sync unless message content changes.
+- Document the `[hybrid]` extra and hybrid search database schema.
+
 ## 0.1.3
 - Auto-discover Chrome profiles for ChatGPT sync.
 
