@@ -22,11 +22,12 @@ def get_db(read_only: bool = False):
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     if read_only and not DB_PATH.exists():
         return None
-    try:
-        return duckdb.connect(str(DB_PATH), read_only=read_only)
-    except Exception as e:
-        if "Conflicting lock is held" in str(e): raise ValueError("Database is locked by another convos process. Try again after `convos sync` finishes.") from e
-        raise
+    for i in range(30 if read_only else 1):
+        try: return duckdb.connect(str(DB_PATH), read_only=read_only)
+        except Exception as e:
+            if "Conflicting lock is held" not in str(e): raise
+            if read_only and i < 29: time.sleep(1); continue
+            raise ValueError("Database is locked by another convos process. Try again after `convos sync` finishes.") from e
 
 def load_state():
     if not STATE_PATH.exists(): return {}

@@ -116,6 +116,19 @@ def test_read_commands_handle_locked_db(monkeypatch):
     assert "locked" in (r.output + (r.stderr if r.stderr_bytes is not None else ""))
 
 
+def test_read_db_waits_for_writer(tmp_path, monkeypatch):
+    """Read-only opens retry transient DuckDB writer locks before giving up."""
+    db, calls = tmp_path / "test.db", {"n": 0}; db.touch()
+    monkeypatch.setattr(cli, "DB_PATH", db); monkeypatch.setattr(cli, "DATA_DIR", tmp_path); monkeypatch.setattr(cli.time, "sleep", lambda _: None)
+    def connect(path, read_only=False):
+        calls["n"] += 1
+        if calls["n"] < 3: raise duckdb.IOException("Conflicting lock is held")
+        return "conn"
+    monkeypatch.setattr(cli.duckdb, "connect", connect)
+    assert cli.get_db(read_only=True) == "conn"
+    assert calls["n"] == 3
+
+
 def test_tier_blend_top3_weights():
     """Position-tier blend: ranks 0-2 → 0.75/0.25, 3-9 → 0.6/0.4, 10+ → 0.4/0.6."""
     W = lambda i: (0.75, 0.25) if i < 3 else (0.6, 0.4) if i < 10 else (0.4, 0.6)
