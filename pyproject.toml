@@ -10,11 +10,12 @@ dependencies = [
     "typer>=0.12.0",
     "cryptography>=42.0.0",
     "playwright>=1.40.0",
+    "llama-cpp-python>=0.3.0",
+    "huggingface-hub>=0.20.0",
 ]
 
 [project.optional-dependencies]
 dev = ["pytest>=8.0.0", "pytest-asyncio>=0.23.0"]
-hybrid = ["llama-cpp-python>=0.3.0", "huggingface-hub>=0.20.0"]
 
 [project.scripts]
 convos = "ai_convos:app"

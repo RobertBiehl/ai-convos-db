@@ -77,10 +77,11 @@ scale (tens of thousands of messages) this is fast enough that a vector index
 
 Pipeline: BM25 top-50 ∪ cosine top-50 → Reciprocal Rank Fusion → Qwen3-Reranker
 top-30 → position-tier blend (rank 0-2: 0.75/0.25, 3-9: 0.6/0.4, 10+: 0.4/0.6).
-Models load lazily, so users without `[hybrid]` extras pay zero overhead.
+Models load lazily, so users pay model startup/download cost only when using
+`convos query`, `convos embed`, or sync-time embedding.
 
-The `[hybrid]` extra pulls `llama-cpp-python` + `huggingface-hub`. Both models
-are GGUF, downloaded on first call and cached by huggingface-hub.
+The package depends on `llama-cpp-python` + `huggingface-hub`. Both models are
+GGUF, downloaded on first call and cached by huggingface-hub.
 
 ## Data Flow
 

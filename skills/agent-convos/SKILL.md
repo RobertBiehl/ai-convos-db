@@ -16,7 +16,7 @@ Retrieve:
 
 ```bash
 convos search "query" -n 8 -c 160                   # BM25 — exact terms, fast
-convos query "natural language question" -n 8 -c 160  # hybrid — semantic, requires [hybrid] extra
+convos query "natural language question" -n 8 -c 160  # hybrid — semantic, slower
 convos list -n 20
 convos show <id-prefix> --tools --thinking
 convos get <id-prefix> --since 2024-01-01T00:00:00Z
