@@ -108,6 +108,14 @@ def test_query_migrates_old_db_before_embedding_check(tmp_path, monkeypatch):
     conn.close()
 
 
+def test_read_commands_handle_locked_db(monkeypatch):
+    """Read commands should print a friendly lock message instead of a traceback."""
+    monkeypatch.setattr(cli, "get_db", lambda read_only=False: (_ for _ in ()).throw(ValueError("Database is locked by another convos process.")))
+    r = CliRunner().invoke(cli.app, ["stats"])
+    assert r.exit_code == 0
+    assert "locked" in (r.output + (r.stderr if r.stderr_bytes is not None else ""))
+
+
 def test_tier_blend_top3_weights():
     """Position-tier blend: ranks 0-2 → 0.75/0.25, 3-9 → 0.6/0.4, 10+ → 0.4/0.6."""
     W = lambda i: (0.75, 0.25) if i < 3 else (0.6, 0.4) if i < 10 else (0.4, 0.6)
