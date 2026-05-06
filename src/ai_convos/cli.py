@@ -591,7 +591,7 @@ _MODELS, _MCFG, _LLAMA_LOG = {}, {"emb": dict(repo_id="ggml-org/embeddinggemma-3
 def _llama(role: str):
     global _LLAMA_LOG
     if role not in _MODELS:
-        from llama_cpp import Llama; import llama_cpp.llama_cpp as lc
+        from llama_cpp import Llama; import llama_cpp.llama_cpp as lc, warnings; warnings.filterwarnings("ignore", message="The `local_dir_use_symlinks` argument is deprecated.*", category=UserWarning)
         if _LLAMA_LOG is None: _LLAMA_LOG = lc.llama_log_callback(lambda *_: None); lc.llama_log_set(_LLAMA_LOG, None)
         cfg = _MCFG[role].copy(); nseq = cfg.pop("n_seq_max", 0)
         if nseq:
