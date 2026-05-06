@@ -47,7 +47,7 @@ Upgrade later with:
 pipx upgrade ai-convos-db
 ```
 
-Install skills (Codex + Claude Code):
+Pipx installs the CLI only. Copy the bundled skills into Codex + Claude Code with:
 
 ```bash
 convos install-skills

@@ -25,10 +25,7 @@ def get_db(read_only: bool = False):
     try:
         return duckdb.connect(str(DB_PATH), read_only=read_only)
     except Exception as e:
-        if "Conflicting lock is held" in str(e) and read_only:
-            raise ValueError("Database is locked for writing; read-only access failed.") from e
-        if "Conflicting lock is held" in str(e):
-            raise ValueError("Database is locked by another process. Try again after it finishes.") from e
+        if "Conflicting lock is held" in str(e): raise ValueError("Database is locked by another convos process. Try again after `convos sync` finishes.") from e
         raise
 
 def load_state():
@@ -622,7 +619,8 @@ def embed_pending(conn, batch: int = 32):
 
 # ---- commands ----
 def _ro():
-    c = get_db(read_only=True)
+    try: c = get_db(read_only=True)
+    except ValueError as e: typer.echo(str(e), err=True); return None
     if c is None: typer.echo("Database not found. Run `convos init` or `convos sync`."); return None
     if not ensure_db_ready(c): c.close(); return None
     return c
