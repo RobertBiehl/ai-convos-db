@@ -587,13 +587,15 @@ def upsert(conn, r: ParseResult):
     return len(r.convs), len(r.msgs), len(r.tools), len(r.attachs), len(r.edits), len(new_convs), len(updated)
 
 # ---- embeddings ----
-_MODELS, _MCFG = {}, {"emb": dict(repo_id="ggml-org/embeddinggemma-300m-qat-q8_0-GGUF", filename="embeddinggemma-300m-qat-Q8_0.gguf", embedding=True, n_ctx=16384, n_batch=2048, n_ubatch=2048, n_seq_max=8, n_gpu_layers=-1), "rr": dict(repo_id="ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF", filename="qwen3-reranker-0.6b-q8_0.gguf", n_ctx=4096, logits_all=True, n_gpu_layers=-1)}
+_MODELS, _MCFG, _LLAMA_LOG = {}, {"emb": dict(repo_id="ggml-org/embeddinggemma-300m-qat-q8_0-GGUF", filename="embeddinggemma-300m-qat-Q8_0.gguf", embedding=True, n_ctx=16384, n_batch=2048, n_ubatch=2048, n_seq_max=8, n_gpu_layers=-1), "rr": dict(repo_id="ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF", filename="qwen3-reranker-0.6b-q8_0.gguf", n_ctx=4096, logits_all=True, n_gpu_layers=-1)}, None
 def _llama(role: str):
+    global _LLAMA_LOG
     if role not in _MODELS:
-        from llama_cpp import Llama
+        from llama_cpp import Llama; import llama_cpp.llama_cpp as lc, warnings; warnings.filterwarnings("ignore", message="The `local_dir_use_symlinks` argument is deprecated.*", category=UserWarning)
+        if _LLAMA_LOG is None: _LLAMA_LOG = lc.llama_log_callback(lambda *_: None); lc.llama_log_set(_LLAMA_LOG, None)
         cfg = _MCFG[role].copy(); nseq = cfg.pop("n_seq_max", 0)
         if nseq:
-            import llama_cpp.llama_cpp as lc; orig = lc.llama_context_default_params
+            orig = lc.llama_context_default_params
             lc.llama_context_default_params = lambda o=orig, n=nseq: (setattr(p := o(), "n_seq_max", n) or p)
         try: _MODELS[role] = Llama.from_pretrained(**cfg, verbose=False)
         finally:
@@ -925,8 +927,8 @@ def sync(watch: bool = typer.Option(False, "-w"), interval: int = typer.Option(3
         typer.echo(f"Daemon mode (interval: {interval}s)")
         while True: r, n, u = do_sync(); typer.echo(f"[{datetime.now().isoformat()}] {n} new, {u} updated convs; {r[1]} msgs, {r[2]} tools, {r[3]} attachs, {r[4]} edits"); time.sleep(interval)
     else:
-        r, n, u = do_sync(); typer.echo(f"Updated {n} new, {u} updated convs; {r[1]} msgs, {r[2]} tools, {r[3]} attachs, {r[4]} edits")
-        cur = counts_by_source(conn); fmt = lambda v: f"{v[0]} convs, {v[1]} msgs, {v[2]} tools, {v[3]} attachs, {v[4]} edits"; total = [sum(v[i] for v in cur.values()) for i in range(5)]; typer.echo(f"Total: {fmt(total)}"); conn.close()
+        r, n, u = do_sync(); typer.echo(f"Updated {n} new, {u} updated convs; {r[1]} msgs, {r[2]} tools, {r[3]} attachs, {r[4]} edits processed")
+        fmt = lambda v: f"{v[0]} convs, {v[1]} msgs, {v[2]} tools, {v[3]} attachs, {v[4]} edits"; total = [conn.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0] for t in ("conversations", "messages", "tool_calls", "attachments", "file_edits")]; typer.echo(f"Total: {fmt(total)}"); conn.close()
 
 @app.command()
 def stats():
