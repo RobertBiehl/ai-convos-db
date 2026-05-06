@@ -6,7 +6,7 @@
 
 ## Quick install
 ```bash
-pipx install ai-convos-db
+pipx install "git+https://github.com/RobertBiehl/ai-convos-db.git"
 ```
 
 Local-first, searchable archive for ChatGPT, Claude, and Codex conversations. One file, one DB, fast full-text search.
@@ -29,16 +29,10 @@ Local-first, searchable archive for ChatGPT, Claude, and Codex conversations. On
 
 ## Install
 
-Install with pipx (adds `convos` to PATH in an isolated environment):
+Install from GitHub with pipx (adds `convos` to PATH in an isolated environment):
 
 ```bash
-pipx install ai-convos-db
-```
-
-Install with hybrid semantic search support:
-
-```bash
-pipx install "ai-convos-db[hybrid]"
+pipx install "git+https://github.com/RobertBiehl/ai-convos-db.git"
 ```
 
 Upgrade later with:
@@ -57,8 +51,10 @@ convos install-skills
 
 ```bash
 convos init
+convos install-skills
 convos sync
 convos search "prompt" -s claude -n 10
+convos query "conceptual search"
 ```
 
 If Safari cookies are protected by macOS privacy, `sync` will fall back to Chrome.
@@ -74,12 +70,11 @@ convos embed                                      # backfill embeddings, no web 
 convos query "how do I store vectors in duckdb"    # hybrid: BM25 + embeddings + rerank
 ```
 
-Hybrid search is opt-in. Install with `pipx install "ai-convos-db[hybrid]"`
-(pulls `llama-cpp-python` + `huggingface-hub`). Run `convos embed` or `convos sync`
+Semantic search is included by default. Run `convos embed` or `convos sync`
 after install to backfill embeddings with a progress bar; subsequent syncs only
 embed new/changed messages. Models used: `embeddinggemma-300m-qat-q8_0` for
 embeddings (768d) and `Qwen3-Reranker-0.6B` for reranking. Both are GGUF and
-run on Apple Silicon via Metal.
+run locally via llama.cpp.
 
 Show a conversation:
 
