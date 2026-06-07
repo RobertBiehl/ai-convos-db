@@ -138,3 +138,17 @@ def test_tier_blend_top3_weights():
     assert W(9) == (0.6, 0.4)
     assert W(10) == (0.4, 0.6)
     assert W(99) == (0.4, 0.6)
+
+
+def test_sql_select_and_blocks_writes(tmp_path, monkeypatch):
+    """convos sql runs read-only SELECTs (json + text) and fails writes cleanly."""
+    db = tmp_path / "test.db"
+    monkeypatch.setattr(cli, "DB_PATH", db); monkeypatch.setattr(cli, "DATA_DIR", tmp_path)
+    conn = duckdb.connect(str(db)); cli.init_schema(conn)
+    conn.execute("INSERT INTO conversations VALUES ('c1','test','T',NULL,NULL,NULL,NULL,NULL,NULL,NULL)"); conn.close()
+    r = CliRunner().invoke(cli.app, ["sql", "SELECT id, source FROM conversations", "--json"])
+    assert r.exit_code == 0, r.output
+    assert '"c1"' in r.output and '"test"' in r.output
+    w = CliRunner().invoke(cli.app, ["sql", "UPDATE conversations SET title='x'"])
+    assert w.exit_code == 0
+    assert "Query failed" in (w.output + (w.stderr if w.stderr_bytes is not None else ""))

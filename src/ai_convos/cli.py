@@ -952,4 +952,13 @@ def stats():
         typer.echo(f"  {fp}: {cnt}")
     conn.close()
 
+@app.command()
+def sql(query: str, json_: bool = typer.Option(False, "--json")):
+    if (conn := _ro()) is None: return
+    try: cur = conn.execute(query); cols = [d[0] for d in cur.description]; rows = cur.fetchall()
+    except Exception as e: conn.close(); typer.echo(f"Query failed: {e}", err=True); return
+    conn.close()
+    if json_: typer.echo(json.dumps([dict(zip(cols, r)) for r in rows], default=str)); return
+    typer.echo(" | ".join(cols)); [typer.echo(" | ".join("" if v is None else str(v) for v in r)) for r in rows]; typer.echo(f"\n{len(rows)} rows")
+
 if __name__ == "__main__": app()
