@@ -4,6 +4,40 @@ import pytest, json, os
 from pathlib import Path
 from unittest.mock import patch, MagicMock
 
+# API response schemas for testing (moved here when the dead Playwright browser.py was removed)
+EXPECTED_SCHEMAS = {
+    "chatgpt_conversations": {"type": "object", "required": ["items", "total"],
+        "properties": {"items": {"type": "array"}, "total": {"type": "integer"}}},
+    "chatgpt_conversation": {"type": "object", "required": ["mapping"],
+        "properties": {"mapping": {"type": "object"}}},
+    "claude_organizations": {"type": "array", "items": {"type": "object", "required": ["uuid"]}},
+    "claude_conversations": {"type": "array", "items": {"type": "object", "required": ["uuid"]}},
+    "claude_conversation": {"type": "object", "required": ["uuid", "chat_messages"],
+        "properties": {"chat_messages": {"type": "array"}}},
+}
+
+def validate_schema(data, schema_name):
+    schema = EXPECTED_SCHEMAS.get(schema_name)
+    if not schema:
+        return False, f"Unknown schema: {schema_name}"
+    if schema["type"] == "array":
+        if not isinstance(data, list):
+            return False, f"Expected array, got {type(data).__name__}"
+        if data and "items" in schema and "required" in schema["items"]:
+            for i, item in enumerate(data[:3]):
+                for field in schema["items"]["required"]:
+                    if field not in item:
+                        return False, f"Item {i} missing required field: {field}"
+        return True, "OK"
+    if schema["type"] == "object":
+        if not isinstance(data, dict):
+            return False, f"Expected object, got {type(data).__name__}"
+        for field in schema.get("required", []):
+            if field not in data:
+                return False, f"Missing required field: {field}"
+        return True, "OK"
+    return False, f"Unknown schema type: {schema['type']}"
+
 # Skip all integration tests if SKIP_INTEGRATION is set
 pytestmark = pytest.mark.skipif(
     os.environ.get("SKIP_INTEGRATION", "0") == "1",
@@ -22,7 +56,6 @@ class TestChatGPTAPI:
     @pytest.mark.integration
     def test_conversations_list_schema(self, mock_cookies):
         """Verify /backend-api/conversations returns expected schema."""
-        from ai_convos.browser import validate_schema
 
         # Mock response matching expected schema
         mock_response = {
@@ -39,7 +72,6 @@ class TestChatGPTAPI:
     @pytest.mark.integration
     def test_conversations_list_missing_items(self):
         """Detect if API removes 'items' field."""
-        from ai_convos.browser import validate_schema
 
         broken_response = {"total": 1}  # missing items
         valid, msg = validate_schema(broken_response, "chatgpt_conversations")
@@ -49,7 +81,6 @@ class TestChatGPTAPI:
     @pytest.mark.integration
     def test_conversation_detail_schema(self):
         """Verify /backend-api/conversation/{id} returns expected schema."""
-        from ai_convos.browser import validate_schema
 
         mock_response = {
             "mapping": {
@@ -83,7 +114,6 @@ class TestClaudeAPI:
     @pytest.mark.integration
     def test_organizations_schema(self):
         """Verify /api/organizations returns expected schema."""
-        from ai_convos.browser import validate_schema
 
         mock_response = [{"uuid": "org-123", "name": "Personal"}]
         valid, msg = validate_schema(mock_response, "claude_organizations")
@@ -92,7 +122,6 @@ class TestClaudeAPI:
     @pytest.mark.integration
     def test_organizations_missing_uuid(self):
         """Detect if API changes organization structure."""
-        from ai_convos.browser import validate_schema
 
         broken_response = [{"id": "org-123"}]  # uuid -> id would break us
         valid, msg = validate_schema(broken_response, "claude_organizations")
@@ -102,7 +131,6 @@ class TestClaudeAPI:
     @pytest.mark.integration
     def test_conversations_list_schema(self):
         """Verify /api/organizations/{id}/chat_conversations returns expected schema."""
-        from ai_convos.browser import validate_schema
 
         mock_response = [
             {"uuid": "conv-123", "name": "Test Chat", "created_at": "2024-01-01T00:00:00Z"}
@@ -113,7 +141,6 @@ class TestClaudeAPI:
     @pytest.mark.integration
     def test_conversation_detail_schema(self):
         """Verify conversation detail endpoint returns expected schema."""
-        from ai_convos.browser import validate_schema
 
         mock_response = {
             "uuid": "conv-123",
