@@ -165,6 +165,28 @@ class TestCookieExtraction:
                 cookies = read_chrome_cookies("example.com")
                 assert cookies == {}
 
+    def test_chrome_cookies_strip_v10_prefix(self, tmp_path, monkeypatch):
+        """Recent Chrome prepends a 32-byte hash to each decrypted cookie; strip it (legacy unprefixed values stay intact)."""
+        import sqlite3, hashlib
+        from hashlib import pbkdf2_hmac
+        from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+        from ai_convos import cli
+        key = pbkdf2_hmac("sha1", b"peanuts", b"saltysalt", 1003, 16)
+        def enc_v10(value, prefix=b""):
+            plain = prefix + value
+            pad = 16 - (len(plain) % 16); plain += bytes([pad]) * pad
+            e = Cipher(algorithms.AES(key), modes.CBC(b" " * 16)).encryptor()
+            return b"v10" + e.update(plain) + e.finalize()
+        cdir = tmp_path / "Library/Application Support/Google/Chrome/Default"; cdir.mkdir(parents=True)
+        con = sqlite3.connect(str(cdir / "Cookies"))
+        con.execute("CREATE TABLE cookies (name TEXT, encrypted_value BLOB, host_key TEXT)")
+        con.execute("INSERT INTO cookies VALUES (?,?,?)", ["sessionKey", enc_v10(b"sk-ant-sid02-REAL", hashlib.sha256(b"claude.ai").digest()), ".claude.ai"])
+        con.execute("INSERT INTO cookies VALUES (?,?,?)", ["legacy", enc_v10(b"plain-token-123"), ".claude.ai"])
+        con.commit(); con.close()
+        monkeypatch.setattr(cli.Path, "home", classmethod(lambda cls: tmp_path))
+        monkeypatch.setattr(cli.subprocess, "run", lambda *a, **k: type("R", (), {"returncode": 0, "stdout": "peanuts"})())
+        assert cli.read_chrome_cookies("claude.ai") == {"sessionKey": "sk-ant-sid02-REAL", "legacy": "plain-token-123"}
+
 
 # ---- Deduplication Tests ----
 

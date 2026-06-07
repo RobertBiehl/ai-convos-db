@@ -170,7 +170,7 @@ def read_chrome_cookies(domain: str, profile: str | None = None) -> dict[str, st
         if encrypted[:3] == b'v10':
             cipher = Cipher(algorithms.AES(key), modes.CBC(b' ' * 16))
             decrypted = cipher.decryptor().update(encrypted[3:]) + cipher.decryptor().finalize()
-            cookies[name] = decrypted[:-decrypted[-1]].decode('utf-8', errors='ignore')
+            cookies[name] = (v[32:] if not (v := decrypted[:-decrypted[-1]])[:32].isascii() else v).decode('utf-8', errors='ignore')
     conn.close()
     return cookies
 
