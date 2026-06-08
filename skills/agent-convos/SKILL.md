@@ -18,6 +18,7 @@ Retrieve:
 convos search "query" -n 8 -c 160                   # BM25 — exact terms, fast
 convos query "natural language question" -n 8 -c 160  # hybrid — semantic, slower
 convos list -n 20
+convos sql "SELECT source, COUNT(*) FROM conversations GROUP BY source" -f json  # ad-hoc read-only SQL
 convos show <id-prefix> --tools --thinking
 convos get <id-prefix> --since 2024-01-01T00:00:00Z
 convos get <id-prefix> --after <message-id-prefix>
@@ -27,6 +28,7 @@ convos doctor
 Behavior:
 - Optimize relevance and tokens: set `-n` <= 8 and `-c` <= 200 unless user wants more.
 - Filter early: use `-s` for source, `-d` for recency, `-r` for role when implied.
+- Structured output: add `-f jsonl` (stream, one object per line) or `-f json` to search/query/list/show/get/edits/tools/sql; default is human text. Prefer jsonl when parsing programmatically.
 - Pick the right command: `search` for known keywords or exact strings; `query` for paraphrased / conceptual lookups (slower, needs models loaded).
 - Prefer conversation-level answers: summarize unique conversation IDs/titles, then `show` only when asked.
 - Use `sync` as the only fetch/import update command; use `embed` only to backfill hybrid embeddings.

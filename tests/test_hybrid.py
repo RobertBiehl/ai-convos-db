@@ -146,9 +146,30 @@ def test_sql_select_and_blocks_writes(tmp_path, monkeypatch):
     monkeypatch.setattr(cli, "DB_PATH", db); monkeypatch.setattr(cli, "DATA_DIR", tmp_path)
     conn = duckdb.connect(str(db)); cli.init_schema(conn)
     conn.execute("INSERT INTO conversations VALUES ('c1','test','T',NULL,NULL,NULL,NULL,NULL,NULL,NULL)"); conn.close()
-    r = CliRunner().invoke(cli.app, ["sql", "SELECT id, source FROM conversations", "--json"])
+    r = CliRunner().invoke(cli.app, ["sql", "SELECT id, source FROM conversations", "-f", "json"])
     assert r.exit_code == 0, r.output
     assert '"c1"' in r.output and '"test"' in r.output
     w = CliRunner().invoke(cli.app, ["sql", "UPDATE conversations SET title='x'"])
     assert w.exit_code == 0
     assert "Query failed" in (w.output + (w.stderr if w.stderr_bytes is not None else ""))
+
+
+def test_json_output_formats(tmp_path, monkeypatch):
+    """-f json emits an array; -f jsonl emits one object per line; across read commands."""
+    import json as _json
+    db = tmp_path / "test.db"
+    monkeypatch.setattr(cli, "DB_PATH", db); monkeypatch.setattr(cli, "DATA_DIR", tmp_path)
+    conn = duckdb.connect(str(db)); cli.init_schema(conn)
+    conn.execute("INSERT INTO conversations VALUES ('c1','test','T',NULL,NULL,NULL,NULL,NULL,NULL,NULL)")
+    conn.execute("INSERT INTO messages VALUES ('m1','c1','user','hello',NULL,NULL,NULL,NULL,NULL)")
+    conn.execute("INSERT INTO messages VALUES ('m2','c1','assistant','hi there',NULL,NULL,NULL,NULL,NULL)")
+    cli.rebuild_fts_index(conn); conn.close()
+    data = _json.loads(CliRunner().invoke(cli.app, ["list", "-f", "json"]).output)
+    assert data[0]["id"] == "c1" and data[0]["messages"] == 2
+    out = CliRunner().invoke(cli.app, ["get", "c1", "-f", "jsonl"]).output
+    objs = [_json.loads(l) for l in out.strip().splitlines() if l.strip()]
+    assert len(objs) == 2 and {o["role"] for o in objs} == {"user", "assistant"}
+    sh = _json.loads(CliRunner().invoke(cli.app, ["show", "c1", "-f", "json"]).output)
+    assert sh["id"] == "c1" and len(sh["messages"]) == 2
+    sd = _json.loads(CliRunner().invoke(cli.app, ["search", "hello", "-f", "json"]).output)
+    assert isinstance(sd, list)
