@@ -944,11 +944,8 @@ def sync(watch: bool = typer.Option(False, "-w"), interval: int = typer.Option(3
         fmt = lambda v: f"{v[0]} convs, {v[1]} msgs, {v[2]} tools, {v[3]} attachs, {v[4]} edits"; total = [conn.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0] for t in ("conversations", "messages", "tool_calls", "attachments", "file_edits")]; typer.echo(f"Total: {fmt(total)}"); conn.close()
 
 @app.command()
-def stats(fmt: str = typer.Option("text", "-f", "--format")):
+def stats():
     if (conn := _ro()) is None: return
-    if fmt != "text":
-        q = lambda s: conn.execute(s).fetchone()[0]
-        emit(dict(conversations=q('SELECT COUNT(*) FROM conversations'), messages=q('SELECT COUNT(*) FROM messages'), tool_calls=q('SELECT COUNT(*) FROM tool_calls'), attachments=q('SELECT COUNT(*) FROM attachments'), file_edits=q('SELECT COUNT(*) FROM file_edits'), with_thinking=q('SELECT COUNT(*) FROM messages WHERE thinking IS NOT NULL'), by_source=[dict(source=s, conversations=c, messages=m) for s, c, m in conn.execute("SELECT source, COUNT(*), (SELECT COUNT(*) FROM messages mm JOIN conversations c2 ON mm.conversation_id=c2.id WHERE c2.source=c.source) FROM conversations c GROUP BY source").fetchall()]), fmt); conn.close(); return
     typer.echo(f"Conversations: {conn.execute('SELECT COUNT(*) FROM conversations').fetchone()[0]}")
     typer.echo(f"Messages: {conn.execute('SELECT COUNT(*) FROM messages').fetchone()[0]}")
     typer.echo(f"Tool calls: {conn.execute('SELECT COUNT(*) FROM tool_calls').fetchone()[0]}")
