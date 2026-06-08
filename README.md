@@ -76,13 +76,11 @@ embed new/changed messages. Models used: `embeddinggemma-300m-qat-q8_0` for
 embeddings (768d) and `Qwen3-Reranker-0.6B` for reranking. Both are GGUF and
 run locally via llama.cpp.
 
-Show a conversation:
+List and read (read-only DuckDB SQL; schema in `docs/database.md`):
 
 ```bash
-convos list -n 20
-convos show <id-prefix> --tools --thinking
-convos get <id-prefix> --since 2024-01-01T00:00:00Z
-convos get <id-prefix> --after <message-id-prefix>
+convos sql "SELECT id, title, created_at FROM conversations ORDER BY created_at DESC LIMIT 20" -f json
+convos sql "SELECT role, content FROM messages WHERE conversation_id LIKE 'abc%' ORDER BY created_at" -f jsonl
 ```
 
 Sync:
@@ -129,14 +127,11 @@ f2b9c5a9  ChatGPT  "Indexing embeddings with DuckDB"  2026-01-14T09:22:11Z
 ```
 
 ```bash
-convos show f2b9c5a9 --tools --thinking
+convos sql "SELECT role, content FROM messages WHERE conversation_id LIKE 'f2b9c5a9%' ORDER BY created_at" -f jsonl
 ```
 ```text
-ChatGPT  Indexing embeddings with DuckDB  2026-01-14T09:22:11Z
-user: How do I store vectors in DuckDB?
-assistant: Use a table with a FLOAT[] column and an HNSW index...
-tool: web.search {"q":"duckdb hnsw index"}
-assistant: Here's a minimal schema and index setup...
+{"role": "user", "content": "How do I store vectors in DuckDB?"}
+{"role": "assistant", "content": "Use a table with a FLOAT[] column and an HNSW index..."}
 ```
 
 ## Data model
