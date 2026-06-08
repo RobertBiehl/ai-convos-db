@@ -640,6 +640,10 @@ def _fmt_hit(content, ts, role, title, src, cid, cwd, q, ctx, meta):
     for w in q.split(): p = re.sub(f"({re.escape(w)})", r"\033[1;33m\1\033[0m", p, flags=re.I)
     typer.echo(f"\n{'='*60}\n[{src}] {title or 'Untitled'}{f' @ {cwd}' if cwd else ''} ({cid[:8]})\n{role} @ {ts or '?'} ({meta})\n{'-'*40}\n{p}")
 
+def emit(data, fmt):
+    if fmt == "jsonl" and isinstance(data, list): [typer.echo(json.dumps(r, default=str)) for r in data]
+    else: typer.echo(json.dumps(data, default=str))
+
 @app.command()
 def init():
     conn = get_db(); init_schema(conn); rebuild_fts_index(conn); conn.close()
@@ -647,7 +651,7 @@ def init():
     typer.echo(f"Database initialized at {DB_PATH}")
 
 @app.command()
-def search(query: str, source: Optional[str] = typer.Option(None, "-s"), days: Optional[int] = typer.Option(None, "-d"), role: Optional[str] = typer.Option(None, "-r"), thinking: bool = typer.Option(False, "--thinking", "-t"), limit: int = typer.Option(20, "-n"), context: int = typer.Option(300, "-c")):
+def search(query: str, source: Optional[str] = typer.Option(None, "-s"), days: Optional[int] = typer.Option(None, "-d"), role: Optional[str] = typer.Option(None, "-r"), thinking: bool = typer.Option(False, "--thinking", "-t"), limit: int = typer.Option(20, "-n"), context: int = typer.Option(300, "-c"), fmt: str = typer.Option("text", "-f", "--format")):
     if (conn := _ro()) is None: return
     try: load_fts(conn)
     except ValueError as e: conn.close(); typer.echo(str(e)); return
@@ -655,6 +659,7 @@ def search(query: str, source: Optional[str] = typer.Option(None, "-s"), days: O
     results = conn.execute(f"""SELECT m.content, m.thinking, m.role, m.created_at, fts_main_messages.match_bm25(m.id, ?) as score, c.title, c.source, c.id, c.cwd
         FROM messages m JOIN conversations c ON m.conversation_id = c.id WHERE score IS NOT NULL{' AND ' + ' AND '.join(w) if w else ''} ORDER BY score DESC LIMIT ?""", [query] + p + [limit]).fetchall()
     conn.close()
+    if fmt != "text": emit([dict(role=r, content=content, thinking=think, created_at=ts, score=score, title=title, source=src, conversation_id=cid, cwd=cwd) for content, think, r, ts, score, title, src, cid, cwd in results], fmt); return
     if not results: typer.echo("No results"); return
     for content, think, r, ts, score, title, src, cid, cwd in results:
         _fmt_hit(content, ts, r, title, src, cid, cwd, query, context, f"score: {score:.2f}")
@@ -662,7 +667,7 @@ def search(query: str, source: Optional[str] = typer.Option(None, "-s"), days: O
     typer.echo(f"\n{len(results)} results")
 
 @app.command("query")
-def query_cmd(q: str, source: Optional[str] = typer.Option(None, "-s"), days: Optional[int] = typer.Option(None, "-d"), role: Optional[str] = typer.Option(None, "-r"), limit: int = typer.Option(10, "-n"), context: int = typer.Option(300, "-c")):
+def query_cmd(q: str, source: Optional[str] = typer.Option(None, "-s"), days: Optional[int] = typer.Option(None, "-d"), role: Optional[str] = typer.Option(None, "-r"), limit: int = typer.Option(10, "-n"), context: int = typer.Option(300, "-c"), fmt: str = typer.Option("text", "-f", "--format")):
     if (conn := _hybrid_ro()) is None: return
     if not conn.execute("SELECT COUNT(*) FROM messages WHERE embedding IS NOT NULL").fetchone()[0]:
         conn.close(); typer.echo("No embeddings yet. Run `pip install ai-convos-db[hybrid]` and `convos embed`, or use `convos search` for BM25 only.", err=True); return
@@ -683,6 +688,7 @@ def query_cmd(q: str, source: Optional[str] = typer.Option(None, "-s"), days: Op
     except Exception as e: typer.echo(f"Hybrid rerank failed: {e}", err=True); return
     W = lambda i: (0.75, 0.25) if i < 3 else (0.6, 0.4) if i < 10 else (0.4, 0.6)
     ranked = sorted([(W(i)[0]*(1.0/(i+1)) + W(i)[1]*rr, row, rr) for i, (row, rr) in enumerate(zip(rows, rrs))], reverse=True, key=lambda x: x[0])
+    if fmt != "text": emit([dict(score=score, role=r, content=content, created_at=ts, title=title, source=src, conversation_id=cid, cwd=cwd, rerank=rr) for score, (r, content, ts, title, src, cid, cwd), rr in ranked[:limit]], fmt); return
     for score, (r, content, ts, title, src, cid, cwd), rr in ranked[:limit]: _fmt_hit(content, ts, r, title, src, cid, cwd, q, context, f"score: {score:.3f}, rerank: {rr:.2f}")
     typer.echo(f"\n{min(len(ranked), limit)} results")
 
@@ -692,74 +698,6 @@ def embed_cmd(batch: int = typer.Option(32, "-b")):
     try: embed_pending(conn, batch); typer.echo("Embeddings ready")
     except Exception as e: typer.echo(f"Embedding failed: {e}", err=True)
     conn.close()
-
-@app.command("list")
-def list_convos(source: Optional[str] = typer.Option(None, "-s"), days: Optional[int] = typer.Option(None, "-d"), cwd: Optional[str] = typer.Option(None, "--cwd"), limit: int = typer.Option(50, "-n")):
-    if (conn := _ro()) is None: return
-    wp, params = [], []
-    if source: wp.append("source = ?"); params.append(source)
-    if days: wp.append("created_at > ?"); params.append(datetime.now() - timedelta(days=days))
-    if cwd: wp.append("cwd LIKE ?"); params.append(f"%{cwd}%")
-    rows = conn.execute(f"""SELECT id, source, title, created_at, cwd, git_branch, (SELECT COUNT(*) FROM messages WHERE conversation_id = c.id) FROM conversations c {('WHERE ' + ' AND '.join(wp)) if wp else ''} ORDER BY created_at DESC LIMIT ?""", params + [limit]).fetchall()
-    conn.close()
-    for cid, src, title, ts, cwd, branch, cnt in rows:
-        typer.echo(f"{cid[:8]}  [{src:12}]  {str(ts)[:16] if ts else '?':16}  {cnt:3} msgs  {(title or 'Untitled')[:30]}{f' [{cwd}]' if cwd else ''}{f' ({branch})' if branch else ''}")
-    typer.echo(f"\n{len(rows)} conversations")
-
-@app.command()
-def show(conv_id: str, tools_: bool = typer.Option(False, "--tools", "-t"), thinking: bool = typer.Option(False, "--thinking")):
-    if (conn := _ro()) is None: return
-    conv = conn.execute("SELECT id, source, title, created_at, model, cwd, git_branch, project_id FROM conversations WHERE id LIKE ?", [f"{conv_id}%"]).fetchone()
-    if not conv: typer.echo("Not found"); return
-    cid, src, title, ts, model, cwd, branch, proj = conv
-    extras = "".join(f"\n{k}: {v}" for k, v in [("Directory", cwd), ("Branch", branch), ("Project", proj)] if v)
-    typer.echo(f"{'='*60}\n[{src}] {title or 'Untitled'}\nID: {cid}\nCreated: {ts}\nModel: {model}{extras}\n{'='*60}\n")
-    for role, content, think, mts, mmodel in conn.execute("SELECT role, content, thinking, created_at, model FROM messages WHERE conversation_id = ? ORDER BY created_at", [cid]).fetchall():
-        typer.echo(f"\n--- {role.upper()}{f' [{mmodel}]' if mmodel else ''} @ {mts or '?'} ---\n{content}")
-        if thinking and think: typer.echo(f"\n[THINKING]\n{think}")
-    if tools_ and (tcs := conn.execute("SELECT tool_name, input, output, status, duration_ms FROM tool_calls tc JOIN messages m ON tc.message_id = m.id WHERE m.conversation_id = ?", [cid]).fetchall()):
-        typer.echo(f"\n{'='*60}\nTOOL CALLS ({len(tcs)})\n{'='*60}")
-        for name, inp, out, status, dur in tcs:
-            typer.echo(f"\n{name} [{status}]{f' ({dur}ms)' if dur else ''}\nIn: {inp[:200]}{'...' if len(inp)>200 else ''}\nOut: {out[:200]}{'...' if len(out)>200 else ''}")
-    conn.close()
-
-@app.command()
-def get(conv_id: str, since: Optional[str] = typer.Option(None, "--since"), after: Optional[str] = typer.Option(None, "--after"), limit: int = typer.Option(50, "-n"), thinking: bool = typer.Option(False, "--thinking")):
-    if (conn := _ro()) is None: return
-    conv = conn.execute("SELECT id, source, title FROM conversations WHERE id LIKE ?", [f"{conv_id}%"]).fetchone()
-    if not conv: typer.echo("Not found"); return
-    cid, src, title = conv
-    where, params = ["conversation_id = ?"], [cid]
-    if since: where.append("created_at > ?"); params.append(ts_from_iso(since))
-    if after:
-        row = conn.execute("SELECT created_at FROM messages WHERE id LIKE ? AND conversation_id = ? ORDER BY created_at LIMIT 1", [f"{after}%", cid]).fetchone()
-        if not row or not row[0]: conn.close(); typer.echo("After message not found or missing timestamp"); return
-        where.append("created_at > ?"); params.append(row[0])
-    msgs = conn.execute(f"SELECT id, role, content, thinking, created_at, model FROM messages WHERE {' AND '.join(where)} ORDER BY created_at LIMIT ?", params + [limit]).fetchall()
-    conn.close()
-    typer.echo(f"{'='*60}\n[{src}] {title or 'Untitled'}\nID: {cid}\n{'='*60}\n")
-    for mid, role, content, think, mts, mmodel in msgs:
-        typer.echo(f"\n--- {role.upper()}{f' [{mmodel}]' if mmodel else ''} @ {mts or '?'} ({mid[:8]}) ---\n{content}")
-        if thinking and think: typer.echo(f"\n[THINKING]\n{think}")
-    typer.echo(f"\n{len(msgs)} messages")
-
-@app.command()
-def edits(path: Optional[str] = typer.Argument(None), limit: int = typer.Option(30, "-n")):
-    if (conn := _ro()) is None: return
-    where, prm = ("WHERE file_path LIKE ?", [f"%{path}%", limit]) if path else ("", [limit])
-    results = conn.execute(f"SELECT file_path, edit_type, content, created_at FROM file_edits {where} ORDER BY created_at DESC LIMIT ?", prm).fetchall()
-    conn.close()
-    for fp, et, content, ts in results: typer.echo(f"\n{'-'*40}\n{fp} [{et}] @ {ts}\n{content[:200]}{'...' if len(content)>200 else ''}")
-    typer.echo(f"\n{len(results)} edits")
-
-@app.command()
-def tools(query: Optional[str] = typer.Argument(None), limit: int = typer.Option(30, "-n")):
-    if (conn := _ro()) is None: return
-    where, prm = ("WHERE tool_name ILIKE ? OR input ILIKE ? OR output ILIKE ?", [f"%{query}%"]*3 + [limit]) if query else ("", [limit])
-    results = conn.execute(f"SELECT tool_name, input, output, status, created_at FROM tool_calls {where} ORDER BY created_at DESC LIMIT ?", prm).fetchall()
-    conn.close()
-    for name, inp, out, status, ts in results: typer.echo(f"\n{'-'*40}\n{name} [{status}] @ {ts}\nIn: {inp[:100]}{'...' if len(inp)>100 else ''}\nOut: {out[:100]}{'...' if len(out)>100 else ''}")
-    typer.echo(f"\n{len(results)} tool calls")
 
 @app.command()
 def doctor(verbose: bool = typer.Option(False, "-v")):
@@ -930,35 +868,12 @@ def sync(watch: bool = typer.Option(False, "-w"), interval: int = typer.Option(3
         fmt = lambda v: f"{v[0]} convs, {v[1]} msgs, {v[2]} tools, {v[3]} attachs, {v[4]} edits"; total = [conn.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0] for t in ("conversations", "messages", "tool_calls", "attachments", "file_edits")]; typer.echo(f"Total: {fmt(total)}"); conn.close()
 
 @app.command()
-def stats():
-    if (conn := _ro()) is None: return
-    typer.echo(f"Conversations: {conn.execute('SELECT COUNT(*) FROM conversations').fetchone()[0]}")
-    typer.echo(f"Messages: {conn.execute('SELECT COUNT(*) FROM messages').fetchone()[0]}")
-    typer.echo(f"Tool calls: {conn.execute('SELECT COUNT(*) FROM tool_calls').fetchone()[0]}")
-    typer.echo(f"Attachments: {conn.execute('SELECT COUNT(*) FROM attachments').fetchone()[0]}")
-    typer.echo(f"File edits: {conn.execute('SELECT COUNT(*) FROM file_edits').fetchone()[0]}")
-    typer.echo(f"With thinking: {conn.execute('SELECT COUNT(*) FROM messages WHERE thinking IS NOT NULL').fetchone()[0]}")
-    typer.echo("\nBy source:")
-    for src, cnt, msgs in conn.execute("SELECT source, COUNT(*), (SELECT COUNT(*) FROM messages m JOIN conversations c2 ON m.conversation_id=c2.id WHERE c2.source=c.source) FROM conversations c GROUP BY source").fetchall():
-        typer.echo(f"  {src}: {cnt} convs, {msgs} msgs")
-    typer.echo("\nTop directories:")
-    for cwd, cnt in conn.execute("SELECT cwd, COUNT(*) as c FROM conversations WHERE cwd IS NOT NULL GROUP BY cwd ORDER BY c DESC LIMIT 5").fetchall():
-        typer.echo(f"  {cwd}: {cnt}")
-    typer.echo("\nTop tools:")
-    for name, cnt in conn.execute("SELECT tool_name, COUNT(*) as c FROM tool_calls GROUP BY tool_name ORDER BY c DESC LIMIT 10").fetchall():
-        typer.echo(f"  {name}: {cnt}")
-    typer.echo("\nMost edited files:")
-    for fp, cnt in conn.execute("SELECT file_path, COUNT(*) as c FROM file_edits GROUP BY file_path ORDER BY c DESC LIMIT 5").fetchall():
-        typer.echo(f"  {fp}: {cnt}")
-    conn.close()
-
-@app.command()
-def sql(query: str, json_: bool = typer.Option(False, "--json")):
+def sql(query: str, fmt: str = typer.Option("text", "-f", "--format")):
     if (conn := _ro()) is None: return
     try: cur = conn.execute(query); cols = [d[0] for d in cur.description]; rows = cur.fetchall()
     except Exception as e: conn.close(); typer.echo(f"Query failed: {e}", err=True); return
     conn.close()
-    if json_: typer.echo(json.dumps([dict(zip(cols, r)) for r in rows], default=str)); return
+    if fmt != "text": emit([dict(zip(cols, r)) for r in rows], fmt); return
     typer.echo(" | ".join(cols)); [typer.echo(" | ".join("" if v is None else str(v) for v in r)) for r in rows]; typer.echo(f"\n{len(rows)} rows")
 
 if __name__ == "__main__": app()

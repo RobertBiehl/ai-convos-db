@@ -111,7 +111,7 @@ def test_query_migrates_old_db_before_embedding_check(tmp_path, monkeypatch):
 def test_read_commands_handle_locked_db(monkeypatch):
     """Read commands should print a friendly lock message instead of a traceback."""
     monkeypatch.setattr(cli, "get_db", lambda read_only=False: (_ for _ in ()).throw(ValueError("Database is locked by another convos process.")))
-    r = CliRunner().invoke(cli.app, ["stats"])
+    r = CliRunner().invoke(cli.app, ["search", "x"])
     assert r.exit_code == 0
     assert "locked" in (r.output + (r.stderr if r.stderr_bytes is not None else ""))
 
@@ -146,9 +146,28 @@ def test_sql_select_and_blocks_writes(tmp_path, monkeypatch):
     monkeypatch.setattr(cli, "DB_PATH", db); monkeypatch.setattr(cli, "DATA_DIR", tmp_path)
     conn = duckdb.connect(str(db)); cli.init_schema(conn)
     conn.execute("INSERT INTO conversations VALUES ('c1','test','T',NULL,NULL,NULL,NULL,NULL,NULL,NULL)"); conn.close()
-    r = CliRunner().invoke(cli.app, ["sql", "SELECT id, source FROM conversations", "--json"])
+    r = CliRunner().invoke(cli.app, ["sql", "SELECT id, source FROM conversations", "-f", "json"])
     assert r.exit_code == 0, r.output
     assert '"c1"' in r.output and '"test"' in r.output
     w = CliRunner().invoke(cli.app, ["sql", "UPDATE conversations SET title='x'"])
     assert w.exit_code == 0
     assert "Query failed" in (w.output + (w.stderr if w.stderr_bytes is not None else ""))
+
+
+def test_json_output_formats(tmp_path, monkeypatch):
+    """-f json emits an array; -f jsonl emits one object per line; across read commands."""
+    import json as _json
+    db = tmp_path / "test.db"
+    monkeypatch.setattr(cli, "DB_PATH", db); monkeypatch.setattr(cli, "DATA_DIR", tmp_path)
+    conn = duckdb.connect(str(db)); cli.init_schema(conn)
+    conn.execute("INSERT INTO conversations VALUES ('c1','test','T',NULL,NULL,NULL,NULL,NULL,NULL,NULL)")
+    conn.execute("INSERT INTO messages VALUES ('m1','c1','user','hello',NULL,NULL,NULL,NULL,NULL)")
+    conn.execute("INSERT INTO messages VALUES ('m2','c1','assistant','hi there',NULL,NULL,NULL,NULL,NULL)")
+    cli.rebuild_fts_index(conn); conn.close()
+    data = _json.loads(CliRunner().invoke(cli.app, ["sql", "SELECT id, source FROM conversations", "-f", "json"]).output)
+    assert data == [{"id": "c1", "source": "test"}]
+    out = CliRunner().invoke(cli.app, ["sql", "SELECT role FROM messages ORDER BY role", "-f", "jsonl"]).output
+    objs = [_json.loads(l) for l in out.strip().splitlines() if l.strip()]
+    assert [o["role"] for o in objs] == ["assistant", "user"]
+    sd = _json.loads(CliRunner().invoke(cli.app, ["search", "hello", "-f", "json"]).output)
+    assert isinstance(sd, list)

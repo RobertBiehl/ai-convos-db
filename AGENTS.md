@@ -93,9 +93,8 @@ Manual Validation
 
 ```bash
 uv run convos init             # create db
-uv run convos sync             # sync local CLI sessions
-uv run convos fetch claude     # fetch from web (needs cookies)
-uv run convos stats            # verify counts
+uv run convos sync             # sync local CLI sessions + fetch web (needs cookies)
+uv run convos sql "SELECT source, COUNT(*) FROM conversations GROUP BY source"  # verify counts
 uv run convos search "test"    # verify FTS works
 uv run convos query "test"     # verify hybrid pipeline
 ```
