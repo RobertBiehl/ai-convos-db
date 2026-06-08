@@ -342,11 +342,11 @@ def fetch_chatgpt(browser: str = "safari", limit: int = 0) -> ParseResult:
             if total and fetched > total: total = None
             typer.echo(f"  fetched {fetched}{'/' + str(total) if total else ''}")
         return r
-    out = ParseResult()
+    out, errs = ParseResult(), []
     for profile in chatgpt_profiles(browser):
         try: merge_results(out, fetch_with_profile(profile))
-        except Exception as e:
-            if debug: typer.echo(f"  chatgpt chrome profile={profile} failed: {e}", err=True)
+        except Exception as e: errs.append(f"{profile or 'default'}: {e}")
+    if errs and not out.convs: raise ValueError("ChatGPT fetch failed -- " + " | ".join(errs))
     return out
 
 def fetch_claude(browser: str = "safari", limit: int = 0, since: datetime = None) -> ParseResult:
@@ -881,7 +881,7 @@ def sync(watch: bool = typer.Option(False, "-w"), interval: int = typer.Option(3
                 return dict(name=name, label=name.title(), source=name, func=func, state=("web", name, st))
             except Exception as e:
                 errors.append(f"{b}: {e}")
-        if errors: typer.echo(f"{name} sync failed: " + " | ".join(errors))
+        if errors: typer.echo(f"{name}: no cookies found -- skipped" if all("cookies" in e.lower() for e in errors) else f"{name} sync failed: " + " | ".join(errors))
         return None
     def plan_import(path: Path):
         if not path.exists(): return None

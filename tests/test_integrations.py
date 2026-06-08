@@ -74,6 +74,14 @@ class TestChatGPTAPI:
             assert "source" in conv
             assert conv["source"] == "chatgpt"
 
+    def test_fetch_chatgpt_surfaces_total_failure(self, monkeypatch):
+        """A fully failed fetch raises instead of returning empty (no silent 'success')."""
+        from ai_convos import cli
+        monkeypatch.setattr(cli, "chatgpt_profiles", lambda b: ["Default"])
+        monkeypatch.setattr(cli, "chatgpt_cookie_base", lambda *a, **k: (_ for _ in ()).throw(ValueError("HTTP Error 401: Unauthorized")))
+        with pytest.raises(Exception):
+            cli.fetch_chatgpt(browser="chrome")
+
 
 # ---- Claude API Tests ----
 
