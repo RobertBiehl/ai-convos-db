@@ -207,7 +207,33 @@ class TestCodexParser:
         user_id = next(m["id"] for m in result.msgs if m["role"] == "user")
         assert len(result.tools) == 2
         assert all(t["message_id"] == user_id for t in result.tools)
-        assert result.edits == []  # plain shell commands are not guessed into edits
+        assert len(result.edits) == 1  # redirect target is exact; content stays the command (unknown effect)
+        assert result.edits[0]["file_path"] == "/out.txt"
+        assert result.edits[0]["edit_type"] == "shell"
+        assert result.edits[0]["old_content"] is None
+
+    def test_heredoc_write_edits(self, tmp_path):
+        """cat > file <<EOF heredocs yield write edits with the exact full content."""
+        from ai_convos.cli import parse_codex
+
+        sessions_dir = tmp_path / ".codex" / "sessions"
+        sessions_dir.mkdir(parents=True)
+
+        cmd = "cat > src/x.py <<'EOF'\nprint('a')\nprint('b')\nEOF"
+        jsonl = sessions_dir / "session.jsonl"
+        jsonl.write_text("\n".join([
+            json.dumps({"type": "session_meta", "timestamp": "2024-01-01T00:00:00Z", "payload": {"cwd": "/repo"}}),
+            json.dumps({"type": "response_item", "timestamp": "2024-01-01T00:00:01Z", "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "write it"}]}}),
+            json.dumps({"type": "response_item", "timestamp": "2024-01-01T00:00:02Z", "payload": {"type": "function_call", "name": "exec_command", "arguments": json.dumps({"cmd": cmd})}}),
+            json.dumps({"type": "response_item", "timestamp": "2024-01-01T00:00:03Z", "payload": {"type": "function_call", "name": "exec_command", "arguments": json.dumps({"cmd": "python3 - <<'PY'\nprint(1)\nPY"})}}),
+        ]))
+
+        result = parse_codex(tmp_path / ".codex")
+
+        assert len(result.edits) == 1  # interpreter heredocs (no redirect) are not edits
+        assert result.edits[0]["file_path"] == "/repo/src/x.py"
+        assert result.edits[0]["edit_type"] == "write"
+        assert result.edits[0]["content"] == "print('a')\nprint('b')"
 
     def test_apply_patch_edits(self, tmp_path):
         """exec_command apply_patch heredocs yield exact per-hunk edits with before/after text."""
