@@ -500,7 +500,7 @@ def parse_claude_code_session(jsonl: Path) -> dict:
                     old_content=t["input"].get("old_string"))
                for j, t in enumerate(c["tools"]) if t.get("name") in ("Write", "Edit", "MultiEdit") and t.get("input", {}).get("file_path")]
 
-    msgs = [make_msg(idx, i, e) for idx, (i, e) in enumerate(msg_events) if extract_content(e["message"].get("content", ""))["text"]]
+    msgs = [make_msg(idx, i, e) for idx, (i, e) in enumerate(msg_events) if (c := extract_content(e["message"].get("content", "")))["text"] or c["tools"]]  # keep tool-only turns: tools/edits reference them
     if not msgs: return None
     return {
         "conv": dict(id=cid, source=src, title=f"{jsonl.parent.name.replace('-Users-', '~/').replace('-', '/')} ({jsonl.stem[:8]})",
@@ -531,21 +531,23 @@ def parse_codex_session(jsonl: Path) -> dict | None:
     def norm_args(p):
         return json.loads(a) if isinstance((a := p.get("arguments", {})), str) else a
 
-    msgs = [dict(id=gen_id(src, f"{cid}:{i}"), conversation_id=cid, role=p["role"], content=text.strip(),
+    mitems = [(i, p, t) for i, p in items if p.get("type") == "message" and p.get("role") not in ("developer", "system") and (t := extract_msg_text(p))]
+    msgs = [dict(id=gen_id(src, f"{cid}:{i}"), conversation_id=cid, role=p["role"], content=t.strip(),
                 thinking=None, created_at=timestamps[i] if i < len(timestamps) else None, model=None, metadata="{}")
-           for i, p in items if p.get("type") == "message" and p.get("role") not in ("developer", "system") and (text := extract_msg_text(p))]
+           for i, p, t in mitems]
     if not msgs: return None
+    anchor = lambda k: gen_id(src, f"{cid}:{next((i for i, _, _ in reversed(mitems) if i <= k), mitems[0][0])}")  # function_call items are not messages; attach to nearest preceding one
 
-    tools = [dict(id=gen_id(src, f"tool:{cid}:{i}"), message_id=gen_id(src, f"{cid}:{i}"), tool_name=p["name"],
+    tools = [dict(id=gen_id(src, f"tool:{cid}:{i}"), message_id=anchor(i), tool_name=p["name"],
                  input=json.dumps(args), output="{}", status="pending", duration_ms=None,
                  created_at=timestamps[i] if i < len(timestamps) else None)
             for i, p in items if p.get("type") == "function_call" and (args := norm_args(p))] + \
-           [dict(id=gen_id(src, f"toolout:{cid}:{i}"), message_id=gen_id(src, f"{cid}:{i}"), tool_name=p.get("call_id"),
+           [dict(id=gen_id(src, f"toolout:{cid}:{i}"), message_id=anchor(i), tool_name=p.get("call_id"),
                  input="{}", output=json.dumps(p.get("output", "")), status="complete", duration_ms=None,
                  created_at=timestamps[i] if i < len(timestamps) else None)
             for i, p in items if p.get("type") == "function_call_output"]
 
-    edits = [dict(id=gen_id(src, f"edit:{cid}:{i}:{j}"), message_id=gen_id(src, f"{cid}:{i}"),
+    edits = [dict(id=gen_id(src, f"edit:{cid}:{i}:{j}"), message_id=anchor(i),
                  file_path=m.group(1), edit_type="shell", content=cmd,
                  created_at=timestamps[i] if i < len(timestamps) else None, old_content=None)
             for i, p in items if p.get("type") == "function_call" and p.get("name") == "shell"
