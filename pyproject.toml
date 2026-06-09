@@ -14,7 +14,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8.0.0", "pytest-asyncio>=0.23.0"]
+dev = ["pytest>=8.0.0", "pytest-asyncio>=0.23.0", "ai-convos-changegraph"]
 
 [project.scripts]
 convos = "ai_convos:app"
@@ -34,6 +34,12 @@ where = ["src"]
 
 [tool.uv]
 package = true
+
+[tool.uv.workspace]
+members = ["apps/*"]
+
+[tool.uv.sources]
+ai-convos-changegraph = { workspace = true }
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

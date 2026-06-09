@@ -1,0 +1,23 @@
+[project]
+name = "ai-convos-changegraph"
+version = "0.1.0"
+description = "Change graph over the convos DB: blame, timeline, time-travel, graph export"
+license = {text = "MIT"}
+requires-python = ">=3.12"
+dependencies = ["ai-convos-db", "typer>=0.12.0", "duckdb>=1.0.0"]
+
+[project.entry-points."convos.commands"]
+changegraph = "ai_convos_changegraph:register"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.uv.sources]
+ai-convos-db = { workspace = true }

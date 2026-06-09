@@ -103,6 +103,28 @@ class TestClaudeCodeParser:
         assert result.edits[1]["content"] == "print('world')"
         assert result.edits[1]["old_content"] == "print('hello')"
 
+    def test_tool_only_turns_keep_message_rows(self, tmp_path):
+        """Tool-only assistant turns produce message rows so tools/edits are not orphaned."""
+        from ai_convos.cli import parse_claude_code
+
+        session_dir = tmp_path / ".claude" / "projects" / "-test"
+        session_dir.mkdir(parents=True)
+
+        jsonl = session_dir / "session.jsonl"
+        jsonl.write_text("\n".join([
+            json.dumps({"type": "user", "timestamp": "2024-01-01T00:00:00Z", "message": {"content": "edit the file"}}),
+            json.dumps({"type": "assistant", "timestamp": "2024-01-01T00:00:01Z", "message": {"content": [
+                {"type": "tool_use", "name": "Edit", "input": {"file_path": "/t.py", "old_string": "a", "new_string": "b"}}
+            ]}}),
+        ]))
+
+        result = parse_claude_code(tmp_path / ".claude" / "projects")
+
+        msg_ids = {m["id"] for m in result.msgs}
+        assert len(result.msgs) == 2  # tool-only assistant turn included despite empty text
+        assert all(t["message_id"] in msg_ids for t in result.tools)
+        assert all(e["message_id"] in msg_ids for e in result.edits)
+
     def test_empty_session_skipped(self, tmp_path):
         """Empty sessions (no messages) are skipped."""
         from ai_convos.cli import parse_claude_code
@@ -162,6 +184,32 @@ class TestCodexParser:
 
         assert len(result.tools) == 1
         assert result.tools[0]["tool_name"] == "shell"
+        assert result.tools[0]["message_id"] in {m["id"] for m in result.msgs}  # leading call anchors forward to the first message
+
+    def test_function_calls_anchor_to_preceding_message(self, tmp_path):
+        """Tools and shell edits attach to the nearest preceding message, never to a phantom id."""
+        from ai_convos.cli import parse_codex
+
+        sessions_dir = tmp_path / ".codex" / "sessions"
+        sessions_dir.mkdir(parents=True)
+
+        jsonl = sessions_dir / "session.jsonl"
+        jsonl.write_text("\n".join([
+            json.dumps({"type": "session_meta", "timestamp": "2024-01-01T00:00:00Z", "payload": {}}),
+            json.dumps({"type": "response_item", "timestamp": "2024-01-01T00:00:01Z", "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "fix it"}]}}),
+            json.dumps({"type": "response_item", "timestamp": "2024-01-01T00:00:02Z", "payload": {"type": "function_call", "name": "shell", "arguments": {"command": "echo x > /out.txt"}}}),
+            json.dumps({"type": "response_item", "timestamp": "2024-01-01T00:00:03Z", "payload": {"type": "function_call_output", "call_id": "c1", "output": "ok"}}),
+            json.dumps({"type": "response_item", "timestamp": "2024-01-01T00:00:04Z", "payload": {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "done"}]}}),
+        ]))
+
+        result = parse_codex(tmp_path / ".codex")
+
+        user_id = next(m["id"] for m in result.msgs if m["role"] == "user")
+        assert len(result.tools) == 2
+        assert all(t["message_id"] == user_id for t in result.tools)
+        assert len(result.edits) == 1
+        assert result.edits[0]["message_id"] == user_id
+        assert result.edits[0]["file_path"] == "/out.txt"
 
     def test_skip_system_messages(self, tmp_path):
         """System and developer messages are skipped."""
