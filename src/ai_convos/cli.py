@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import json, time, zipfile, hashlib, struct, sqlite3, subprocess, ssl, urllib.request, re, os, sysconfig, math
+from importlib.metadata import entry_points
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -877,5 +878,10 @@ def sql(query: str, fmt: str = typer.Option("text", "-f", "--format")):
     conn.close()
     if fmt != "text": emit([dict(zip(cols, r)) for r in rows], fmt); return
     typer.echo(" | ".join(cols)); [typer.echo(" | ".join("" if v is None else str(v) for v in r)) for r in rows]; typer.echo(f"\n{len(rows)} rows")
+
+# ---- plugin seam: installed apps register subcommands (entry point group convos.commands) ----
+for _ep in entry_points(group="convos.commands"):
+    try: _ep.load()(app)
+    except Exception as _e: typer.echo(f"plugin {_ep.name} failed: {_e}", err=True)  # a broken plugin must not kill the CLI
 
 if __name__ == "__main__": app()

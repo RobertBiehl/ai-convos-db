@@ -2,6 +2,29 @@ version = 1
 revision = 3
 requires-python = ">=3.12"
 
+[manifest]
+members = [
+    "ai-convos-changegraph",
+    "ai-convos-db",
+]
+
+[[package]]
+name = "ai-convos-changegraph"
+version = "0.1.0"
+source = { editable = "apps/changegraph" }
+dependencies = [
+    { name = "ai-convos-db" },
+    { name = "duckdb" },
+    { name = "typer" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "ai-convos-db", editable = "." },
+    { name = "duckdb", specifier = ">=1.0.0" },
+    { name = "typer", specifier = ">=0.12.0" },
+]
+
 [[package]]
 name = "ai-convos-db"
 version = "0.2.0"
@@ -16,12 +39,14 @@ dependencies = [
 
 [package.optional-dependencies]
 dev = [
+    { name = "ai-convos-changegraph" },
     { name = "pytest" },
     { name = "pytest-asyncio" },
 ]
 
 [package.metadata]
 requires-dist = [
+    { name = "ai-convos-changegraph", marker = "extra == 'dev'", editable = "apps/changegraph" },
     { name = "cryptography", specifier = ">=42.0.0" },
     { name = "duckdb", specifier = ">=1.0.0" },
     { name = "huggingface-hub", specifier = ">=0.20.0" },
