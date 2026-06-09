@@ -207,9 +207,35 @@ class TestCodexParser:
         user_id = next(m["id"] for m in result.msgs if m["role"] == "user")
         assert len(result.tools) == 2
         assert all(t["message_id"] == user_id for t in result.tools)
-        assert len(result.edits) == 1
-        assert result.edits[0]["message_id"] == user_id
-        assert result.edits[0]["file_path"] == "/out.txt"
+        assert result.edits == []  # plain shell commands are not guessed into edits
+
+    def test_apply_patch_edits(self, tmp_path):
+        """exec_command apply_patch heredocs yield exact per-hunk edits with before/after text."""
+        from ai_convos.cli import parse_codex
+
+        sessions_dir = tmp_path / ".codex" / "sessions"
+        sessions_dir.mkdir(parents=True)
+
+        patch = ("apply_patch <<'PATCH'\n*** Begin Patch\n"
+                 "*** Update File: src/app.py\n@@\n ctx\n-old line\n+new line\n@@\n+pure add\n"
+                 "*** Add File: docs/new.md\n+hello\n+world\n*** End of File\n"
+                 "*** End Patch\nPATCH")
+        jsonl = sessions_dir / "session.jsonl"
+        jsonl.write_text("\n".join([
+            json.dumps({"type": "session_meta", "timestamp": "2024-01-01T00:00:00Z", "payload": {"cwd": "/repo"}}),
+            json.dumps({"type": "response_item", "timestamp": "2024-01-01T00:00:01Z", "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "patch it"}]}}),
+            json.dumps({"type": "response_item", "timestamp": "2024-01-01T00:00:02Z", "payload": {"type": "function_call", "name": "exec_command", "arguments": json.dumps({"cmd": patch, "workdir": "/repo"})}}),
+        ]))
+
+        result = parse_codex(tmp_path / ".codex")
+
+        e = result.edits
+        assert [(x["file_path"], x["edit_type"]) for x in e] == \
+               [("/repo/src/app.py", "edit"), ("/repo/src/app.py", "edit"), ("/repo/docs/new.md", "write")]
+        assert e[0]["old_content"] == "ctx\nold line" and e[0]["content"] == "ctx\nnew line"
+        assert e[1]["old_content"] is None and e[1]["content"] == "pure add"  # insert-only hunk: no anchor
+        assert e[2]["old_content"] is None and e[2]["content"] == "hello\nworld"
+        assert all(x["message_id"] == result.msgs[0]["id"] for x in e)
 
     def test_skip_system_messages(self, tmp_path):
         """System and developer messages are skipped."""
