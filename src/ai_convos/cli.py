@@ -548,11 +548,20 @@ def parse_codex_session(jsonl: Path) -> dict | None:
             for i, p in items if p.get("type") == "function_call_output"]
 
     def patch_edits(args):
-        """Parse apply_patch heredocs: per-hunk (context+minus -> context+plus) blocks replay like Edit old/new."""
+        """File edits from shell commands, exact or skipped: apply_patch hunks (context+minus -> context+plus,
+        replays like Edit old/new), heredoc writes (full content), plain redirects (file exact, content unknown)."""
         cmd = args.get("cmd") or args.get("command") or ""
         cmd = " ".join(cmd) if isinstance(cmd, list) else str(cmd)
-        if "*** Begin Patch" not in cmd: return []
-        root, out, path, op, old, new = args.get("workdir") or meta.get("cwd") or "", [], None, None, [], []
+        root = args.get("workdir") or meta.get("cwd") or ""
+        if "*** Begin Patch" not in cmd:
+            head = cmd.split("\n", 1)[0]
+            if (hm := re.search(r"<<-?\s*'?(\w+)'?", head)) and (tm := re.search(r"(?:(?<![0-9&])>{1,2}\s*|\btee\s+(?:-a\s+)?)([^\s;|&<>'\"]+)", head)) \
+               and (body := re.search(rf"\n(.*)\n{hm.group(1)}\s*$", cmd, re.S)) and tm.group(1) != "/dev/null":
+                return [(os.path.join(root, tm.group(1)), "write", body.group(1), None)]
+            if (tm := re.search(r"(?<![0-9&])>{1,2}\s*([^\s;|&<>'\"]+\.[A-Za-z]{1,5})\b", head)) and tm.group(1) != "/dev/null":
+                return [(os.path.join(root, tm.group(1)), "shell", cmd, None)]
+            return []
+        out, path, op, old, new = [], None, None, [], []
         def flush():
             if path and (old or new or op != "edit"): out.append((path, op, "\n".join(new), "\n".join(old) or None))
             old.clear(); new.clear()
