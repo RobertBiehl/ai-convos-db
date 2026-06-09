@@ -40,7 +40,7 @@ def recover_stubs(conn):
         GROUP BY message_id""").fetchall())
     found = {h: (cid, i) for cid in convs for i in range(5000) if (h := gen_id("claude-code", f"{cid}:{i}")) in orph}
     meta = json.dumps({"recovered": "id-inversion"})
-    conn.executemany("INSERT OR IGNORE INTO messages VALUES (?,?,?,?,?,?,?,?,NULL)",
+    conn.executemany("INSERT OR IGNORE INTO messages VALUES (?,?,?,?,?,?,?,?,NULL,NULL)",
                      [(mid, cid, "unknown", "", None, orph[mid], None, meta) for mid, (cid, i) in found.items()])
     print(f"id-inversion: re-created {len(found)} of {len(orph)} missing messages")
 
@@ -58,7 +58,7 @@ def recover_history(conn):
                        datetime.fromtimestamp(min(h["timestamp"] for h in hs) / 1000),
                        datetime.fromtimestamp(max(h["timestamp"] for h in hs) / 1000),
                        "claude", hs[0]["project"], None, None, meta) for cid, hs in missing.items()])
-    conn.executemany("INSERT OR IGNORE INTO messages VALUES (?,?,?,?,?,?,?,?,NULL)",
+    conn.executemany("INSERT OR IGNORE INTO messages VALUES (?,?,?,?,?,?,?,?,NULL,NULL)",
                      [(gen_id("claude-code", f"hist:{cid}:{h['timestamp']}"), cid, "user", h["display"], None,
                        datetime.fromtimestamp(h["timestamp"] / 1000), None, meta) for cid, hs in missing.items() for h in hs])
     print(f"history.jsonl: recovered {len(missing)} conversations / {sum(len(h) for h in missing.values())} prompts "

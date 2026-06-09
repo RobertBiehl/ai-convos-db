@@ -70,6 +70,7 @@ def init_schema(conn):
         id VARCHAR PRIMARY KEY, message_id VARCHAR NOT NULL, file_path VARCHAR, edit_type VARCHAR,
         content TEXT, created_at TIMESTAMP)""")
     conn.execute("ALTER TABLE file_edits ADD COLUMN IF NOT EXISTS old_content TEXT")
+    conn.execute("ALTER TABLE messages ADD COLUMN IF NOT EXISTS parent_id VARCHAR")  # thread tree; ALTER (not CREATE) keeps column order identical for fresh and migrated dbs
     conn.execute("INSTALL fts; LOAD fts")
 
 def counts_by_source(conn):
@@ -112,6 +113,7 @@ def ts_from_epoch(t):
     try: return datetime.fromtimestamp(float(t))
     except Exception: return None
 def ts_from_iso(t): return datetime.fromisoformat(t.replace("Z", "+00:00")) if t else None
+def ts_any(t): return ts_from_epoch(t) or (ts_from_iso(t) if isinstance(t, str) else None)  # chatgpt list api sends iso, exports send epoch
 
 def extract_content(content) -> dict:
     if isinstance(content, str): return {"text": content, "thinking": None, "tools": [], "attachments": []}
@@ -288,6 +290,29 @@ def parse_source(path: Path, source: Optional[str] = None) -> ParseResult:
     return parsers[src](path)
 
 # ---- web fetchers ----
+def chatgpt_mapping(cid: str, mapping: dict) -> tuple[list, list, list]:
+    """Walk a chatgpt conversation mapping tree (shared by web fetcher and export parser)."""
+    def pmid(nid):  # nearest ancestor that carries a message (roots are message-less)
+        while (nid := mapping[nid].get("parent")) and not mapping[nid].get("message"): pass
+        return gen_id("chatgpt", f"{cid}:{nid}") if nid else None
+    msgs, tools, attachs = [], [], []
+    for nid, node in mapping.items():
+        if not (msg := node.get("message")): continue
+        mid, role, meta = gen_id("chatgpt", f"{cid}:{nid}"), msg.get("author", {}).get("role", "unknown"), msg.get("metadata", {})
+        ts, model = ts_any(msg.get("create_time")), meta.get("model_slug")
+        if tool := bool(role == "tool" or meta.get("invoked_plugin")):
+            tools.append(dict(id=gen_id("chatgpt", f"tool:{mid}"), message_id=mid, tool_name=meta.get("invoked_plugin", {}).get("namespace", role),
+                              input=json.dumps(meta.get("args", {})), output=json.dumps(msg.get("content", {})), status="complete", duration_ms=None, created_at=ts))
+        parts = msg.get("content", {}).get("parts", []) if msg.get("content") else []
+        att = [dict(id=gen_id("chatgpt", f"attach:{mid}:{i}"), message_id=mid, filename=p.get("name", ""), mime_type=p.get("content_type"),
+                    size=p.get("size"), path=None, url=p.get("asset_pointer"), created_at=ts)
+               for i, p in enumerate(parts) if isinstance(p, dict) and p.get("content_type") in ("image_asset_pointer", "file")]
+        text = "\n".join(p.strip() for p in parts if isinstance(p, str) and p.strip())
+        if text or tool or att:  # keep tool-only turns: tool_calls/attachments reference them
+            msgs.append(dict(id=mid, conversation_id=cid, role=role, content=text, thinking=None, created_at=ts, model=model, metadata=json.dumps(meta), parent_id=pmid(nid)))
+        attachs += att
+    return msgs, tools, attachs
+
 def fetch_chatgpt(browser: str = "safari", limit: int = 0) -> ParseResult:
     hosts = [("https://chatgpt.com", ["chatgpt.com"]),
              ("https://chat.openai.com", ["chat.openai.com", "openai.com"])]
@@ -304,23 +329,9 @@ def fetch_chatgpt(browser: str = "safari", limit: int = 0) -> ParseResult:
             cid = gen_id("chatgpt", item["id"])
             gizmo = item.get("gizmo_id")
             conv = fetch_json(f"{base}/backend-api/conversation/{item['id']}", cookies, headers, timeout=60)
-            msgs, tools, attachs = [], [], []
-            for nid, node in conv.get("mapping", {}).items():
-                if not (msg := node.get("message")): continue
-                mid = gen_id("chatgpt", f"{cid}:{nid}")
-                role, meta = msg.get("author", {}).get("role", "unknown"), msg.get("metadata", {})
-                ts, model = ts_from_epoch(msg.get("create_time")), meta.get("model_slug")
-                if role == "tool" or meta.get("invoked_plugin"):
-                    tools.append(dict(id=gen_id("chatgpt", f"tool:{mid}"), message_id=mid, tool_name=meta.get("invoked_plugin", {}).get("namespace", role),
-                                      input=json.dumps(meta.get("args", {})), output=json.dumps(msg.get("content", {})), status="complete", duration_ms=None, created_at=ts))
-                for i, part in enumerate(msg.get("content", {}).get("parts", []) if msg.get("content") else []):
-                    if isinstance(part, dict) and part.get("content_type") in ("image_asset_pointer", "file"):
-                        attachs.append(dict(id=gen_id("chatgpt", f"attach:{mid}:{i}"), message_id=mid, filename=part.get("name", ""),
-                                            mime_type=part.get("content_type"), size=part.get("size"), path=None, url=part.get("asset_pointer"), created_at=ts))
-                    elif isinstance(part, str) and part.strip():
-                        msgs.append(dict(id=mid, conversation_id=cid, role=role, content=part.strip(), thinking=None, created_at=ts, model=model, metadata=json.dumps(meta)))
-            return dict(conv=dict(id=cid, source="chatgpt", title=item.get("title"), created_at=ts_from_epoch(item.get("create_time")),
-                                  updated_at=ts_from_epoch(item.get("update_time")), model=item.get("model"), cwd=None, git_branch=None,
+            msgs, tools, attachs = chatgpt_mapping(cid, conv.get("mapping", {}))
+            return dict(conv=dict(id=cid, source="chatgpt", title=item.get("title"), created_at=ts_any(item.get("create_time")),
+                                  updated_at=ts_any(item.get("update_time")), model=item.get("model"), cwd=None, git_branch=None,
                                   project_id=gizmo, metadata=json.dumps({"gizmo_id": gizmo}) if gizmo else "{}"),
                         msgs=msgs, tools=tools, attachs=attachs)
         def parse_item(item): return safe_parse(f"chatgpt web conv {item.get('id') if isinstance(item, dict) else 'unknown'}", parse_item_raw, item)
@@ -397,7 +408,7 @@ def fetch_claude(browser: str = "safari", limit: int = 0, since: datetime = None
                     elif block.get("type") == "text": text_parts.append(block.get("text", ""))
                 elif isinstance(block, str): text_parts.append(block)
             if text := "\n".join(text_parts).strip():
-                r.msgs.append(dict(id=mid, conversation_id=cid, role=m.get("sender", "unknown"), content=text, thinking=None, created_at=ts, model=None, metadata="{}"))
+                r.msgs.append(dict(id=mid, conversation_id=cid, role=m.get("sender", "unknown"), content=text, thinking=None, created_at=ts, model=None, metadata="{}", parent_id=None))
         fetched += 1
         return True
     for idx, item in enumerate(items):
@@ -415,23 +426,10 @@ def parse_chatgpt(path: Path) -> ParseResult:
     r = ParseResult()
     def parse_conv(c):
         cid, gizmo = gen_id("chatgpt", c.get("id", "")), c.get("gizmo_id")
-        conv = dict(id=cid, source="chatgpt", title=c.get("title"), created_at=ts_from_epoch(c.get("create_time")),
-                    updated_at=ts_from_epoch(c.get("update_time")), model=c.get("default_model_slug"), cwd=None, git_branch=None,
+        conv = dict(id=cid, source="chatgpt", title=c.get("title"), created_at=ts_any(c.get("create_time")),
+                    updated_at=ts_any(c.get("update_time")), model=c.get("default_model_slug"), cwd=None, git_branch=None,
                     project_id=gizmo, metadata=json.dumps({"gizmo_id": gizmo}) if gizmo else "{}")
-        msgs, tools, attachs = [], [], []
-        for nid, node in c.get("mapping", {}).items():
-            if not (msg := node.get("message")): continue
-            mid, role, meta = gen_id("chatgpt", f"{cid}:{nid}"), msg.get("author", {}).get("role", "unknown"), msg.get("metadata", {})
-            ts, model = ts_from_epoch(msg.get("create_time")), meta.get("model_slug")
-            if role == "tool" or meta.get("invoked_plugin"):
-                tools.append(dict(id=gen_id("chatgpt", f"tool:{mid}"), message_id=mid, tool_name=meta.get("invoked_plugin", {}).get("namespace", role),
-                                  input=json.dumps(meta.get("args", {})), output=json.dumps(msg.get("content", {})), status="complete", duration_ms=None, created_at=ts))
-            for i, part in enumerate(msg.get("content", {}).get("parts", []) if msg.get("content") else []):
-                if isinstance(part, dict) and part.get("content_type") in ("image_asset_pointer", "file"):
-                    attachs.append(dict(id=gen_id("chatgpt", f"attach:{mid}:{i}"), message_id=mid, filename=part.get("name", ""),
-                                       mime_type=part.get("content_type"), size=part.get("size"), path=None, url=part.get("asset_pointer"), created_at=ts))
-                elif isinstance(part, str) and part.strip():
-                    msgs.append(dict(id=mid, conversation_id=cid, role=role, content=part.strip(), thinking=None, created_at=ts, model=model, metadata=json.dumps(meta)))
+        msgs, tools, attachs = chatgpt_mapping(cid, c.get("mapping", {}))
         return dict(conv=conv, msgs=msgs, tools=tools, attachs=attachs)
     for idx, c in enumerate(data):
         cid = c.get("id") if isinstance(c, dict) else idx
@@ -449,7 +447,7 @@ def parse_claude(path: Path) -> ParseResult:
                         updated_at=ts_from_iso(c.get("updated_at")), model=c.get("model"), cwd=None, git_branch=None, project_id=None, metadata="{}"),
             "msgs": [dict(id=(mid := gen_id("claude", f"{cid}:{m['uuid'] if 'uuid' in m else m['id']}")), conversation_id=cid,
                         role=m.get("sender", "unknown"), content=ec["text"], thinking=ec["thinking"],
-                        created_at=ts_from_iso(m.get("created_at")), model=None, metadata="{}")
+                        created_at=ts_from_iso(m.get("created_at")), model=None, metadata="{}", parent_id=None)
                     for m in msgs_data if (ec := extract_content(m.get("text") or m.get("content", "")))["text"]],
             "attachs": [dict(id=gen_id("claude", f"attach:{gen_id('claude', f'{cid}:{m['uuid'] if 'uuid' in m else m['id']}')}:{i}"),
                             message_id=gen_id("claude", f"{cid}:{m['uuid'] if 'uuid' in m else m['id']}"),
@@ -478,12 +476,13 @@ def parse_claude_code_session(jsonl: Path) -> dict:
     timestamps = [ts_from_iso(e["timestamp"]) for e in events if "timestamp" in e]
     system = next((e for e in events if e.get("type") == "system"), {})
     msg_events = [(i, e) for i, e in enumerate(events) if "message" in e]
+    uuid2id = {e["uuid"]: gen_id(src, f"{cid}:{idx}") for idx, (i, e) in enumerate(msg_events) if "uuid" in e}
 
     def make_msg(idx, i, e):
         c = extract_content(e["message"].get("content", e["message"].get("text", "")))
         return dict(id=gen_id(src, f"{cid}:{idx}"), conversation_id=cid, role=e["type"],
                    content=c["text"], thinking=c["thinking"], created_at=ts_from_iso(e.get("timestamp")),
-                   model="claude" if e["type"] == "assistant" else None, metadata="{}")
+                   model="claude" if e["type"] == "assistant" else None, metadata="{}", parent_id=uuid2id.get(e.get("parentUuid")))
 
     def make_tools(idx, i, e):
         c, ts = extract_content(e["message"].get("content", [])), ts_from_iso(e.get("timestamp"))
@@ -533,7 +532,7 @@ def parse_codex_session(jsonl: Path) -> dict | None:
 
     mitems = [(i, p, t) for i, p in items if p.get("type") == "message" and p.get("role") not in ("developer", "system") and (t := extract_msg_text(p))]
     msgs = [dict(id=gen_id(src, f"{cid}:{i}"), conversation_id=cid, role=p["role"], content=t.strip(),
-                thinking=None, created_at=timestamps[i] if i < len(timestamps) else None, model=None, metadata="{}")
+                thinking=None, created_at=timestamps[i] if i < len(timestamps) else None, model=None, metadata="{}", parent_id=None)
            for i, p, t in mitems]
     if not msgs: return None
     anchor = lambda k: gen_id(src, f"{cid}:{next((i for i, _, _ in reversed(mitems) if i <= k), mitems[0][0])}")  # function_call items are not messages; attach to nearest preceding one
@@ -596,7 +595,7 @@ def parse_codex(codex_dir: Path, files: list[Path] | None = None) -> ParseResult
         convs=[s["conv"] for s in sessions], msgs=[m for s in sessions for m in s["msgs"]],
         tools=[t for s in sessions for t in s["tools"]], edits=[e for s in sessions for e in s["edits"]])
 
-_MSG_UPS = "INSERT INTO messages VALUES (?,?,?,?,?,?,?,?,NULL) ON CONFLICT(id) DO UPDATE SET conversation_id=excluded.conversation_id, role=excluded.role, content=excluded.content, thinking=excluded.thinking, created_at=excluded.created_at, model=excluded.model, metadata=excluded.metadata, embedding=CASE WHEN messages.content IS DISTINCT FROM excluded.content THEN NULL ELSE messages.embedding END"
+_MSG_UPS = "INSERT INTO messages VALUES (?,?,?,?,?,?,?,?,NULL,?) ON CONFLICT(id) DO UPDATE SET conversation_id=excluded.conversation_id, role=excluded.role, content=excluded.content, thinking=excluded.thinking, created_at=excluded.created_at, model=excluded.model, metadata=excluded.metadata, parent_id=excluded.parent_id, embedding=CASE WHEN messages.content IS DISTINCT FROM excluded.content THEN NULL ELSE messages.embedding END"
 
 def upsert(conn, r: ParseResult):
     cids, mids = [c["id"] for c in r.convs], [m["id"] for m in r.msgs]

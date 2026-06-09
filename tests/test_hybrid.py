@@ -32,7 +32,7 @@ def hybrid_db(tmp_path, monkeypatch):
     ]
     for mid, content, emb in rows:
         conn.execute(
-            "INSERT INTO messages VALUES (?, 'c1', 'user', ?, NULL, NULL, NULL, NULL, ?)",
+            "INSERT INTO messages VALUES (?, 'c1', 'user', ?, NULL, NULL, NULL, NULL, ?, NULL)",
             [mid, content, emb],
         )
     cli.rebuild_fts_index(conn)
@@ -81,7 +81,7 @@ def test_query_no_embeddings_returns_friendly_error(tmp_path, monkeypatch):
     conn = duckdb.connect(str(db))
     cli.init_schema(conn)
     conn.execute("INSERT INTO conversations VALUES ('c1', 'test', 'Conv', NULL, NULL, NULL, NULL, NULL, NULL, NULL)")
-    conn.execute("INSERT INTO messages VALUES ('m1', 'c1', 'user', 'hello', NULL, NULL, NULL, NULL, NULL)")
+    conn.execute("INSERT INTO messages VALUES ('m1', 'c1', 'user', 'hello', NULL, NULL, NULL, NULL, NULL, NULL)")
     cli.rebuild_fts_index(conn)
     conn.close()
     r = CliRunner().invoke(cli.app, ["query", "hello"])
@@ -161,8 +161,8 @@ def test_json_output_formats(tmp_path, monkeypatch):
     monkeypatch.setattr(cli, "DB_PATH", db); monkeypatch.setattr(cli, "DATA_DIR", tmp_path)
     conn = duckdb.connect(str(db)); cli.init_schema(conn)
     conn.execute("INSERT INTO conversations VALUES ('c1','test','T',NULL,NULL,NULL,NULL,NULL,NULL,NULL)")
-    conn.execute("INSERT INTO messages VALUES ('m1','c1','user','hello',NULL,NULL,NULL,NULL,NULL)")
-    conn.execute("INSERT INTO messages VALUES ('m2','c1','assistant','hi there',NULL,NULL,NULL,NULL,NULL)")
+    conn.execute("INSERT INTO messages VALUES ('m1','c1','user','hello',NULL,NULL,NULL,NULL,NULL,NULL)")
+    conn.execute("INSERT INTO messages VALUES ('m2','c1','assistant','hi there',NULL,NULL,NULL,NULL,NULL,NULL)")
     cli.rebuild_fts_index(conn); conn.close()
     data = _json.loads(CliRunner().invoke(cli.app, ["sql", "SELECT id, source FROM conversations", "-f", "json"]).output)
     assert data == [{"id": "c1", "source": "test"}]

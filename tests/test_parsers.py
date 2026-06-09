@@ -33,6 +33,26 @@ class TestClaudeCodeParser:
         assert result.msgs[0]["role"] == "human"
         assert result.msgs[1]["role"] == "assistant"
 
+    def test_parent_thread_tree(self, tmp_path):
+        """parentUuid chains become parent_id links; roots and unknown parents stay NULL."""
+        from ai_convos.cli import parse_claude_code
+
+        session_dir = tmp_path / ".claude" / "projects" / "-test"
+        session_dir.mkdir(parents=True)
+        (session_dir / "s.jsonl").write_text("\n".join([
+            json.dumps({"type": "human", "uuid": "u-1", "parentUuid": None, "timestamp": "2024-01-01T00:00:00Z", "message": {"content": "Hello"}}),
+            json.dumps({"type": "assistant", "uuid": "a-1", "parentUuid": "u-1", "timestamp": "2024-01-01T00:00:01Z", "message": {"content": [{"type": "text", "text": "Hi"}]}}),
+            json.dumps({"type": "human", "uuid": "u-2", "parentUuid": "a-1", "timestamp": "2024-01-01T00:00:02Z", "message": {"content": "Branch A"}}),
+            json.dumps({"type": "human", "uuid": "u-3", "parentUuid": "a-1", "timestamp": "2024-01-01T00:00:03Z", "message": {"content": "Branch B (regenerated)"}}),
+        ]))
+
+        msgs = parse_claude_code(tmp_path / ".claude" / "projects").msgs
+        by_content = {m["content"]: m for m in msgs}
+        assert by_content["Hello"]["parent_id"] is None
+        assert by_content["Hi"]["parent_id"] == by_content["Hello"]["id"]
+        assert by_content["Branch A"]["parent_id"] == by_content["Hi"]["id"]
+        assert by_content["Branch B (regenerated)"]["parent_id"] == by_content["Hi"]["id"]
+
     def test_parse_thinking_blocks(self, tmp_path):
         """Parse session with thinking blocks."""
         from ai_convos.cli import parse_claude_code
@@ -368,6 +388,49 @@ class TestChatGPTExportParser:
         result = parse_chatgpt(export)
 
         assert result.convs[0]["project_id"] == "g-abc123"
+
+    def test_tool_only_node_kept_and_threaded(self, tmp_path):
+        """Tool-role nodes without text parts still produce a message row (tool_calls reference it);
+        parent_id walks the mapping tree past message-less roots."""
+        from ai_convos.cli import parse_chatgpt
+
+        export = tmp_path / "conversations.json"
+        export.write_text(json.dumps([{
+            "id": "conv-tool",
+            "mapping": {
+                "root": {"message": None, "parent": None},
+                "n1": {"message": {"author": {"role": "user"}, "content": {"parts": ["search the web"]}}, "parent": "root"},
+                "n2": {"message": {"author": {"role": "tool"}, "content": {"content_type": "code", "text": ""}}, "parent": "n1"},
+                "n3": {"message": {"author": {"role": "assistant"}, "content": {"parts": ["Found it."]}}, "parent": "n2"},
+            }
+        }]))
+
+        result = parse_chatgpt(export)
+        by_id = {m["id"]: m for m in result.msgs}
+        assert len(result.msgs) == 3  # tool node kept despite empty text
+        assert len(result.tools) == 1
+        assert result.tools[0]["message_id"] in by_id  # no orphan
+        tool_msg = by_id[result.tools[0]["message_id"]]
+        assert tool_msg["role"] == "tool" and tool_msg["content"] == ""
+        user_msg = next(m for m in result.msgs if m["content"] == "search the web")
+        assert user_msg["parent_id"] is None  # walks past the message-less root
+        assert tool_msg["parent_id"] == user_msg["id"]
+        assert next(m for m in result.msgs if m["content"] == "Found it.")["parent_id"] == tool_msg["id"]
+
+    def test_iso_timestamps(self, tmp_path):
+        """create_time as ISO string (web list api format) parses instead of becoming NULL."""
+        from ai_convos.cli import parse_chatgpt, ts_any
+
+        export = tmp_path / "conversations.json"
+        export.write_text(json.dumps([{
+            "id": "conv-iso", "create_time": "2024-03-01T12:00:00.000000+00:00", "update_time": 1709294400,
+            "mapping": {"n1": {"message": {"author": {"role": "user"}, "content": {"parts": ["hi"]}, "create_time": 1709294400}}}
+        }]))
+
+        conv = parse_chatgpt(export).convs[0]
+        assert conv["created_at"] is not None and conv["created_at"].year == 2024
+        assert conv["updated_at"] is not None  # epoch still works
+        assert ts_any(None) is None and ts_any("") is None
 
 
 # ---- Claude Export Parser Tests ----

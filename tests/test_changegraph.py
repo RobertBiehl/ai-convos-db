@@ -61,8 +61,8 @@ def test_edits_for_attributes_prompt(tmp_path):
     conn = duckdb.connect(str(tmp_path / "t.db"))
     init_schema(conn)
     conn.execute("INSERT INTO conversations VALUES ('c1','claude-code','t','2024-01-01','2024-01-01','m',NULL,NULL,NULL,'{}')")
-    conn.execute("INSERT INTO messages VALUES ('u1','c1','user','please edit',NULL,'2024-01-01 00:00:00',NULL,'{}',NULL),"
-                 "('a1','c1','assistant','done',NULL,'2024-01-01 00:00:01',NULL,'{}',NULL)")
+    conn.execute("INSERT INTO messages VALUES ('u1','c1','user','please edit',NULL,'2024-01-01 00:00:00',NULL,'{}',NULL,NULL),"
+                 "('a1','c1','assistant','done',NULL,'2024-01-01 00:00:01',NULL,'{}',NULL,'u1')")
     conn.execute("INSERT INTO file_edits VALUES ('e1','a1','/f.py','write','x','2024-01-01 00:00:01',NULL)")
     edits = edits_for(conn, "/f.py")
     conn.close()
@@ -93,8 +93,8 @@ def _tui_db(tmp_path):
     conn = duckdb.connect(str(tmp_path / "t.db"))
     init_schema(conn)
     conn.execute("INSERT INTO conversations VALUES ('c1','claude-code','fix greeting','2024-01-01','2024-01-01','m',NULL,NULL,NULL,'{}')")
-    conn.execute("INSERT INTO messages VALUES ('u1','c1','user','please fix',NULL,'2024-01-01 00:00:00',NULL,'{}',NULL),"
-                 "('a1','c1','assistant','',NULL,'2024-01-01 00:00:01',NULL,'{}',NULL)")
+    conn.execute("INSERT INTO messages VALUES ('u1','c1','user','please fix',NULL,'2024-01-01 00:00:00',NULL,'{}',NULL,NULL),"
+                 "('a1','c1','assistant','',NULL,'2024-01-01 00:00:01',NULL,'{}',NULL,'u1')")
     conn.execute("INSERT INTO file_edits VALUES ('e1','a1','/f.py','edit','new','2024-01-01 00:00:01','old')")
     return conn
 
