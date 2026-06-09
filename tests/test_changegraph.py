@@ -99,17 +99,25 @@ def _tui_db(tmp_path):
     return conn
 
 
-def test_tui_views_walk_the_graph(tmp_path):
-    from ai_convos_changegraph.tui import _detail, _files, _timeline
+def test_tui_graph_panes_and_walk(tmp_path):
+    import curses
+    from ai_convos_changegraph.tui import _gkey, _graph, _nbrs, _nodes
     conn = _tui_db(tmp_path)
-    files = _files(conn)
-    assert len(files["rows"]) == 1 and "/f.py" in files["fmt"](files["rows"][0])
-    tl = files["enter"](files["rows"][0])
-    assert tl["title"] == "/f.py" and "please fix" in tl["fmt"](tl["rows"][0])
+    conn.execute("INSERT INTO file_edits VALUES ('e2','a1','/g.py','write','x','2024-01-02',NULL),"
+                 "('e3','gone','/f.py','shell','rm x','2024-01-03',NULL)")  # second file + an orphaned edit
+    v = _graph(conn)
+    files, convs = _nodes(v["E"], 0), _nodes(v["E"], 1)
+    assert [f[0] for f in files] == ["/f.py", "/g.py"]  # recency order
+    assert {c[0] for c in convs} == {"c1", "unknown"}  # orphans surface as a node
+    nbrs = _nbrs(v["E"], 0, "/f.py")
+    assert {n[0] for n in nbrs} == {"c1", "unknown"}
+    v["prim"], v["nbrs"], v["sels"] = files, nbrs, [0, 0]
+    tl = _gkey(10, v, None, 24, 80)  # enter on a file -> timeline view
+    assert tl["title"] == "/f.py" and len(tl["rows"]) == 2
     detail = tl["enter"](tl["rows"][0])
     assert "- old" in detail["rows"] and "+ new" in detail["rows"]
-    pivot = detail["conv"](None)  # edit -> its conversation's files
-    assert "fix greeting" in pivot["title"] and len(pivot["rows"]) == 1
+    v["focus"] = 1  # enter on a conversation neighbor -> re-roots the graph on it
+    assert _gkey(10, v, None, 24, 80) is None and v["mode"] == 1 and _nodes(v["E"], 1)[v["sels"][0]][0] == nbrs[0][0]
     conn.close()
 
 
