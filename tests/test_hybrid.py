@@ -111,7 +111,7 @@ def test_query_migrates_old_db_before_embedding_check(tmp_path, monkeypatch):
 def test_read_commands_handle_locked_db(monkeypatch):
     """Read commands should print a friendly lock message instead of a traceback."""
     monkeypatch.setattr(cli, "get_db", lambda read_only=False: (_ for _ in ()).throw(ValueError("Database is locked by another convos process.")))
-    r = CliRunner().invoke(cli.app, ["stats"])
+    r = CliRunner().invoke(cli.app, ["search", "x"])
     assert r.exit_code == 0
     assert "locked" in (r.output + (r.stderr if r.stderr_bytes is not None else ""))
 
@@ -164,12 +164,10 @@ def test_json_output_formats(tmp_path, monkeypatch):
     conn.execute("INSERT INTO messages VALUES ('m1','c1','user','hello',NULL,NULL,NULL,NULL,NULL)")
     conn.execute("INSERT INTO messages VALUES ('m2','c1','assistant','hi there',NULL,NULL,NULL,NULL,NULL)")
     cli.rebuild_fts_index(conn); conn.close()
-    data = _json.loads(CliRunner().invoke(cli.app, ["list", "-f", "json"]).output)
-    assert data[0]["id"] == "c1" and data[0]["messages"] == 2
-    out = CliRunner().invoke(cli.app, ["get", "c1", "-f", "jsonl"]).output
+    data = _json.loads(CliRunner().invoke(cli.app, ["sql", "SELECT id, source FROM conversations", "-f", "json"]).output)
+    assert data == [{"id": "c1", "source": "test"}]
+    out = CliRunner().invoke(cli.app, ["sql", "SELECT role FROM messages ORDER BY role", "-f", "jsonl"]).output
     objs = [_json.loads(l) for l in out.strip().splitlines() if l.strip()]
-    assert len(objs) == 2 and {o["role"] for o in objs} == {"user", "assistant"}
-    sh = _json.loads(CliRunner().invoke(cli.app, ["show", "c1", "-f", "json"]).output)
-    assert sh["id"] == "c1" and len(sh["messages"]) == 2
+    assert [o["role"] for o in objs] == ["assistant", "user"]
     sd = _json.loads(CliRunner().invoke(cli.app, ["search", "hello", "-f", "json"]).output)
     assert isinstance(sd, list)

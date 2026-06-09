@@ -149,8 +149,8 @@ CONVOS_IMPORT_PATHS="~/.claude/projects/-Users-name-project" uv run convos sync
 # Search with thinking included
 uv run convos search "auth bug" --thinking
 
-# List file edits
-uv run convos edits auth.py
+# File edits touching a path
+uv run convos sql "SELECT file_path, edit_type, created_at FROM file_edits WHERE file_path LIKE '%auth.py' ORDER BY created_at DESC" -f jsonl
 ```
 
 ## Claude Code Web

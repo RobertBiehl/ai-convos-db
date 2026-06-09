@@ -103,6 +103,7 @@ File modifications from CLI tools.
 | edit_type | VARCHAR | `write`, `edit`, `multiedit`, `shell` |
 | content | TEXT | New content or edit description |
 | created_at | TIMESTAMP | Edit timestamp |
+| old_content | TEXT | Replaced text (`old_string` for `edit`; NULL for `write`/`shell`) |
 
 ## Full-Text Search
 

@@ -87,13 +87,21 @@ class TestClaudeCodeParser:
                 {"type": "tool_use", "name": "Write", "input": {"file_path": "/test.py", "content": "print('hello')"}},
                 {"type": "text", "text": "Created file."}
             ]}}),
+            json.dumps({"type": "assistant", "timestamp": "2024-01-01T00:01:00Z", "message": {"content": [
+                {"type": "tool_use", "name": "Edit", "input": {"file_path": "/test.py", "old_string": "print('hello')", "new_string": "print('world')"}},
+                {"type": "text", "text": "Updated file."}
+            ]}}),
         ]))
 
         result = parse_claude_code(tmp_path / ".claude" / "projects")
 
-        assert len(result.edits) == 1
+        assert len(result.edits) == 2
         assert result.edits[0]["file_path"] == "/test.py"
         assert result.edits[0]["edit_type"] == "write"
+        assert result.edits[0]["old_content"] is None
+        assert result.edits[1]["edit_type"] == "edit"
+        assert result.edits[1]["content"] == "print('world')"
+        assert result.edits[1]["old_content"] == "print('hello')"
 
     def test_empty_session_skipped(self, tmp_path):
         """Empty sessions (no messages) are skipped."""

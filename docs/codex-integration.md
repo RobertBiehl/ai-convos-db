@@ -149,7 +149,7 @@ CONVOS_IMPORT_PATHS="~/.codex" uv run convos sync
 uv run convos search "python" -s codex
 
 # List by source
-uv run convos list -s codex
+uv run convos sql "SELECT id, title, created_at FROM conversations WHERE source='codex' ORDER BY created_at DESC LIMIT 20" -f json
 ```
 
 ## Differences from Claude Code
