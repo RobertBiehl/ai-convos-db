@@ -547,13 +547,29 @@ def parse_codex_session(jsonl: Path) -> dict | None:
                  created_at=timestamps[i] if i < len(timestamps) else None)
             for i, p in items if p.get("type") == "function_call_output"]
 
-    edits = [dict(id=gen_id(src, f"edit:{cid}:{i}:{j}"), message_id=anchor(i),
-                 file_path=m.group(1), edit_type="shell", content=cmd,
-                 created_at=timestamps[i] if i < len(timestamps) else None, old_content=None)
-            for i, p in items if p.get("type") == "function_call" and p.get("name") == "shell"
-            and (args := norm_args(p)) and (c := args.get("command")) and (cmd := " ".join(c) if isinstance(c, list) else c)
-            for j, pat in enumerate([r'(?:cat|echo).*[>].*?([^\s>]+)', r'(?:sed|awk).*?([^\s]+)$'])
-            if (m := re.search(pat, cmd))]
+    def patch_edits(args):
+        """Parse apply_patch heredocs: per-hunk (context+minus -> context+plus) blocks replay like Edit old/new."""
+        cmd = args.get("cmd") or args.get("command") or ""
+        cmd = " ".join(cmd) if isinstance(cmd, list) else str(cmd)
+        if "*** Begin Patch" not in cmd: return []
+        root, out, path, op, old, new = args.get("workdir") or meta.get("cwd") or "", [], None, None, [], []
+        def flush():
+            if path and (old or new or op != "edit"): out.append((path, op, "\n".join(new), "\n".join(old) or None))
+            old.clear(); new.clear()
+        for ln in cmd.split("*** Begin Patch", 1)[1].split("*** End Patch", 1)[0].splitlines():
+            if m := re.match(r"\*\*\* (Update|Add|Delete) File: (.+)", ln):
+                flush(); op, path = {"Update": "edit", "Add": "write", "Delete": "delete"}[m.group(1)], os.path.join(root, m.group(2).strip())
+            elif ln.startswith("@@"): flush()
+            elif ln.startswith("***"): pass  # e.g. *** End of File
+            elif ln.startswith("+"): new.append(ln[1:])
+            elif ln.startswith("-"): old.append(ln[1:])
+            elif path: old.append(ln[1:] if ln.startswith(" ") else ln); new.append(ln[1:] if ln.startswith(" ") else ln)
+        flush(); return out
+
+    edits = [dict(id=gen_id(src, f"edit:{cid}:{i}:{j}"), message_id=anchor(i), file_path=fp, edit_type=op,
+                 content=c, created_at=timestamps[i] if i < len(timestamps) else None, old_content=o)
+            for i, p in items if p.get("type") == "function_call" and p.get("name") in ("exec_command", "shell_command", "shell")
+            and (args := norm_args(p)) for j, (fp, op, c, o) in enumerate(patch_edits(args))]
 
     return {
         "conv": dict(id=cid, source=src, title=meta.get("cwd") or jsonl.stem,
