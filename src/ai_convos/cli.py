@@ -68,6 +68,7 @@ def init_schema(conn):
     conn.execute("""CREATE TABLE IF NOT EXISTS file_edits (
         id VARCHAR PRIMARY KEY, message_id VARCHAR NOT NULL, file_path VARCHAR, edit_type VARCHAR,
         content TEXT, created_at TIMESTAMP)""")
+    conn.execute("ALTER TABLE file_edits ADD COLUMN IF NOT EXISTS old_content TEXT")
     conn.execute("INSTALL fts; LOAD fts")
 
 def counts_by_source(conn):
@@ -494,7 +495,8 @@ def parse_claude_code_session(jsonl: Path) -> dict:
         c, ts = extract_content(e["message"].get("content", [])), ts_from_iso(e.get("timestamp"))
         mid = gen_id(src, f"{cid}:{idx}")
         return [dict(id=gen_id(src, f"edit:{cid}:{idx}:{j}"), message_id=mid, file_path=t["input"]["file_path"],
-                    edit_type=t["name"].lower(), content=t["input"].get("content") or t["input"].get("new_string", ""), created_at=ts)
+                    edit_type=t["name"].lower(), content=t["input"].get("content") or t["input"].get("new_string", ""), created_at=ts,
+                    old_content=t["input"].get("old_string"))
                for j, t in enumerate(c["tools"]) if t.get("name") in ("Write", "Edit", "MultiEdit") and t.get("input", {}).get("file_path")]
 
     msgs = [make_msg(idx, i, e) for idx, (i, e) in enumerate(msg_events) if extract_content(e["message"].get("content", ""))["text"]]
@@ -544,7 +546,7 @@ def parse_codex_session(jsonl: Path) -> dict | None:
 
     edits = [dict(id=gen_id(src, f"edit:{cid}:{i}:{j}"), message_id=gen_id(src, f"{cid}:{i}"),
                  file_path=m.group(1), edit_type="shell", content=cmd,
-                 created_at=timestamps[i] if i < len(timestamps) else None)
+                 created_at=timestamps[i] if i < len(timestamps) else None, old_content=None)
             for i, p in items if p.get("type") == "function_call" and p.get("name") == "shell"
             and (args := norm_args(p)) and (c := args.get("command")) and (cmd := " ".join(c) if isinstance(c, list) else c)
             for j, pat in enumerate([r'(?:cat|echo).*[>].*?([^\s>]+)', r'(?:sed|awk).*?([^\s]+)$'])
@@ -581,7 +583,7 @@ def upsert(conn, r: ParseResult):
     for t in r.tools: conn.execute("INSERT OR REPLACE INTO tool_calls VALUES (?,?,?,?,?,?,?,?)", list(t.values()))
     for a in r.attachs: conn.execute("INSERT OR REPLACE INTO attachments VALUES (?,?,?,?,?,?,?,?)", list(a.values()))
     for a in r.artifacts: conn.execute("INSERT OR REPLACE INTO artifacts VALUES (?,?,?,?,?,?,?,?)", list(a.values()))
-    for e in r.edits: conn.execute("INSERT OR REPLACE INTO file_edits VALUES (?,?,?,?,?,?)", list(e.values()))
+    for e in r.edits: conn.execute("INSERT OR REPLACE INTO file_edits VALUES (?,?,?,?,?,?,?)", list(e.values()))
     return len(r.convs), len(r.msgs), len(r.tools), len(r.attachs), len(r.edits), len(new_convs), len(updated)
 
 # ---- embeddings ----
