@@ -21,8 +21,8 @@ def test_line_budget():
 
 
 def test_app_line_budgets():
-    """Each app package stays under 120 LOC (token-aware), per the ~100-LoC app contract."""
+    """Each app package stays under 200 LOC (token-aware): ~100 logic + ~100 for a TUI."""
     root = Path(__file__).resolve().parents[1]
     for src in sorted((root / "apps").glob("*/src")):
         loc = _loc(sorted(src.rglob("*.py")))
-        assert loc < 120, f"App {src.parent.name} budget exceeded: {loc} >= 120"
+        assert loc < 200, f"App {src.parent.name} budget exceeded: {loc} >= 200"

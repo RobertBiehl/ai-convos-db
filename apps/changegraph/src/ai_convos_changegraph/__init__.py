@@ -10,10 +10,10 @@ from typing import Optional
 import typer
 from ai_convos.cli import get_db
 
-_Q = """SELECT fe.edit_type, fe.content, fe.old_content, fe.created_at, m.conversation_id, c.source,
+_Q = """SELECT fe.edit_type, fe.content, fe.old_content, fe.created_at, COALESCE(m.conversation_id, 'unknown'), COALESCE(c.source, '?'),
     (SELECT u.content FROM messages u WHERE u.conversation_id = m.conversation_id AND u.role = 'user'
-     AND u.created_at <= fe.created_at ORDER BY u.created_at DESC LIMIT 1)
-FROM file_edits fe JOIN messages m ON fe.message_id = m.id JOIN conversations c ON c.id = m.conversation_id
+     AND u.content != '' AND u.created_at <= fe.created_at ORDER BY u.created_at DESC LIMIT 1)
+FROM file_edits fe LEFT JOIN messages m ON fe.message_id = m.id LEFT JOIN conversations c ON c.id = m.conversation_id
 WHERE fe.file_path = ? ORDER BY fe.created_at, fe.id"""
 _GQ = """SELECT fe.file_path, m.conversation_id, fe.message_id, c.source FROM file_edits fe
 JOIN messages m ON fe.message_id = m.id JOIN conversations c ON c.id = m.conversation_id"""
@@ -84,4 +84,5 @@ def graph(target: Optional[str] = typer.Argument(None), fmt: str = typer.Option(
     else: typer.echo(json.dumps(edges, default=str))
 
 def register(app: typer.Typer):
-    for cmd in (blame, timeline, at, graph): app.command()(cmd)
+    from .tui import browse
+    for cmd in (blame, timeline, at, graph, browse): app.command()(cmd)
