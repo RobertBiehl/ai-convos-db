@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import json, time, zipfile, hashlib, struct, sqlite3, subprocess, ssl, urllib.request, re, os, sysconfig, math
+import json, time, zipfile, hashlib, struct, sqlite3, subprocess, ssl, urllib.request, re, os, sysconfig, site, math
 from importlib.metadata import entry_points
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
@@ -747,10 +747,10 @@ def doctor(verbose: bool = typer.Option(False, "-v")):
 
 @app.command()
 def install_skills():
-    skill = PROJECT_ROOT / "skills" / "agent-convos" / "SKILL.md"
-    if not skill.exists():
-        data_root = Path(sysconfig.get_paths().get("data", ""))
-        skill = data_root / "share" / "ai-convos-db" / "skills" / "agent-convos" / "SKILL.md"
+    rel = Path("skills") / "agent-convos" / "SKILL.md"
+    shares = [Path(p) / "share" / "ai-convos-db" for p in [sysconfig.get_paths().get("data", ""), site.getuserbase()]]
+    roots = [PROJECT_ROOT, Path(__file__).resolve().parents[2], *shares]
+    skill = next((r / rel for r in roots if (r / rel).exists()), roots[-1] / rel)
     if not skill.exists(): typer.echo(f"Missing skill: {skill}", err=True); raise typer.Exit(1)
     text = skill.read_text()
     for base in [Path(os.environ.get("CODEX_HOME", Path.home() / ".codex")) / "skills",
