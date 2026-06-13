@@ -501,3 +501,17 @@ class TestTimestampParsing:
         """None ISO returns None."""
         from ai_convos.cli import ts_from_iso
         assert ts_from_iso(None) is None
+
+
+class TestInstallSkills:
+    def test_writes_bundled_skill_to_both_targets(self, tmp_path, monkeypatch):
+        """install_skills resolves the bundled SKILL.md and installs it to codex + claude dirs."""
+        from ai_convos.cli import install_skills
+        src = Path(__file__).resolve().parents[1] / "skills" / "agent-convos" / "SKILL.md"
+        assert src.exists(), "bundled skill missing from repo source tree"
+        monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+        monkeypatch.setenv("CODEX_HOME", str(tmp_path / ".codex"))
+        install_skills()
+        dests = [tmp_path / ".codex" / "skills" / "agent-convos" / "SKILL.md",
+                 tmp_path / ".claude" / "skills" / "agent-convos" / "SKILL.md"]
+        assert all(d.read_text() == src.read_text() for d in dests)
