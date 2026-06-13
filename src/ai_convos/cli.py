@@ -330,8 +330,8 @@ def fetch_chatgpt(browser: str = "safari", limit: int = 0) -> ParseResult:
             gizmo = item.get("gizmo_id")
             conv = fetch_json(f"{base}/backend-api/conversation/{item['id']}", cookies, headers, timeout=60)
             msgs, tools, attachs = chatgpt_mapping(cid, conv.get("mapping", {}))
-            return dict(conv=dict(id=cid, source="chatgpt", title=item.get("title"), created_at=ts_any(item.get("create_time")),
-                                  updated_at=ts_any(item.get("update_time")), model=item.get("model"), cwd=None, git_branch=None,
+            return dict(conv=dict(id=cid, source="chatgpt", title=item.get("title"), created_at=ts_any(conv.get("create_time") or item.get("create_time")),
+                                  updated_at=ts_any(conv.get("update_time") or item.get("update_time")), model=item.get("model"), cwd=None, git_branch=None,
                                   project_id=gizmo, metadata=json.dumps({"gizmo_id": gizmo}) if gizmo else "{}"),
                         msgs=msgs, tools=tools, attachs=attachs)
         def parse_item(item): return safe_parse(f"chatgpt web conv {item.get('id') if isinstance(item, dict) else 'unknown'}", parse_item_raw, item)
@@ -781,7 +781,7 @@ def export(output: Path, fmt: str = typer.Option("json", "-f"), source: Optional
     conn.close(); typer.echo(f"Exported to {output}")
 
 @app.command()
-def sync(watch: bool = typer.Option(False, "-w"), interval: int = typer.Option(300, "-i"), claude_code: bool = True, codex: bool = True, verbose: bool = typer.Option(False, "-v", "--verbose")):
+def sync(watch: bool = typer.Option(False, "-w"), interval: int = typer.Option(300, "-i"), claude_code: bool = True, codex: bool = True, full: bool = typer.Option(False, "--full", help="Re-parse/re-fetch everything, ignoring incremental state"), verbose: bool = typer.Option(False, "-v", "--verbose")):
     conn = get_db(); init_schema(conn)
     state, dirty = load_state(), False
     local, web, imports = state.setdefault("local", {}), state.setdefault("web", {}), state.setdefault("imports", {})
@@ -793,10 +793,10 @@ def sync(watch: bool = typer.Option(False, "-w"), interval: int = typer.Option(3
         if name in ("codex", "claude-code"):
             files = [p for p in path.rglob("*.jsonl")]
             prev, mt = local.get(name, {}).get("files", {}), {str(p): p.stat().st_mtime for p in files}
-            if not (chg := [p for p in files if mt.get(str(p), 0) > prev.get(str(p), 0)]): return None
+            if not (chg := files if full else [p for p in files if mt.get(str(p), 0) > prev.get(str(p), 0)]): return None
             return dict(name=name, label=name.replace("-", " ").title(), source=name, func=lambda p=path, fs=chg: parser(p, fs), state=("local", name, {"files": mt}))
         mtime = latest_mtime(path)
-        if mtime <= local.get(name, {}).get("mtime", 0): return None
+        if not full and mtime <= local.get(name, {}).get("mtime", 0): return None
         return dict(name=name, label=name.replace("-", " ").title(), source=name, func=lambda p=path: parser(p), state=("local", name, {"mtime": mtime}))
     def probe_chatgpt(browser):
         hosts = [("https://chatgpt.com", ["chatgpt.com"]),
@@ -839,10 +839,10 @@ def sync(watch: bool = typer.Option(False, "-w"), interval: int = typer.Option(3
         for b in [x for x in order if x]:
             try:
                 head = probe(b); lu = head.split(":", 1)[1] if (name == "claude" and head and ":" in head) else None
-                if head is not None and head == pref.get("head"):
+                if head is not None and head == pref.get("head") and not full:
                     set_state("web", name, {"browser": b, "head": head, **({"last_updated": lu} if lu else {})}); return None
                 last = pref.get("last_updated")
-                since = ts_from_iso(last) if (name == "claude" and last) else None
+                since = ts_from_iso(last) if (name == "claude" and last and not full) else None
                 st = {"browser": b, "head": head, **({"last_updated": lu} if lu else {})}
                 func = (lambda b=b, since=since: fetcher(b, since=since)) if name == "claude" else (lambda b=b: fetcher(b))
                 return dict(name=name, label=name.title(), source=name, func=func, state=("web", name, st))
