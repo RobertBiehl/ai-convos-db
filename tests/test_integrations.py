@@ -257,7 +257,7 @@ class TestDeduplication:
                             updated_at=None, model="claude", cwd=None, git_branch=None,
                             project_id=None, metadata="{}"))
         r1.msgs.append(dict(id=gen_id("claude", f"{cid}:0"), conversation_id=cid, role="user",
-                           content="Hello", thinking=None, created_at=None, model=None, metadata="{}"))
+                           content="Hello", thinking=None, created_at=None, model=None, metadata="{}", parent_id=None))
         upsert(db, r1)
 
         # Second insert with same ID but updated title
@@ -266,7 +266,7 @@ class TestDeduplication:
                             updated_at=None, model="claude", cwd=None, git_branch=None,
                             project_id=None, metadata="{}"))
         r2.msgs.append(dict(id=gen_id("claude", f"{cid}:1"), conversation_id=cid, role="assistant",
-                           content="Hi there", thinking=None, created_at=None, model=None, metadata="{}"))
+                           content="Hi there", thinking=None, created_at=None, model=None, metadata="{}", parent_id=None))
         upsert(db, r2)
 
         # Verify: 1 conversation, 2 messages, title updated
@@ -296,7 +296,7 @@ class TestDeduplication:
         for i in range(3):
             r1.msgs.append(dict(id=gen_id("claude-code", f"{cid}:{i}"), conversation_id=cid,
                                role="user" if i % 2 == 0 else "assistant", content=f"Message {i}",
-                               thinking=None, created_at=None, model=None, metadata="{}"))
+                               thinking=None, created_at=None, model=None, metadata="{}", parent_id=None))
         upsert(db, r1)
 
         # Simulate: same conversation continued (3 more messages)
@@ -307,7 +307,7 @@ class TestDeduplication:
         for i in range(6):  # includes original 3 + 3 new
             r2.msgs.append(dict(id=gen_id("claude-code", f"{cid}:{i}"), conversation_id=cid,
                                role="user" if i % 2 == 0 else "assistant", content=f"Message {i}",
-                               thinking=None, created_at=None, model=None, metadata="{}"))
+                               thinking=None, created_at=None, model=None, metadata="{}", parent_id=None))
         upsert(db, r2)
 
         # Verify: still 1 conversation, now 6 messages
