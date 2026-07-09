@@ -206,6 +206,14 @@ class TestCodexParser:
         assert result.tools[0]["tool_name"] == "shell"
         assert result.tools[0]["message_id"] in {m["id"] for m in result.msgs}  # leading call anchors forward to the first message
 
+    def test_parse_empty_function_call_arguments(self, tmp_path):
+        from ai_convos.cli import parse_codex
+        sessions = tmp_path / ".codex" / "sessions"; sessions.mkdir(parents=True)
+        (sessions / "session.jsonl").write_text("\n".join([
+            json.dumps({"type": "response_item", "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "list"}]}}),
+            json.dumps({"type": "response_item", "payload": {"type": "function_call", "name": "list_dir", "arguments": "{}"}})]))
+        assert parse_codex(tmp_path / ".codex").tools[0]["input"] == "{}"
+
     def test_function_calls_anchor_to_preceding_message(self, tmp_path):
         """Tools and shell edits attach to the nearest preceding message, never to a phantom id."""
         from ai_convos.cli import parse_codex
@@ -533,6 +541,18 @@ class TestIDGeneration:
         id1 = gen_id("claude-code", path)
         id2 = gen_id("claude-code", path)
         assert id1 == id2
+
+
+def test_parse_failures_are_visible(capsys):
+    from ai_convos.cli import safe_parse
+    assert safe_parse("broken fixture", lambda: 1/0) is None
+    assert "parse error (broken fixture): ZeroDivisionError" in capsys.readouterr().err
+
+
+def test_latest_mtime_includes_export_formats(tmp_path):
+    from ai_convos.cli import latest_mtime
+    (tmp_path / "export.json").write_text("[]")
+    assert latest_mtime(tmp_path) == (tmp_path / "export.json").stat().st_mtime
 
 
 # ---- Timestamp Parsing Tests ----

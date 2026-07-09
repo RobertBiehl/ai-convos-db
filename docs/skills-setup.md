@@ -26,3 +26,17 @@ Use
 ---
 
 Tell your agent to use the skill, e.g. "Use agent-convos to sync then search."
+
+Just-in-time ingestion
+----------------------
+
+Install user-level lifecycle hooks for both coding agents:
+
+```bash
+convos install-hooks
+convos install-hooks --status
+```
+
+Claude Code uses `Stop` plus `SessionEnd`; Codex uses `Stop`. Remove only these
+ai-convos-db handlers with `convos install-hooks --remove`. Codex may require
+reviewing the new command hook through `/hooks` after installation.
