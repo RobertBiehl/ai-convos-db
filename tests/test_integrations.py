@@ -113,6 +113,23 @@ class TestChatGPTAPI:
         with pytest.raises(Exception):
             cli.fetch_chatgpt(browser="chrome")
 
+    def test_fetch_chatgpt_dates_from_detail(self, monkeypatch):
+        """Conv dates come from the detail endpoint (epoch) even when the list item omits them."""
+        from ai_convos import cli
+        monkeypatch.setattr(cli, "chatgpt_profiles", lambda b: [None])
+        monkeypatch.setattr(cli, "chatgpt_cookie_base", lambda *a, **k: ({}, "https://chatgpt.com"))
+        monkeypatch.setattr(cli, "chatgpt_headers", lambda *a, **k: {})
+        def fake(url, *a, **k):
+            if "/conversations?offset=0" in url: return {"items": [{"id": "c1", "title": "T", "create_time": None, "update_time": None}], "total": 1}
+            if "/conversations?offset=" in url: return {"items": [], "total": 1}
+            return {"create_time": 1709294400, "update_time": 1709294500,
+                    "mapping": {"n1": {"message": {"author": {"role": "user"}, "content": {"parts": ["hi"]}, "create_time": 1709294400}}}}
+        monkeypatch.setattr(cli, "fetch_json", fake)
+        r = cli.fetch_chatgpt("safari")
+        assert len(r.convs) == 1
+        assert r.convs[0]["created_at"] == cli.ts_from_epoch(1709294400)
+        assert r.convs[0]["updated_at"] == cli.ts_from_epoch(1709294500)
+
 
 # ---- Claude API Tests ----
 
