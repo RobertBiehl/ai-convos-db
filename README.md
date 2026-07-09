@@ -71,6 +71,9 @@ convos embed                                      # backfill embeddings, no web 
 convos query "how do I store vectors in duckdb"    # hybrid: BM25 + embeddings + rerank
 ```
 
+Both discovery commands return the strongest matching message from each
+conversation, so `-n` controls the number of distinct conversation candidates.
+
 Semantic search is included by default. Run `convos embed` or `convos sync`
 after install to backfill embeddings with a progress bar; subsequent syncs only
 embed new/changed messages. Models used: `embeddinggemma-300m-qat-q8_0` for

@@ -78,6 +78,13 @@ def test_query_returns_one_hit_per_conversation(hybrid_db, monkeypatch):
     assert len(__import__("json").loads(r.output)) == 1
 
 
+def test_search_returns_one_hit_per_conversation(hybrid_db):
+    r = CliRunner().invoke(cli.app, ["search", "apple", "-n", "5", "-f", "json"])
+    assert r.exit_code == 0
+    hits = __import__("json").loads(r.output)
+    assert len(hits) == 1 and hits[0]["conversation_id"] == "c1"
+
+
 def test_query_filters_candidates_and_skips_injected_boilerplate(tmp_path, monkeypatch):
     db = tmp_path / "test.db"; monkeypatch.setattr(cli, "DB_PATH", db); monkeypatch.setattr(cli, "DATA_DIR", tmp_path)
     conn = duckdb.connect(str(db)); cli.init_schema(conn)

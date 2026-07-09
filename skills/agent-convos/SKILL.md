@@ -9,7 +9,7 @@ Retrieve with one of three commands:
 
 ```bash
 convos query "natural language question" -n 8 -f jsonl   # conceptual/paraphrased discovery; default when wording is uncertain
-convos search "exact terms" -n 8 -c 160 -f jsonl         # known terms, quotes, ids, filenames; fast BM25
+convos search "exact terms" -n 8 -c 160 -f jsonl         # known terms, quotes, ids, filenames; one hit/conversation
 convos sql "SELECT ..." -f jsonl                          # open known conversations; structured filters, joins, counts, history
 ```
 
@@ -41,6 +41,7 @@ convos sql "SELECT source, COUNT(*) FROM conversations GROUP BY source" -f json
 Behavior:
 
 - Discover first with `query` for concepts/paraphrases or `search` for known literal text, then use `sql` to read the strongest conversation candidates in order or answer structured questions.
+- Both discovery commands return at most one strongest message per conversation, so `-n` budgets distinct conversation candidates.
 - SQL text matching is available but usually a worse discovery path than `query`/`search`; reserve SQL primarily for known ids, fields, relations, ordering, and aggregation.
 - `search`/`query` accept `-s` source, `-d` days, `-r` role, `-n` limit, `-c` context; for any richer filter, use `sql`.
 - Optimize relevance and tokens: keep `-n` <= 8 and `-c` <= 200 unless the user wants more.
