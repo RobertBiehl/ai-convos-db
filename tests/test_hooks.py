@@ -36,8 +36,47 @@ def test_retrieval_drains_idempotently_and_preserves_truncated_rewritten_history
     transcript(path); enqueue(path); runner.invoke(cli.app, ["search", "remember alpha"])
     conn = duckdb.connect(str(data/"convos.db")); assert conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0] == 2; assert conn.execute("SELECT updated_at FROM conversations").fetchone()[0] == updated; conn.close()
     transcript(path, user="rewritten alpha"); enqueue(path); runner.invoke(cli.app, ["search", "rewritten alpha"])
-    conn = duckdb.connect(str(data/"convos.db")); assert conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0] == 3; assert conn.execute("SELECT COUNT(*) FROM messages WHERE content IN ('remember alpha','rewritten alpha')").fetchone()[0] == 2; conn.close()
+    conn = duckdb.connect(str(data/"convos.db")); assert conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0] == 3; assert conn.execute("SELECT COUNT(*) FROM messages WHERE content IN ('remember alpha','rewritten alpha')").fetchone()[0] == 2; meta = json.loads(conn.execute("SELECT metadata FROM messages WHERE content='remember alpha'").fetchone()[0]); assert meta["history_of"] and meta["superseded_at"]; conn.close()
     enqueue(path); runner.invoke(cli.app, ["search", "rewritten alpha"]); conn = duckdb.connect(str(data/"convos.db")); assert conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0] == 3; conn.close()
+
+def test_enqueue_during_drain_survives_for_next_worker(hooks, monkeypatch):
+    sessions, data = hooks; path = sessions/"s.jsonl"; transcript(path); enqueue(path); original, raced = cli.upsert, {"done":False}
+    def upsert(conn, result):
+        out = original(conn, result)
+        if not raced["done"]: raced["done"] = True; transcript(path, "newer alpha"); enqueue(path)
+        return out
+    monkeypatch.setattr(cli, "upsert", upsert); assert cli.drain_hooks() == 1
+    assert len(list((data/"hook_inbox").glob("*.json"))) == 1
+    monkeypatch.setattr(cli, "upsert", original); assert cli.drain_hooks() == 1
+    conn = duckdb.connect(str(data/"convos.db")); assert conn.execute("SELECT COUNT(*) FROM messages WHERE content IN ('remember alpha','newer alpha')").fetchone()[0] == 2; conn.close()
+
+def test_failed_parse_returns_claim_to_queue(hooks, monkeypatch):
+    sessions, data = hooks; path = sessions/"s.jsonl"; transcript(path); enqueue(path); original = cli.hook_result
+    monkeypatch.setattr(cli, "hook_result", lambda *_: (_ for _ in ()).throw(ValueError("partial transcript"))); assert cli.drain_hooks() == 0
+    assert len(list((data/"hook_inbox").glob("*.json"))) == 1 and not list((data/"hook_inbox").glob("*.work"))
+    monkeypatch.setattr(cli, "hook_result", original); assert cli.drain_hooks() == 1
+
+def test_orphaned_claim_forces_reindex_after_committed_upsert(hooks):
+    sessions, data = hooks; path = sessions/"s.jsonl"; transcript(path); enqueue(path); q = next((data/"hook_inbox").glob("*.json")); work = q.with_suffix(".work"); q.replace(work)
+    conn = duckdb.connect(str(data/"convos.db")); cli.init_schema(conn); cli.upsert(conn, cli.hook_result("codex", path)); conn.close()
+    assert cli.drain_hooks() == 1
+    conn = duckdb.connect(str(data/"convos.db")); assert conn.execute("SELECT COUNT(*) FROM information_schema.schemata WHERE schema_name='fts_main_messages'").fetchone()[0] == 1; conn.close()
+
+def test_embedding_claim_is_scoped_and_preserves_new_work(hooks, monkeypatch):
+    _, data = hooks; (data/"hook_inbox").mkdir(parents=True); cli.atomic_json(data/"hook_embeddings_dirty", ["old"]); seen = {}
+    def embed(batch, ids): seen.update(batch=batch, ids=ids); cli.atomic_json(data/"hook_embeddings_dirty", ["new"])
+    monkeypatch.setattr(cli, "embed_pending", embed); cli.embed_hook_pending()
+    assert seen == {"batch":32, "ids":["old"]} and json.loads((data/"hook_embeddings_dirty").read_text()) == ["new"]
+
+def test_failed_embedding_restores_claimed_ids(hooks, monkeypatch):
+    _, data = hooks; (data/"hook_inbox").mkdir(parents=True); cli.atomic_json(data/"hook_embeddings_dirty", ["old"])
+    monkeypatch.setattr(cli, "embed_pending", lambda *_: (_ for _ in ()).throw(RuntimeError("model failed")))
+    with pytest.raises(RuntimeError, match="model failed"): cli.embed_hook_pending()
+    assert json.loads((data/"hook_embeddings_dirty").read_text()) == ["old"]
+
+def test_init_still_installs_skills(hooks, monkeypatch):
+    called = []; monkeypatch.setattr(cli, "install_skills", lambda: called.append(True))
+    assert CliRunner().invoke(cli.app, ["init"]).exit_code == 0 and called == [True]
 
 def test_hook_rejects_paths_outside_provider_root(hooks):
     _, data = hooks; data.mkdir(); path = data/"outside.jsonl"; transcript(path)

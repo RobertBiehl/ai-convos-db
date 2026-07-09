@@ -95,14 +95,17 @@ GGUF, downloaded on first call and cached by huggingface-hub.
 
 Claude Code and Codex lifecycle hooks write coalesced records under
 `data/hook_inbox/`; records contain only provider, transcript path, size, and
-mtime. The hook process never opens DuckDB. A detached drain parses stable
-transcript snapshots without a DB lock, upserts each snapshot under a short
-writer connection, rebuilds FTS once, and records the processed snapshot.
+mtime. The hook process never opens DuckDB. A detached drain atomically claims
+each record, parses stable transcript snapshots without a DB lock, upserts each
+snapshot under a short writer connection, rebuilds FTS only for changed text,
+and records the processed snapshot. New events cannot be deleted by an older
+in-flight claim, and orphaned claims are retried after a process crash.
 
 `search`, `query`, and `sql` drain pending records before opening their read
-connection. `query` also embeds hook-ingested messages when the local dirty
-marker is present. Ingest is additive: missing records are never deleted, and
-rewritten records preserve the prior payload under a deterministic history id.
+connection. `query` also atomically claims and embeds only dirty message ids;
+concurrent queries share an embedding lock without holding DuckDB open. Ingest
+is additive: missing records are never deleted, and rewritten records preserve
+the prior payload under a deterministic history id with provenance metadata.
 `sync` drains the same inbox before its normal local/web reconciliation.
 5. **Query**: CLI commands read from DB, apply filters, format output
 

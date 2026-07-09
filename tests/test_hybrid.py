@@ -197,6 +197,7 @@ def test_search_rebuilds_missing_fts_index(tmp_path, monkeypatch):
     conn.execute("INSERT INTO messages VALUES ('m1','c1','user','recoverable',NULL,NULL,NULL,NULL,NULL,NULL)"); conn.close()
     r = CliRunner().invoke(cli.app, ["search", "recoverable", "-f", "json"])
     assert r.exit_code == 0 and __import__("json").loads(r.output)[0]["conversation_id"] == "c1"
+    conn = duckdb.connect(str(db)); assert conn.execute("SELECT COUNT(*) FROM information_schema.schemata WHERE schema_name='fts_main_messages'").fetchone()[0] == 1; conn.close()
 
 
 def test_export_parameterizes_source_and_path(tmp_path, monkeypatch):

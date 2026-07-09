@@ -101,8 +101,10 @@ convos install-hooks --remove    # remove only ai-convos-db hook handlers
 
 Hooks enqueue only the local transcript path and file metadata, then return
 immediately. A coalescing background drain parses and upserts the transcript;
-read commands flush any pending work before querying. `sync` remains the
-reconciliation path for missed local events, web providers, and imports.
+read commands flush any pending work before querying. `query` also embeds only
+the changed hook messages, while `search` and `sql` avoid loading the embedding
+model. `sync` remains the reconciliation path for missed local events, web
+providers, pre-hook sessions, and imports rather than a routine local update.
 
 Auto-import export paths with:
 
