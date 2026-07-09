@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 import json, time, zipfile, hashlib, struct, sqlite3, subprocess, ssl, urllib.request, re, os, sysconfig, site, math, csv, sys, shutil, shlex, fcntl
-from importlib.metadata import entry_points
+from importlib.metadata import entry_points, version
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -822,6 +822,20 @@ def embed_cmd(batch: int = typer.Option(32, "-b")):
 
 @app.command()
 def doctor(verbose: bool = typer.Option(False, "-v")):
+    typer.echo(f"convos: {version('ai-convos-db')}")
+    pending = len(list(HOOK_DIR.glob("*.json"))) + len(list(HOOK_DIR.glob("*.work"))); state = json.loads(HOOK_STATE.read_text()) if HOOK_STATE.exists() else {}; last = max((v[0] for v in state.values()), default=0)
+    dirty = len(json.loads(HOOK_EMBED_DIRTY.read_text())) if HOOK_EMBED_DIRTY.exists() else 0; claims = len(list(DATA_DIR.glob(f".{HOOK_EMBED_DIRTY.name}.*")))
+    typer.echo(f"ingest: pending={pending}, embedding_ids={dirty}, embedding_claims={claims}, last={datetime.fromtimestamp(last/1e9).isoformat(timespec='seconds') if last else 'never'}")
+    if DB_PATH.exists():
+        try:
+            conn = get_db(read_only=True); cols = set(conn.execute("SELECT table_name,column_name FROM information_schema.columns").fetchall()); required = {"conversations":("id","source","title","created_at","updated_at","model","cwd","git_branch","project_id","metadata"), "messages":("id","conversation_id","role","content","thinking","created_at","model","metadata","embedding","parent_id"), "tool_calls":("id","message_id","tool_name","input","output","status","duration_ms","created_at"), "attachments":("id","message_id","filename","mime_type","size","path","url","created_at"), "artifacts":("id","conversation_id","artifact_type","title","content","language","created_at","version"), "file_edits":("id","message_id","file_path","edit_type","content","created_at","old_content")}; missing = [f"{t}.{c}" for t, cs in required.items() for c in cs if (t,c) not in cols]
+            convs, msgs, unembedded, latest = conn.execute("SELECT (SELECT COUNT(*) FROM conversations),(SELECT COUNT(*) FROM messages),(SELECT COUNT(*) FROM messages WHERE embedding IS NULL AND COALESCE(content,'')!=''),(SELECT MAX(updated_at) FROM conversations)").fetchone() if not missing else (0,0,0,None); fts = bool(conn.execute("SELECT 1 FROM information_schema.schemata WHERE schema_name='fts_main_messages'").fetchone()); conn.close()
+            typer.echo(f"archive: {convs} convs, {msgs} msgs, {unembedded} unembedded, {DB_PATH.stat().st_size/1024**3:.1f} GB, latest={latest or 'never'}, schema={'ready' if not missing else 'missing:' + ','.join(missing)}, fts={'yes' if fts else 'no'}")
+            if missing or not fts: typer.echo("repair: convos init")
+            elif unembedded: typer.echo("repair: convos embed")
+        except Exception as e: typer.echo(f"archive: unavailable ({e})")
+    else: typer.echo(f"archive: missing ({DB_PATH})"); typer.echo("repair: convos init")
+    install_hooks(status=True)
     def has(domains, host): return any(host in d or d in host for d in domains)
     targets = ["chatgpt.com", "chat.openai.com", "openai.com", "claude.ai"]
     for name, getter in [("safari", safari_cookie_domains), ("chrome", chrome_cookie_domains)]:

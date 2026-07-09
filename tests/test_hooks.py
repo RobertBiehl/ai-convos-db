@@ -78,6 +78,20 @@ def test_init_still_installs_skills(hooks, monkeypatch):
     called = []; monkeypatch.setattr(cli, "install_skills", lambda: called.append(True))
     assert CliRunner().invoke(cli.app, ["init"]).exit_code == 0 and called == [True]
 
+def test_doctor_reports_archive_ingest_and_hook_health(hooks, monkeypatch):
+    _, data = hooks; claude = data/"claude"; claude.mkdir(parents=True); monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(claude)); monkeypatch.setattr(cli, "safari_cookie_domains", lambda: []); monkeypatch.setattr(cli, "chrome_cookie_domains", lambda: [])
+    conn = duckdb.connect(str(data/"convos.db")); cli.init_schema(conn); conn.execute("INSERT INTO conversations VALUES ('c','codex','T',NULL,'2026-01-01',NULL,NULL,NULL,NULL,NULL)"); conn.execute("INSERT INTO messages VALUES ('m','c','user','hello',NULL,NULL,NULL,NULL,NULL,NULL)"); cli.rebuild_fts_index(conn); conn.close()
+    cli.atomic_json(data/"hook_state.json", {"x":[1767225600000000000,1]}); cli.atomic_json(data/"hook_embeddings_dirty", ["m"]); cli.atomic_json(data/"hook_inbox/q.json", {"source":"codex"})
+    r = CliRunner().invoke(cli.app, ["doctor"]); assert r.exit_code == 0
+    assert "convos:" in r.output and "archive: 1 convs, 1 msgs, 1 unembedded" in r.output and "schema=ready, fts=yes" in r.output and "repair: convos embed" in r.output
+    assert "ingest: pending=1, embedding_ids=1, embedding_claims=0, last=2026-01-01" in r.output and "codex: 0 hooks" in r.output
+
+def test_doctor_surfaces_schema_skew(hooks, monkeypatch):
+    _, data = hooks; data.mkdir(); monkeypatch.setattr(cli, "safari_cookie_domains", lambda: []); monkeypatch.setattr(cli, "chrome_cookie_domains", lambda: [])
+    conn = duckdb.connect(str(data/"convos.db")); conn.execute("CREATE TABLE messages (id VARCHAR, content VARCHAR)"); conn.close()
+    r = CliRunner().invoke(cli.app, ["doctor"]); assert r.exit_code == 0
+    assert "schema=missing:" in r.output and "messages.embedding" in r.output and "fts=no" in r.output and "repair: convos init" in r.output
+
 def test_hook_rejects_paths_outside_provider_root(hooks):
     _, data = hooks; data.mkdir(); path = data/"outside.jsonl"; transcript(path)
     with pytest.raises(ValueError, match="Invalid codex transcript path"): cli.enqueue_hook("codex", {"transcript_path":str(path)})

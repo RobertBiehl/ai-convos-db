@@ -46,6 +46,7 @@ Behavior:
 - Optimize relevance and tokens: keep `-n` <= 8 and `-c` <= 200 unless the user wants more.
 - `sql` runs on a read-only connection, so writes fail by construction; it is safe for arbitrary `SELECT`s.
 - Installed coding-agent hooks make local Claude Code and Codex turns available just in time; read commands flush pending hook work automatically.
+- If retrieval is stale, empty, or unavailable, run `convos doctor` before syncing; it reports archive/schema/FTS health, ingestion and embedding backlog, hooks, and web access.
 - Sync when the request needs fresh web conversations, imports, missed-hook reconciliation, or the user explicitly asks for an update.
 - Use `sync` as the only fetch/import update command; use `embed` only to backfill hybrid embeddings.
 - Expect a fast no-op when nothing changed. Report specific errors (cookies, auth, permissions) if a fetch fails.

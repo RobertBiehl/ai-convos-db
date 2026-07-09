@@ -106,6 +106,10 @@ the changed hook messages, while `search` and `sql` avoid loading the embedding
 model. `sync` remains the reconciliation path for missed local events, web
 providers, pre-hook sessions, and imports rather than a routine local update.
 
+Check the complete local pipeline with `convos doctor`. It reports the running
+version, archive/schema/FTS health, embedding backlog, queued ingestion, hook
+installation, and web-cookie availability without modifying the archive.
+
 Auto-import export paths with:
 
 ```bash
