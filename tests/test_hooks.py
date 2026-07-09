@@ -7,7 +7,7 @@ from ai_convos import cli
 @pytest.fixture
 def hooks(tmp_path, monkeypatch):
     data, codex = tmp_path/"data", tmp_path/".codex"; sessions = codex/"sessions"; sessions.mkdir(parents=True)
-    for k, v in (("DATA_DIR", data), ("DB_PATH", data/"convos.db"), ("HOOK_DIR", data/"hook_inbox"), ("HOOK_STATE", data/"hook_state.json"), ("HOOK_EMBED_DIRTY", data/"hook_embeddings_dirty")): monkeypatch.setattr(cli, k, v)
+    for k, v in (("DATA_DIR", data), ("DB_PATH", data/"convos.db"), ("HOOK_DIR", data/"hook_inbox"), ("HOOK_STATE", data/"hook_state.json"), ("HOOK_EMBED_DIRTY", data/"hook_embeddings_dirty"), ("HOOK_FTS_DIRTY", data/"hook_fts_dirty")): monkeypatch.setattr(cli, k, v)
     monkeypatch.setenv("CODEX_HOME", str(codex)); monkeypatch.setattr(cli.subprocess, "Popen", lambda *a, **k: None)
     return sessions, data
 
@@ -60,7 +60,30 @@ def test_orphaned_claim_forces_reindex_after_committed_upsert(hooks):
     sessions, data = hooks; path = sessions/"s.jsonl"; transcript(path); enqueue(path); q = next((data/"hook_inbox").glob("*.json")); work = q.with_suffix(".work"); q.replace(work)
     conn = duckdb.connect(str(data/"convos.db")); cli.init_schema(conn); cli.upsert(conn, cli.hook_result("codex", path)); conn.close()
     assert cli.drain_hooks() == 1
+    assert (data/"hook_fts_dirty").exists(); assert cli.flush_fts()
     conn = duckdb.connect(str(data/"convos.db")); assert conn.execute("SELECT COUNT(*) FROM information_schema.schemata WHERE schema_name='fts_main_messages'").fetchone()[0] == 1; conn.close()
+
+def test_hook_defers_fts_until_fresh_search(hooks):
+    sessions, data = hooks; path = sessions/"s.jsonl"; transcript(path); enqueue(path); assert cli.drain_hooks() == 1
+    conn = duckdb.connect(str(data/"convos.db")); assert not conn.execute("SELECT 1 FROM information_schema.schemata WHERE schema_name='fts_main_messages'").fetchone(); conn.close(); assert (data/"hook_fts_dirty").exists()
+    hits = json.loads(CliRunner().invoke(cli.app, ["search", "remember alpha", "-f", "json"]).output)
+    assert hits[0]["content"] == "remember alpha" and not (data/"hook_fts_dirty").exists()
+
+def test_fts_claim_preserves_new_work(hooks, monkeypatch):
+    _, data = hooks; (data/"hook_inbox").mkdir(parents=True); (data/"hook_fts_dirty").touch(); conn = duckdb.connect(str(data/"convos.db")); cli.init_schema(conn); conn.close()
+    monkeypatch.setattr(cli, "rebuild_fts_index", lambda _: (data/"hook_fts_dirty").touch()); assert cli.flush_fts()
+    assert (data/"hook_fts_dirty").exists() and not list(data.glob(".hook_fts_dirty.*"))
+
+def test_failed_fts_claim_is_restored(hooks, monkeypatch):
+    _, data = hooks; (data/"hook_inbox").mkdir(parents=True); (data/"hook_fts_dirty").touch()
+    monkeypatch.setattr(cli, "rebuild_fts_index", lambda _: (_ for _ in ()).throw(RuntimeError("index failed")))
+    with pytest.raises(RuntimeError, match="index failed"): cli.flush_fts()
+    assert (data/"hook_fts_dirty").exists() and not list(data.glob(".hook_fts_dirty.*"))
+
+def test_orphaned_fts_claim_is_retried(hooks, monkeypatch):
+    _, data = hooks; (data/"hook_inbox").mkdir(parents=True); (data/".hook_fts_dirty.dead").touch(); seen = []
+    monkeypatch.setattr(cli, "rebuild_fts_index", lambda _: seen.append(True)); assert cli.flush_fts()
+    assert seen == [True] and not (data/"hook_fts_dirty").exists() and not list(data.glob(".hook_fts_dirty.*"))
 
 def test_embedding_claim_is_scoped_and_preserves_new_work(hooks, monkeypatch):
     _, data = hooks; (data/"hook_inbox").mkdir(parents=True); cli.atomic_json(data/"hook_embeddings_dirty", ["old"]); seen = {}
