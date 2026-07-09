@@ -6,7 +6,7 @@
 
 ## Quick install
 ```bash
-pipx install "git+https://github.com/RobertBiehl/ai-convos-db.git"
+uv tool install "git+https://github.com/RobertBiehl/ai-convos-db.git"
 ```
 
 Local-first, searchable archive for ChatGPT, Claude, and Codex conversations. One file, one DB, fast full-text search.
@@ -25,20 +25,23 @@ Local-first, searchable archive for ChatGPT, Claude, and Codex conversations. On
 - Fetch from ChatGPT and Claude using browser cookies
 - Import exports from ChatGPT, Claude, Claude Code, and Codex
 - Sync Claude Code + Codex sessions on a schedule
+- Optional code-change provenance: blame, timeline, time travel, and graph browsing
 - Export to JSON or CSV
 
 ## Install
 
-Install from GitHub with pipx (adds `convos` to PATH in an isolated environment):
+Install from GitHub with uv (adds `convos` to PATH in an isolated environment):
 
 ```bash
-pipx install "git+https://github.com/RobertBiehl/ai-convos-db.git"
+uv tool install "git+https://github.com/RobertBiehl/ai-convos-db.git"
 ```
+
+`pipx install "git+https://github.com/RobertBiehl/ai-convos-db.git"` is also supported.
 
 Upgrade later with:
 
 ```bash
-pipx upgrade ai-convos-db
+uv tool install --reinstall "git+https://github.com/RobertBiehl/ai-convos-db.git"
 ```
 
 `convos init` creates the archive and installs the bundled Codex + Claude Code
@@ -47,6 +50,15 @@ skills automatically. Refresh the skills without initializing the archive with:
 ```bash
 convos install-skills
 ```
+
+Optionally add code-change provenance without expanding the core CLI package:
+
+```bash
+uv tool install --reinstall "git+https://github.com/RobertBiehl/ai-convos-db.git" \
+  --with "ai-convos-changegraph @ git+https://github.com/RobertBiehl/ai-convos-db.git#subdirectory=apps/changegraph"
+```
+
+This adds `convos blame`, `timeline`, `at`, `graph`, and `browse`.
 
 ## Quickstart
 
