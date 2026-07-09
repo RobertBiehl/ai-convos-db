@@ -75,8 +75,9 @@ computed brute-force via DuckDB's `array_cosine_similarity` — at the current
 scale (tens of thousands of messages) this is fast enough that a vector index
 (VSS/HNSW) would only add complexity.
 
-Pipeline: BM25 top-50 ∪ cosine top-50 → Reciprocal Rank Fusion → Qwen3-Reranker
-top-30 → position-tier blend (rank 0-2: 0.75/0.25, 3-9: 0.6/0.4, 10+: 0.4/0.6).
+Pipeline: filtered BM25 top-50 ∪ cosine top-50 → Reciprocal Rank Fusion → one
+message per conversation → Qwen3-Reranker top-16 → position-tier blend (rank
+0-2: 0.75/0.25, 3-9: 0.6/0.4, 10+: 0.4/0.6).
 Models load lazily, so users pay model startup/download cost only when using
 `convos query`, `convos embed`, or sync-time embedding.
 
@@ -85,10 +86,25 @@ GGUF, downloaded on first call and cached by huggingface-hub.
 
 ## Data Flow
 
-1. **Fetch/Parse**: Read from API or file, produce `ParseResult`
-2. **Upsert**: `INSERT OR REPLACE` into DuckDB tables
-3. **Index**: Rebuild FTS index on messages table
-4. **Query**: CLI commands read from DB, apply filters, format output
+1. **Fetch/Parse**: Read from API or file without holding the DuckDB lock
+2. **Upsert**: Acquire the writer briefly per completed `ParseResult`
+3. **Index**: Rebuild FTS under a short writer connection
+4. **Embed**: Compute vectors unlocked, then update each batch under a short writer connection
+
+### Just-in-time local ingestion
+
+Claude Code and Codex lifecycle hooks write coalesced records under
+`data/hook_inbox/`; records contain only provider, transcript path, size, and
+mtime. The hook process never opens DuckDB. A detached drain parses stable
+transcript snapshots without a DB lock, upserts each snapshot under a short
+writer connection, rebuilds FTS once, and records the processed snapshot.
+
+`search`, `query`, and `sql` drain pending records before opening their read
+connection. `query` also embeds hook-ingested messages when the local dirty
+marker is present. Ingest is additive: missing records are never deleted, and
+rewritten records preserve the prior payload under a deterministic history id.
+`sync` drains the same inbox before its normal local/web reconciliation.
+5. **Query**: CLI commands read from DB, apply filters, format output
 
 ## File Layout
 

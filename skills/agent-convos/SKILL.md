@@ -1,25 +1,16 @@
 ---
 name: agent-convos
-description: Sync and search the local convo DB to update or retrieve conversation context.
+description: Retrieve prior AI conversation context and keep the local archive current. Use whenever the user asks to recall, find, continue, summarize, compare, or verify information from past ChatGPT, Claude, Claude Code, or Codex conversations, including earlier plans, decisions, commands, evidence, or work sessions.
 ---
 
 # Agent Convos
 
-Sync:
+Retrieve with one of three commands:
 
 ```bash
-convos sync                 # fetch/import all sources (no-op when nothing changed)
-convos embed                # backfill hybrid embeddings without a web sync
-```
-
-Retrieve. There are only three retrieval commands; everything else (listing,
-reading a conversation, filtering, counts, file history) is a `sql` query over
-the schema below:
-
-```bash
-convos search "exact terms" -n 8 -c 160 -f jsonl         # BM25, fast
-convos query "natural language question" -n 8 -f jsonl   # hybrid (semantic), slower, loads local models
-convos sql "SELECT ..." -f jsonl                          # read-only DuckDB SQL, the general tool
+convos query "natural language question" -n 8 -f jsonl   # conceptual/paraphrased discovery; default when wording is uncertain
+convos search "exact terms" -n 8 -c 160 -f jsonl         # known terms, quotes, ids, filenames; fast BM25
+convos sql "SELECT ..." -f jsonl                          # open known conversations; structured filters, joins, counts, history
 ```
 
 Output: add `-f jsonl` (stream, one JSON object per line) or `-f json` (array);
@@ -28,10 +19,10 @@ default is human text. Prefer `jsonl` when parsing programmatically.
 Schema (write `convos sql` against these tables):
 
 - `conversations(id, source, title, created_at, updated_at, model, cwd, git_branch, project_id, metadata JSON)`
-- `messages(id, conversation_id, role, content, thinking, created_at, model, metadata JSON, embedding FLOAT[768])`
+- `messages(id, conversation_id, role, content, thinking, created_at, model, metadata JSON, embedding FLOAT[768], parent_id)`
 - `tool_calls(id, message_id, tool_name, input JSON, output JSON, status, duration_ms, created_at)`
 - `attachments(id, message_id, filename, mime_type, size, path, url, created_at)`
-- `file_edits(id, message_id, file_path, edit_type, content, created_at)`
+- `file_edits(id, message_id, file_path, edit_type, content, created_at, old_content)`
 - Full-text: `fts_main_messages.match_bm25(id, 'terms')` -> score, `NULL` when no match; indexed over `content`+`thinking`.
 
 Common `sql` recipes:
@@ -49,19 +40,29 @@ convos sql "SELECT source, COUNT(*) FROM conversations GROUP BY source" -f json
 
 Behavior:
 
-- Pick the command: `search` for known keywords/exact strings; `query` for paraphrased/conceptual lookups (slower, needs models); `sql` for listing, reading a conversation, filters, joins, counts -- anything structured.
+- Discover first with `query` for concepts/paraphrases or `search` for known literal text, then use `sql` to read the strongest conversation candidates in order or answer structured questions.
+- SQL text matching is available but usually a worse discovery path than `query`/`search`; reserve SQL primarily for known ids, fields, relations, ordering, and aggregation.
 - `search`/`query` accept `-s` source, `-d` days, `-r` role, `-n` limit, `-c` context; for any richer filter, use `sql`.
 - Optimize relevance and tokens: keep `-n` <= 8 and `-c` <= 200 unless the user wants more.
 - `sql` runs on a read-only connection, so writes fail by construction; it is safe for arbitrary `SELECT`s.
+- Installed coding-agent hooks make local Claude Code and Codex turns available just in time; read commands flush pending hook work automatically.
+- Sync when the request needs fresh web conversations, imports, missed-hook reconciliation, or the user explicitly asks for an update.
 - Use `sync` as the only fetch/import update command; use `embed` only to backfill hybrid embeddings.
 - Expect a fast no-op when nothing changed. Report specific errors (cookies, auth, permissions) if a fetch fails.
 - Use `CONVOS_IMPORT_PATHS` for export paths (comma-separated) consumed by `sync`.
 - If `convos` is not on PATH, use the repo wrapper: `bin/convos`.
 - Use shell commands only; do not use MCP resources for this skill.
 
+Sync:
+
+```bash
+convos sync                 # fetch/import new or changed source data
+convos embed                # backfill hybrid embeddings without a web sync
+convos install-hooks        # install user-level Claude Code + Codex JIT ingestion
+```
+
 Storage:
 
 - DB file: `<root>/data/convos.db`
 - Sync state: `<root>/data/sync_state.json`
 - Default root: `~/.convos` (override with `CONVOS_PROJECT_ROOT`)
-```

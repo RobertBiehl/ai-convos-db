@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import json, time, zipfile, hashlib, struct, sqlite3, subprocess, ssl, urllib.request, re, os, sysconfig, site, math
+import json, time, zipfile, hashlib, struct, sqlite3, subprocess, ssl, urllib.request, re, os, sysconfig, site, math, csv, sys, shutil, shlex, fcntl
 from importlib.metadata import entry_points
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
@@ -17,18 +17,19 @@ def find_root():
 PROJECT_ROOT = find_root()
 DATA_DIR, DB_PATH = PROJECT_ROOT / "data", PROJECT_ROOT / "data" / "convos.db"
 STATE_PATH = DATA_DIR / "sync_state.json"
+HOOK_DIR, HOOK_STATE, HOOK_EMBED_DIRTY = DATA_DIR/"hook_inbox", DATA_DIR/"hook_state.json", DATA_DIR/"hook_embeddings_dirty"
 
 # ---- db helpers ----
 def get_db(read_only: bool = False):
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     if read_only and not DB_PATH.exists():
         return None
-    for i in range(30 if read_only else 1):
+    for i in range(30):
         try: return duckdb.connect(str(DB_PATH), read_only=read_only)
         except Exception as e:
             if "Conflicting lock is held" not in str(e): raise
-            if read_only and i < 29: time.sleep(1); continue
-            raise ValueError("Database is locked by another convos process. Try again after `convos sync` finishes.") from e
+            if i < 29: time.sleep(1); continue
+            raise ValueError("Database stayed locked by another convos process for 30 seconds.") from e
 
 def load_state():
     if not STATE_PATH.exists(): return {}
@@ -38,15 +39,18 @@ def load_state():
 def save_state(state):
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     STATE_PATH.write_text(json.dumps(state))
+def atomic_json(path: Path, data):
+    path.parent.mkdir(parents=True, exist_ok=True); tmp = path.with_name(f".{path.name}.{os.getpid()}"); tmp.write_text(json.dumps(data)); os.replace(tmp, path)
 
 def detect_source(path: Path):
     if path.is_dir(): return "codex" if (path / "sessions").exists() else "claude-code"
     if path.suffix == ".zip" or "chatgpt" in path.name.lower(): return "chatgpt"
     data = json.loads(path.read_text())
+    if not data: raise ValueError(f"Empty export: {path}")
     return "chatgpt" if "mapping" in data[0] else "claude" if "chat_messages" in data[0] else "chatgpt"
 
-def latest_mtime(path: Path, glob: str = "*.jsonl"):
-    return max((p.stat().st_mtime for p in path.rglob(glob)), default=0)
+def latest_mtime(path: Path, globs: tuple[str, ...] = ("*.jsonl", "*.json", "*.zip")):
+    return max((p.stat().st_mtime for g in globs for p in path.rglob(g)), default=0)
 
 def init_schema(conn):
     conn.execute("""CREATE TABLE IF NOT EXISTS conversations (
@@ -173,7 +177,7 @@ def read_chrome_cookies(domain: str, profile: str | None = None) -> dict[str, st
     for name, encrypted, host in conn.execute("SELECT name, encrypted_value, host_key FROM cookies WHERE host_key LIKE ?", (f"%{domain}%",)):
         if encrypted[:3] == b'v10':
             cipher = Cipher(algorithms.AES(key), modes.CBC(b' ' * 16))
-            decrypted = cipher.decryptor().update(encrypted[3:]) + cipher.decryptor().finalize()
+            dec = cipher.decryptor(); decrypted = dec.update(encrypted[3:]) + dec.finalize()
             cookies[name] = (v[32:] if not (v := decrypted[:-decrypted[-1]])[:32].isascii() else v).decode('utf-8', errors='ignore')
     conn.close()
     return cookies
@@ -272,8 +276,6 @@ class ParseResult:
         self.attachs, self.artifacts, self.edits = attachs or [], artifacts or [], edits or []
 
 def log_parse_error(context: str, err: Exception):
-    if not os.environ.get("CONVOS_PARSE_LOG"):
-        return
     typer.echo(f"  parse error ({context}): {type(err).__name__}: {err}", err=True)
 
 def safe_parse(context: str, fn, *args, **kwargs):
@@ -540,7 +542,7 @@ def parse_codex_session(jsonl: Path) -> dict | None:
     tools = [dict(id=gen_id(src, f"tool:{cid}:{i}"), message_id=anchor(i), tool_name=p["name"],
                  input=json.dumps(args), output="{}", status="pending", duration_ms=None,
                  created_at=timestamps[i] if i < len(timestamps) else None)
-            for i, p in items if p.get("type") == "function_call" and (args := norm_args(p))] + \
+            for i, p in items if p.get("type") == "function_call" and (args := norm_args(p)) is not None] + \
            [dict(id=gen_id(src, f"toolout:{cid}:{i}"), message_id=anchor(i), tool_name=p.get("call_id"),
                  input="{}", output=json.dumps(p.get("output", "")), status="complete", duration_ms=None,
                  created_at=timestamps[i] if i < len(timestamps) else None)
@@ -596,22 +598,63 @@ def parse_codex(codex_dir: Path, files: list[Path] | None = None) -> ParseResult
         tools=[t for s in sessions for t in s["tools"]], edits=[e for s in sessions for e in s["edits"]])
 
 _MSG_UPS = "INSERT INTO messages VALUES (?,?,?,?,?,?,?,?,NULL,?) ON CONFLICT(id) DO UPDATE SET conversation_id=excluded.conversation_id, role=excluded.role, content=excluded.content, thinking=excluded.thinking, created_at=excluded.created_at, model=excluded.model, metadata=excluded.metadata, parent_id=excluded.parent_id, embedding=CASE WHEN messages.content IS DISTINCT FROM excluded.content THEN NULL ELSE messages.embedding END"
+_CONV_UPS = "INSERT INTO conversations VALUES (?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET source=excluded.source,title=excluded.title,created_at=CASE WHEN conversations.created_at IS NULL OR excluded.created_at < conversations.created_at THEN excluded.created_at ELSE conversations.created_at END,updated_at=CASE WHEN conversations.updated_at IS NULL OR excluded.updated_at > conversations.updated_at THEN excluded.updated_at ELSE conversations.updated_at END,model=COALESCE(excluded.model,conversations.model),cwd=COALESCE(excluded.cwd,conversations.cwd),git_branch=COALESCE(excluded.git_branch,conversations.git_branch),project_id=COALESCE(excluded.project_id,conversations.project_id),metadata=excluded.metadata"
 
 def upsert(conn, r: ParseResult):
     cids, mids = [c["id"] for c in r.convs], [m["id"] for m in r.msgs]
     cur = conn.execute
     existing = set(cur(f"SELECT id FROM conversations WHERE id IN ({','.join(['?']*len(cids))})", cids).fetchall()) if cids else set()
-    existing_msgs = set(cur(f"SELECT id FROM messages WHERE id IN ({','.join(['?']*len(mids))})", mids).fetchall()) if mids else set()
+    old_msgs = {x[0]: x for x in cur(f"SELECT * FROM messages WHERE id IN ({','.join(['?']*len(mids))})", mids).fetchall()} if mids else {}; existing_msgs = set(old_msgs)
     new_convs = set(cids) - {x[0] for x in existing}
-    new_msgs = set(mids) - {x[0] for x in existing_msgs}
+    new_msgs = set(mids) - existing_msgs
     updated = {m["conversation_id"] for m in r.msgs if m["id"] in new_msgs} - new_convs
-    for c in r.convs: conn.execute("INSERT OR REPLACE INTO conversations VALUES (?,?,?,?,?,?,?,?,?,?)", list(c.values()))
-    for m in r.msgs: conn.execute(_MSG_UPS, list(m.values()))
-    for t in r.tools: conn.execute("INSERT OR REPLACE INTO tool_calls VALUES (?,?,?,?,?,?,?,?)", list(t.values()))
-    for a in r.attachs: conn.execute("INSERT OR REPLACE INTO attachments VALUES (?,?,?,?,?,?,?,?)", list(a.values()))
-    for a in r.artifacts: conn.execute("INSERT OR REPLACE INTO artifacts VALUES (?,?,?,?,?,?,?,?)", list(a.values()))
-    for e in r.edits: conn.execute("INSERT OR REPLACE INTO file_edits VALUES (?,?,?,?,?,?,?)", list(e.values()))
+    for c in r.convs: conn.execute(_CONV_UPS, list(c.values()))
+    for m in r.msgs:
+        vals = list(m.values()); old = old_msgs.get(m["id"])
+        if old and old[2:5] != tuple(vals[2:5]): hist = list(old); hist[0] = gen_id("history", f"messages:{m['id']}:{json.dumps(hist[2:5], default=str)}"); conn.execute("INSERT INTO messages VALUES (?,?,?,?,?,?,?,?,?,?) ON CONFLICT DO NOTHING", hist)
+        conn.execute(_MSG_UPS, vals)
+    def replace_preserving(table, rows):
+        if not rows: return
+        ids = [r["id"] for r in rows]; old = {x[0]: x for x in cur(f"SELECT * FROM {table} WHERE id IN ({','.join(['?']*len(ids))})", ids).fetchall()}
+        for r in rows:
+            vals = list(r.values())
+            skip = {"tool_calls":7, "attachments":7, "artifacts":6, "file_edits":5}[table]; prev = old.get(r["id"]); payload = lambda x: tuple(v for i, v in enumerate(x) if i not in (0, skip))
+            if prev and payload(prev) != payload(vals): hist = list(prev); hist[0] = gen_id("history", f"{table}:{r['id']}:{json.dumps(payload(hist), default=str)}"); cur(f"INSERT INTO {table} VALUES ({','.join(['?']*len(hist))}) ON CONFLICT DO NOTHING", hist)
+            cur(f"INSERT OR REPLACE INTO {table} VALUES ({','.join(['?']*len(vals))})", vals)
+    [replace_preserving(t, rows) for t, rows in (("tool_calls", r.tools), ("attachments", r.attachs), ("artifacts", r.artifacts), ("file_edits", r.edits))]
     return len(r.convs), len(r.msgs), len(r.tools), len(r.attachs), len(r.edits), len(new_convs), len(updated)
+
+def hook_root(source): return Path(os.environ.get("CLAUDE_CONFIG_DIR", Path.home()/".claude"))/"projects" if source == "claude-code" else Path(os.environ.get("CODEX_HOME", Path.home()/".codex"))/"sessions"
+def hook_result(source, path):
+    s = (parse_claude_code_session if source == "claude-code" else parse_codex_session)(path)
+    return ParseResult(convs=[s["conv"]], msgs=s["msgs"], tools=s["tools"], edits=s["edits"]) if s else ParseResult()
+def enqueue_hook(source, payload):
+    path = Path(payload["transcript_path"]).expanduser().resolve(); root = hook_root(source).expanduser().resolve()
+    if source not in ("claude-code", "codex") or path.suffix != ".jsonl" or not path.is_relative_to(root): raise ValueError(f"Invalid {source} transcript path")
+    st, key = path.stat(), gen_id("hook", f"{source}:{path}"); atomic_json(HOOK_DIR/f"{key}.json", dict(source=source, path=str(path), mtime=st.st_mtime_ns, size=st.st_size))
+    subprocess.Popen([sys.executable, "-m", "ai_convos", "drain-hooks"], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+def drain_hooks(embed=False):
+    HOOK_DIR.mkdir(parents=True, exist_ok=True); done = []
+    with (HOOK_DIR/".lock").open("w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX); state = json.loads(HOOK_STATE.read_text()) if HOOK_STATE.exists() else {}
+        for q in HOOK_DIR.glob("*.json"):
+            try:
+                e = json.loads(q.read_text()); path = Path(e["path"]); key = q.stem; st = path.stat(); snap = [st.st_mtime_ns, st.st_size]
+                if state.get(key) == snap: q.unlink(); continue
+                r = hook_result(e["source"], path); st2 = path.stat()
+                if snap != [st2.st_mtime_ns, st2.st_size] or not r.convs: continue
+                conn = get_db(); init_schema(conn)
+                try: upsert(conn, r)
+                finally: conn.close()
+                done.append((q, key, snap))
+            except FileNotFoundError: q.unlink(missing_ok=True)
+            except Exception as e: log_parse_error(f"hook inbox {q}", e)
+        if done:
+            conn = get_db(); rebuild_fts_index(conn); conn.close()
+            for q, key, snap in done: state[key] = snap; q.unlink(missing_ok=True)
+            atomic_json(HOOK_STATE, state); HOOK_EMBED_DIRTY.touch()
+    if embed and HOOK_EMBED_DIRTY.exists(): embed_pending(); HOOK_EMBED_DIRTY.unlink(missing_ok=True)
+    return len(done)
 
 # ---- embeddings ----
 _MODELS, _MCFG, _LLAMA_LOG = {}, {"emb": dict(repo_id="ggml-org/embeddinggemma-300m-qat-q8_0-GGUF", filename="embeddinggemma-300m-qat-Q8_0.gguf", embedding=True, n_ctx=16384, n_batch=2048, n_ubatch=2048, n_seq_max=8, n_gpu_layers=-1), "rr": dict(repo_id="ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF", filename="qwen3-reranker-0.6b-q8_0.gguf", n_ctx=4096, logits_all=True, n_gpu_layers=-1)}, None
@@ -637,13 +680,18 @@ RR_PROMPT = '<|im_start|>system\nJudge whether the Document meets the requiremen
 def rerank(query: str, docs: list[str]) -> list[float]:
     rr, qq = _llama("rr"), query[:512]
     return [(lambda l: (math.exp(l.get("yes",-100))/(math.exp(l.get("yes",-100))+math.exp(l.get("no",-100)))) if math.exp(l.get("yes",-100))+math.exp(l.get("no",-100))>0 else 0.0)(rr.create_completion(RR_PROMPT.format(q=qq, d=(d or "")[:3000]), max_tokens=1, temperature=0.0, logprobs=10)["choices"][0]["logprobs"]["top_logprobs"][0]) for d in docs]
-def embed_pending(conn, batch: int = 32):
+def embed_pending(batch: int = 32):
     Q = "FROM messages WHERE embedding IS NULL AND content IS NOT NULL AND content != ''"
-    if not (n := conn.execute(f"SELECT COUNT(*) {Q}").fetchone()[0]): return
+    conn = get_db(read_only=True); n = conn.execute(f"SELECT COUNT(*) {Q}").fetchone()[0]; conn.close()
+    if not n: return
     typer.echo(f"Embedding {n} messages..."); done = 0
-    while rows := conn.execute(f"SELECT id, content {Q} ORDER BY LEAST(length(content),1600) LIMIT ?", [batch]).fetchall():
+    while True:
+        conn = get_db(read_only=True); rows = conn.execute(f"SELECT id, content {Q} ORDER BY LEAST(length(content),1600) LIMIT ?", [batch]).fetchall(); conn.close()
+        if not rows: break
+        updates = []
         for ch in [rows[i:i+_MCFG["emb"]["n_seq_max"]] for i in range(0, len(rows), _MCFG["emb"]["n_seq_max"])]:
-            conn.executemany("UPDATE messages SET embedding=? WHERE id=?", [(e, mid) for (mid, _), e in zip(ch, embed_texts([c for _, c in ch], doc=True))])
+            updates += [(e, mid) for (mid, _), e in zip(ch, embed_texts([c for _, c in ch], doc=True))]
+        conn = get_db(); conn.executemany("UPDATE messages SET embedding=? WHERE id=? AND embedding IS NULL", updates); conn.close()
         done += len(rows); typer.echo(f"  {done}/{n}\r", nl=False)
     typer.echo()
 
@@ -658,6 +706,13 @@ def _hybrid_ro():
     if (c := _ro()) is None: return None
     if c.execute("SELECT 1 FROM information_schema.columns WHERE table_name='messages' AND column_name='embedding'").fetchone(): return c
     c.close(); c = get_db(); init_schema(c); c.close(); return _ro()
+def _fts_ro(hybrid=False):
+    if (c := _hybrid_ro() if hybrid else _ro()) is None: return None
+    try: load_fts(c)
+    except ValueError as e: c.close(); typer.echo(str(e)); return None
+    if not c.execute("SELECT 1 FROM information_schema.tables WHERE table_name='fts_main_messages'").fetchone():
+        c.close(); w = get_db(); load_fts(w); ensure_fts_index(w); w.close(); c = _ro(); load_fts(c)
+    return c
 def _filt(source, days, role):
     w, p = [], []
     if source: w.append("c.source = ?"); p.append(source)
@@ -673,17 +728,23 @@ def emit(data, fmt):
     if fmt == "jsonl" and isinstance(data, list): [typer.echo(json.dumps(r, default=str)) for r in data]
     else: typer.echo(json.dumps(data, default=str))
 
+@app.command(hidden=True)
+def hook(source: str):
+    try: enqueue_hook(source, json.loads(sys.stdin.read() or "{}"))
+    except Exception as e: log_parse_error(f"{source} hook", e)
+
+@app.command("drain-hooks", hidden=True)
+def drain_hooks_cmd(): drain_hooks(embed=True)
+
 @app.command()
 def init():
     conn = get_db(); init_schema(conn); rebuild_fts_index(conn); conn.close()
-    install_skills()
     typer.echo(f"Database initialized at {DB_PATH}")
 
 @app.command()
 def search(query: str, source: Optional[str] = typer.Option(None, "-s"), days: Optional[int] = typer.Option(None, "-d"), role: Optional[str] = typer.Option(None, "-r"), thinking: bool = typer.Option(False, "--thinking", "-t"), limit: int = typer.Option(20, "-n"), context: int = typer.Option(300, "-c"), fmt: str = typer.Option("text", "-f", "--format")):
-    if (conn := _ro()) is None: return
-    try: load_fts(conn)
-    except ValueError as e: conn.close(); typer.echo(str(e)); return
+    drain_hooks()
+    if (conn := _fts_ro()) is None: return
     w, p = _filt(source, days, role)
     results = conn.execute(f"""SELECT m.content, m.thinking, m.role, m.created_at, fts_main_messages.match_bm25(m.id, ?) as score, c.title, c.source, c.id, c.cwd
         FROM messages m JOIN conversations c ON m.conversation_id = c.id WHERE score IS NOT NULL{' AND ' + ' AND '.join(w) if w else ''} ORDER BY score DESC LIMIT ?""", [query] + p + [limit]).fetchall()
@@ -697,20 +758,20 @@ def search(query: str, source: Optional[str] = typer.Option(None, "-s"), days: O
 
 @app.command("query")
 def query_cmd(q: str, source: Optional[str] = typer.Option(None, "-s"), days: Optional[int] = typer.Option(None, "-d"), role: Optional[str] = typer.Option(None, "-r"), limit: int = typer.Option(10, "-n"), context: int = typer.Option(300, "-c"), fmt: str = typer.Option("text", "-f", "--format")):
-    if (conn := _hybrid_ro()) is None: return
+    drain_hooks(embed=True)
+    if (conn := _fts_ro(True)) is None: return
     if not conn.execute("SELECT COUNT(*) FROM messages WHERE embedding IS NOT NULL").fetchone()[0]:
         conn.close(); typer.echo("No embeddings yet. Run `pip install ai-convos-db[hybrid]` and `convos embed`, or use `convos search` for BM25 only.", err=True); return
-    try: load_fts(conn)
-    except ValueError as e: conn.close(); typer.echo(str(e)); return
     try: qv = embed_text(q, doc=False)
     except Exception as e: conn.close(); typer.echo(f"Hybrid embedding failed: {e}", err=True); return
     w, p = _filt(source, days, role)
     rows = conn.execute(f"""WITH qe AS (SELECT ?::FLOAT[768] AS v),
-        fts AS (SELECT id, ROW_NUMBER() OVER (ORDER BY score DESC) AS r FROM (SELECT id, fts_main_messages.match_bm25(id, ?) AS score FROM messages) s WHERE score IS NOT NULL LIMIT 50),
-        vec AS (SELECT m.id, ROW_NUMBER() OVER (ORDER BY array_cosine_similarity(m.embedding, qe.v) DESC) AS r FROM messages m, qe WHERE m.embedding IS NOT NULL LIMIT 50),
+        base AS (SELECT m.id, m.embedding FROM messages m JOIN conversations c ON c.id=m.conversation_id WHERE m.content IS NOT NULL AND m.content NOT LIKE 'Base directory for this skill:%' AND m.content NOT LIKE '<local-command-caveat>%'{' AND ' + ' AND '.join(w) if w else ''}),
+        fts AS (SELECT id, ROW_NUMBER() OVER (ORDER BY score DESC) AS r FROM (SELECT id, fts_main_messages.match_bm25(id, ?) AS score FROM base) s WHERE score IS NOT NULL LIMIT 50),
+        vec AS (SELECT b.id, ROW_NUMBER() OVER (ORDER BY array_cosine_similarity(b.embedding, qe.v) DESC) AS r FROM base b, qe WHERE b.embedding IS NOT NULL LIMIT 50),
         fused AS (SELECT id, SUM(1.0/(60+r)) AS rrf FROM (SELECT id, r FROM fts UNION ALL SELECT id, r FROM vec) GROUP BY id)
         SELECT m.role, m.content, m.created_at, c.title, c.source, c.id, c.cwd FROM fused JOIN messages m ON m.id = fused.id JOIN conversations c ON c.id = m.conversation_id
-        WHERE 1=1{' AND ' + ' AND '.join(w) if w else ''} ORDER BY fused.rrf DESC LIMIT 30""", [qv, q] + p).fetchall()
+        QUALIFY ROW_NUMBER() OVER (PARTITION BY c.id ORDER BY fused.rrf DESC)=1 ORDER BY fused.rrf DESC LIMIT 16""", [qv] + p + [q]).fetchall()
     conn.close()
     if not rows: typer.echo("No results"); return
     try: rrs = rerank(q, [r[1] or "" for r in rows])
@@ -723,10 +784,9 @@ def query_cmd(q: str, source: Optional[str] = typer.Option(None, "-s"), days: Op
 
 @app.command("embed")
 def embed_cmd(batch: int = typer.Option(32, "-b")):
-    conn = get_db(); init_schema(conn)
-    try: embed_pending(conn, batch); typer.echo("Embeddings ready")
+    conn = get_db(); init_schema(conn); conn.close()
+    try: embed_pending(batch); typer.echo("Embeddings ready")
     except Exception as e: typer.echo(f"Embedding failed: {e}", err=True)
-    conn.close()
 
 @app.command()
 def doctor(verbose: bool = typer.Option(False, "-v")):
@@ -759,12 +819,33 @@ def install_skills():
         dest.write_text(text)
         typer.echo(f"Installed {dest}")
 
+def edit_hook_config(path, events, source, remove=False):
+    data = json.loads(path.read_text()) if path.exists() else {}; hooks = data.setdefault("hooks", {}); suffix = f" hook {source}"
+    for event in list(hooks):
+        for group in hooks[event]: group["hooks"] = [h for h in group.get("hooks", []) if not (h.get("command", "").endswith(suffix) and h.get("statusMessage") == "Updating conversation archive")]
+        hooks[event] = [g for g in hooks[event] if g.get("hooks")]
+        if not hooks[event]: del hooks[event]
+    if not remove:
+        cmd = f"{shlex.quote(shutil.which('convos') or 'convos')} hook {source}"
+        for event in events: hooks.setdefault(event, []).append(dict(hooks=[dict(type="command", command=cmd, timeout=5, statusMessage="Updating conversation archive")]))
+    atomic_json(path, data); return sum(h.get("command", "").endswith(suffix) for gs in hooks.values() for g in gs for h in g.get("hooks", []))
+
+@app.command("install-hooks")
+def install_hooks(remove: bool = typer.Option(False, "--remove"), status: bool = typer.Option(False, "--status")):
+    cfgs = [(Path(os.environ.get("CLAUDE_CONFIG_DIR", Path.home()/".claude"))/"settings.json", ("Stop", "SessionEnd"), "claude-code"),
+            (Path(os.environ.get("CODEX_HOME", Path.home()/".codex"))/"hooks.json", ("Stop",), "codex")]
+    for path, events, source in cfgs:
+        if status:
+            data = json.loads(path.read_text()) if path.exists() else {}; n = sum(h.get("command", "").endswith(f" hook {source}") and h.get("statusMessage") == "Updating conversation archive" for gs in data.get("hooks", {}).values() for g in gs for h in g.get("hooks", []))
+        else: n = edit_hook_config(path, events, source, remove)
+        typer.echo(f"{source}: {n} hook{'s' if n != 1 else ''}{' installed' if not status and not remove else ''} ({path})")
+
 @app.command()
 def export(output: Path, fmt: str = typer.Option("json", "-f"), source: Optional[str] = typer.Option(None, "-s")):
     if (conn := _ro()) is None: return
-    where = f"WHERE c.source = '{source}'" if source else ""
+    where, params = ("WHERE c.source = ?", [source]) if source else ("", [])
     if fmt == "json":
-        rows = conn.execute(f"SELECT c.id, c.source, c.title, c.created_at, c.updated_at, c.model, c.cwd, c.git_branch, c.project_id FROM conversations c {where}").fetchall()
+        rows = conn.execute(f"SELECT c.id, c.source, c.title, c.created_at, c.updated_at, c.model, c.cwd, c.git_branch, c.project_id FROM conversations c {where}", params).fetchall()
         result = []
         for r in rows:
             msgs = [dict(role=m[0], content=m[1], thinking=m[2], created_at=str(m[3]) if m[3] else None, model=m[4])
@@ -777,12 +858,14 @@ def export(output: Path, fmt: str = typer.Option("json", "-f"), source: Optional
                               model=r[5], cwd=r[6], git_branch=r[7], project_id=r[8], messages=msgs, tool_calls=tcs, file_edits=edits))
         output.write_text(json.dumps(result, indent=2))
     else:
-        conn.execute(f"COPY (SELECT c.id, c.source, c.title, c.cwd, m.role, m.content, m.created_at FROM conversations c JOIN messages m ON c.id = m.conversation_id {where} ORDER BY c.created_at, m.created_at) TO '{output}' (HEADER)")
+        cur = conn.execute(f"SELECT c.id, c.source, c.title, c.cwd, m.role, m.content, m.created_at FROM conversations c JOIN messages m ON c.id = m.conversation_id {where} ORDER BY c.created_at, m.created_at", params)
+        with output.open("w", newline="") as f: w = csv.writer(f); w.writerow([d[0] for d in cur.description]); w.writerows(cur.fetchall())
     conn.close(); typer.echo(f"Exported to {output}")
 
 @app.command()
 def sync(watch: bool = typer.Option(False, "-w"), interval: int = typer.Option(300, "-i"), claude_code: bool = True, codex: bool = True, full: bool = typer.Option(False, "--full", help="Re-parse/re-fetch everything, ignoring incremental state"), verbose: bool = typer.Option(False, "-v", "--verbose")):
-    conn = get_db(); init_schema(conn)
+    conn = get_db(); init_schema(conn); conn.close()
+    drain_hooks()
     state, dirty = load_state(), False
     local, web, imports = state.setdefault("local", {}), state.setdefault("web", {}), state.setdefault("imports", {})
     def set_state(section, key, val):
@@ -858,7 +941,7 @@ def sync(watch: bool = typer.Option(False, "-w"), interval: int = typer.Option(3
     def do_sync():
         nonlocal dirty
         t0 = time.perf_counter(); dirty, total, changed, jobs, newc, updc = False, [0]*5, False, [], 0, 0
-        cur = counts_by_source(conn); fmt = lambda v: f"{v[0]} convs, {v[1]} msgs, {v[2]} tools, {v[3]} attachs, {v[4]} edits"
+        conn = get_db(read_only=True); cur = counts_by_source(conn); conn.close(); fmt = lambda v: f"{v[0]} convs, {v[1]} msgs, {v[2]} tools, {v[3]} attachs, {v[4]} edits"
         start = lambda label, src=None: typer.echo(f"Syncing {label}" if not src else f"Syncing {label} ({fmt(cur.setdefault(src, [0]*5))})")
         if paths := [Path(p).expanduser() for p in os.environ.get("CONVOS_IMPORT_PATHS", "").split(",") if p.strip()]:
             start("imports")
@@ -875,16 +958,19 @@ def sync(watch: bool = typer.Option(False, "-w"), interval: int = typer.Option(3
                 futs = {ex.submit(j["func"]): {**j, "t": time.perf_counter()} for j in jobs}
                 for fut in as_completed(futs):
                     j = futs[fut]
-                    try: r = fut.result()
+                    try:
+                        r = fut.result(); conn = get_db()
+                        try: c, m, t, a, e, n, u = upsert(conn, r)
+                        finally: conn.close()
                     except Exception as e: typer.echo(f"{j['name']} failed: {e}"); continue
-                    c, m, t, a, e, n, u = upsert(conn, r)
                     total = [total[i]+v for i, v in enumerate([c, m, t, a, e])]
                     newc, updc = newc+n, updc+u
                     changed |= any([c, m, t, a, e])
                     if st := j.get("state"): set_state(*st)
+                    if dirty: save_state(state); dirty = False
                     if src := j.get("source"): typer.echo(f"Updated {j['label']} ({n} new, {u} updated convs; {fmt([c, m, t, a, e])} processed){' in %.2fs' % (time.perf_counter()-j['t']) if verbose else ''}")
-        if changed: rebuild_fts_index(conn)
-        try: embed_pending(conn)
+        if changed: conn = get_db(); rebuild_fts_index(conn); conn.close()
+        try: embed_pending(); HOOK_EMBED_DIRTY.unlink(missing_ok=True)
         except ImportError: pass
         if dirty: save_state(state)
         verbose and typer.echo(f"Total sync time {time.perf_counter()-t0:.2f}s")
@@ -894,10 +980,11 @@ def sync(watch: bool = typer.Option(False, "-w"), interval: int = typer.Option(3
         while True: r, n, u = do_sync(); typer.echo(f"[{datetime.now().isoformat()}] {n} new, {u} updated convs; {r[1]} msgs, {r[2]} tools, {r[3]} attachs, {r[4]} edits"); time.sleep(interval)
     else:
         r, n, u = do_sync(); typer.echo(f"Updated {n} new, {u} updated convs; {r[1]} msgs, {r[2]} tools, {r[3]} attachs, {r[4]} edits processed")
-        fmt = lambda v: f"{v[0]} convs, {v[1]} msgs, {v[2]} tools, {v[3]} attachs, {v[4]} edits"; total = [conn.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0] for t in ("conversations", "messages", "tool_calls", "attachments", "file_edits")]; typer.echo(f"Total: {fmt(total)}"); conn.close()
+        fmt = lambda v: f"{v[0]} convs, {v[1]} msgs, {v[2]} tools, {v[3]} attachs, {v[4]} edits"; conn = get_db(read_only=True); total = [conn.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0] for t in ("conversations", "messages", "tool_calls", "attachments", "file_edits")]; conn.close(); typer.echo(f"Total: {fmt(total)}")
 
 @app.command()
 def sql(query: str, fmt: str = typer.Option("text", "-f", "--format")):
+    drain_hooks()
     if (conn := _ro()) is None: return
     try: cur = conn.execute(query); cols = [d[0] for d in cur.description]; rows = cur.fetchall()
     except Exception as e: conn.close(); typer.echo(f"Query failed: {e}", err=True); return

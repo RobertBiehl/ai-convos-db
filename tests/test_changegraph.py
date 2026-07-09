@@ -57,6 +57,12 @@ def test_cut_by_conv_and_timestamp():
     assert cut(edits, "2024-03") == edits
 
 
+def test_cut_treats_date_as_date_before_conversation_substring():
+    edits = [_e("write", "a", conv="abc2024-01", ts="2023-12-01 00:00:00"),
+             _e("edit", "b", old="a", conv="c2", ts="2024-02-01 00:00:00")]
+    assert cut(edits, "2024-01") == edits[:1]
+
+
 def test_edits_for_attributes_prompt(tmp_path):
     conn = duckdb.connect(str(tmp_path / "t.db"))
     init_schema(conn)
