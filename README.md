@@ -51,9 +51,9 @@ convos install-skills
 
 ```bash
 convos init
-convos install-skills
 convos install-hooks
 convos sync
+convos doctor
 convos search "prompt" -s claude -n 10
 convos query "conceptual search"
 ```
@@ -98,6 +98,10 @@ convos install-hooks             # user-level Claude Code + Codex hooks
 convos install-hooks --status
 convos install-hooks --remove    # remove only ai-convos-db hook handlers
 ```
+
+Start a new agent session after installing hooks. In Codex, review the user
+hook through `/hooks`; after the first completed turn, `convos doctor` should
+show a recent `ingest: ... last=...` timestamp.
 
 Hooks enqueue only the local transcript path and file metadata, then return
 immediately. A coalescing background drain parses and upserts the transcript;

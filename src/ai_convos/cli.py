@@ -885,6 +885,7 @@ def install_hooks(remove: bool = typer.Option(False, "--remove"), status: bool =
             data = json.loads(path.read_text()) if path.exists() else {}; n = sum(h.get("command", "").endswith(f" hook {source}") and h.get("statusMessage") == "Updating conversation archive" for gs in data.get("hooks", {}).values() for g in gs for h in g.get("hooks", []))
         else: n = edit_hook_config(path, events, source, remove)
         typer.echo(f"{source}: {n} hook{'s' if n != 1 else ''}{' installed' if not status and not remove else ''} ({path})")
+    if not status and not remove: typer.echo("Start a new agent session; in Codex, review the user hook with `/hooks`.")
 
 @app.command()
 def export(output: Path, fmt: str = typer.Option("json", "-f"), source: Optional[str] = typer.Option(None, "-s")):
