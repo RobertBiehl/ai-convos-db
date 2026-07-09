@@ -41,7 +41,8 @@ Upgrade later with:
 pipx upgrade ai-convos-db
 ```
 
-Pipx installs the CLI only. Copy the bundled skills into Codex + Claude Code with:
+`convos init` creates the archive and installs the bundled Codex + Claude Code
+skills automatically. Refresh the skills without initializing the archive with:
 
 ```bash
 convos install-skills
