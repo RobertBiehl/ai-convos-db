@@ -5,6 +5,7 @@ once an edit cannot be replayed (shell, missing or unmatched old_content), conte
 until the next full write.
 """
 import json
+import re
 from typing import Optional
 
 import typer
@@ -24,6 +25,7 @@ def edits_for(conn, path: str) -> list[dict]:
 def cut(edits: list[dict], at: str | None) -> list[dict]:
     """Keep edits up to a conversation (id substring: through its last edit) or a timestamp (ISO prefix)."""
     if at is None: return edits
+    if re.fullmatch(r"\d{4}(?:-\d{2}(?:-\d{2}(?:[ T].*)?)?)?", at): return [e for e in edits if (s := str(e["ts"])) <= at or s.startswith(at)]
     if idxs := [i for i, e in enumerate(edits) if at in e["conv"]]: return edits[:idxs[-1] + 1]
     return [e for e in edits if (s := str(e["ts"])) <= at or s.startswith(at)]
 

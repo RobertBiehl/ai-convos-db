@@ -275,7 +275,7 @@ class TestDeduplication:
                             project_id=None, metadata="{}"))
         r1.msgs.append(dict(id=gen_id("claude", f"{cid}:0"), conversation_id=cid, role="user",
                            content="Hello", thinking=None, created_at=None, model=None, metadata="{}", parent_id=None))
-        upsert(db, r1)
+        first = upsert(db, r1); assert first[5:7] == (1, 0) and len(first[7]) == 1
 
         # Second insert with same ID but updated title
         r2 = ParseResult()
@@ -284,7 +284,8 @@ class TestDeduplication:
                             project_id=None, metadata="{}"))
         r2.msgs.append(dict(id=gen_id("claude", f"{cid}:1"), conversation_id=cid, role="assistant",
                            content="Hi there", thinking=None, created_at=None, model=None, metadata="{}", parent_id=None))
-        upsert(db, r2)
+        second = upsert(db, r2); assert second[5:7] == (0, 1) and len(second[7]) == 1
+        third = upsert(db, r2); assert third[5:7] == (0, 0) and not third[7]
 
         # Verify: 1 conversation, 2 messages, title updated
         conv_count = db.execute("SELECT COUNT(*) FROM conversations").fetchone()[0]

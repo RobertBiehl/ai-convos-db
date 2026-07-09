@@ -52,6 +52,7 @@ convos install-skills
 ```bash
 convos init
 convos install-skills
+convos install-hooks
 convos sync
 convos search "prompt" -s claude -n 10
 convos query "conceptual search"
@@ -89,6 +90,21 @@ Sync:
 convos sync
 convos sync -w -i 600
 ```
+
+Local Claude Code and Codex sessions can be ingested after each completed turn:
+
+```bash
+convos install-hooks             # user-level Claude Code + Codex hooks
+convos install-hooks --status
+convos install-hooks --remove    # remove only ai-convos-db hook handlers
+```
+
+Hooks enqueue only the local transcript path and file metadata, then return
+immediately. A coalescing background drain parses and upserts the transcript;
+read commands flush any pending work before querying. `query` also embeds only
+the changed hook messages, while `search` and `sql` avoid loading the embedding
+model. `sync` remains the reconciliation path for missed local events, web
+providers, pre-hook sessions, and imports rather than a routine local update.
 
 Auto-import export paths with:
 
