@@ -76,13 +76,12 @@ scale (tens of thousands of messages) this is fast enough that a vector index
 (VSS/HNSW) would only add complexity.
 
 Pipeline: filtered BM25 top-50 ∪ cosine top-50 → Reciprocal Rank Fusion → one
-message per conversation → Qwen3-Reranker top-16 → position-tier blend (rank
-0-2: 0.75/0.25, 3-9: 0.6/0.4, 10+: 0.4/0.6).
-Models load lazily, so users pay model startup/download cost only when using
+strongest message per conversation.
+The embedding model loads lazily, so users pay model startup/download cost only when using
 `convos query`, `convos embed`, or sync-time embedding.
 
-The package depends on `llama-cpp-python` + `huggingface-hub`. Both models are
-GGUF, downloaded on first call and cached by huggingface-hub.
+The package depends on `llama-cpp-python` + `huggingface-hub`. The GGUF model is
+downloaded on first call and cached by huggingface-hub.
 
 ## Data Flow
 
