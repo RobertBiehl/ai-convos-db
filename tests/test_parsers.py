@@ -291,6 +291,28 @@ class TestCodexParser:
         assert e[2]["old_content"] is None and e[2]["content"] == "hello\nworld"
         assert all(x["message_id"] == result.msgs[0]["id"] for x in e)
 
+    def test_custom_exec_tools_and_apply_patch_edits(self, tmp_path):
+        from ai_convos.cli import parse_codex
+        sessions = tmp_path/".codex"/"sessions"; sessions.mkdir(parents=True); patch = "*** Begin Patch\n*** Update File: src/app.py\n@@\n-old\n+new\n*** End Patch"
+        code = rf'const unrelated = "\x1b"; const patch = {json.dumps(patch)}; text(await tools.apply_patch(patch));'
+        (sessions/"session.jsonl").write_text("\n".join(json.dumps(x) for x in [
+            {"type":"session_meta","timestamp":"2026-01-01T00:00:00Z","payload":{"cwd":"/repo"}},
+            {"type":"response_item","timestamp":"2026-01-01T00:00:01Z","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"fix"}]}},
+            {"type":"response_item","timestamp":"2026-01-01T00:00:02Z","payload":{"type":"custom_tool_call","name":"exec","call_id":"c1","status":"completed","input":code}},
+            {"type":"response_item","timestamp":"2026-01-01T00:00:03Z","payload":{"type":"custom_tool_call_output","call_id":"c1","output":"ok"}}]))
+        result = parse_codex(tmp_path/".codex"); assert len(result.tools) == 2 and result.tools[0]["tool_name"] == "exec" and result.tools[0]["status"] == "complete" and json.loads(result.tools[0]["input"])["code"] == code
+        assert len(result.edits) == 1 and (result.edits[0]["file_path"], result.edits[0]["old_content"], result.edits[0]["content"]) == ("/repo/src/app.py", "old", "new")
+
+    def test_custom_exec_patch_text_is_not_an_edit(self, tmp_path):
+        from ai_convos.cli import parse_codex
+        sessions = tmp_path/".codex"/"sessions"; sessions.mkdir(parents=True)
+        code = 'const sample = "await tools.apply_patch(patch)"; text(sample);'
+        (sessions/"session.jsonl").write_text("\n".join(json.dumps(x) for x in [
+            {"type":"session_meta","timestamp":"2026-01-01T00:00:00Z","payload":{"cwd":"/repo"}},
+            {"type":"response_item","timestamp":"2026-01-01T00:00:01Z","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"inspect"}]}},
+            {"type":"response_item","timestamp":"2026-01-01T00:00:02Z","payload":{"type":"custom_tool_call","name":"exec","call_id":"c1","input":code}}]))
+        result = parse_codex(tmp_path/".codex"); assert len(result.tools) == 1 and result.edits == []
+
     def test_skip_system_messages(self, tmp_path):
         """System and developer messages are skipped."""
         from ai_convos.cli import parse_codex

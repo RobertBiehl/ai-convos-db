@@ -547,6 +547,8 @@ def parse_codex_session(jsonl: Path) -> dict | None:
                  input="{}", output=json.dumps(p.get("output", "")), status="complete", duration_ms=None,
                  created_at=timestamps[i] if i < len(timestamps) else None)
             for i, p in items if p.get("type") == "function_call_output"]
+    tools += [dict(id=gen_id(src, f"custom:{cid}:{i}"), message_id=anchor(i), tool_name=p["name"], input=json.dumps({"code":p.get("input", "")}), output="{}", status={"completed":"complete"}.get(p.get("status"), p.get("status", "pending")), duration_ms=None, created_at=timestamps[i] if i < len(timestamps) else None) for i, p in items if p.get("type") == "custom_tool_call"] + \
+             [dict(id=gen_id(src, f"customout:{cid}:{i}"), message_id=anchor(i), tool_name=p.get("call_id"), input="{}", output=json.dumps(p.get("output", "")), status="complete", duration_ms=None, created_at=timestamps[i] if i < len(timestamps) else None) for i, p in items if p.get("type") == "custom_tool_call_output"]
 
     def patch_edits(args):
         """File edits from shell commands, exact or skipped: apply_patch hunks (context+minus -> context+plus,
@@ -576,10 +578,17 @@ def parse_codex_session(jsonl: Path) -> dict | None:
             elif path: old.append(ln[1:] if ln.startswith(" ") else ln); new.append(ln[1:] if ln.startswith(" ") else ln)
         flush(); return out
 
+    def custom_edits(p):
+        code = p.get("input", ""); names = re.findall(r"await\s+tools\.apply_patch\(\s*(\w+)\s*\)", code)
+        vals = {n:json.loads(s) for n, s in re.findall(r"(?:const|let|var)\s+(\w+)\s*=\s*(\"(?:\\.|[^\"\\])*\")", code, re.S) if n in names}
+        patches = [vals[n] for n in names if n in vals] + [json.loads(s) for s in re.findall(r"await\s+tools\.apply_patch\(\s*(\"(?:\\.|[^\"\\])*\")\s*\)", code, re.S)]
+        return [e for patch in patches if "*** Begin Patch" in patch for e in patch_edits({"cmd":patch})]
+
     edits = [dict(id=gen_id(src, f"edit:{cid}:{i}:{j}"), message_id=anchor(i), file_path=fp, edit_type=op,
                  content=c, created_at=timestamps[i] if i < len(timestamps) else None, old_content=o)
             for i, p in items if p.get("type") == "function_call" and p.get("name") in ("exec_command", "shell_command", "shell")
             and (args := norm_args(p)) for j, (fp, op, c, o) in enumerate(patch_edits(args))]
+    edits += [dict(id=gen_id(src, f"edit:{cid}:{i}:{j}"), message_id=anchor(i), file_path=fp, edit_type=op, content=c, created_at=timestamps[i] if i < len(timestamps) else None, old_content=o) for i, p in items if p.get("type") == "custom_tool_call" for j, (fp, op, c, o) in enumerate(custom_edits(p))]
 
     return {
         "conv": dict(id=cid, source=src, title=meta.get("cwd") or jsonl.stem,
