@@ -799,12 +799,12 @@ def query_cmd(q: str, source: Optional[str] = typer.Option(None, "-s"), days: Op
         fts AS (SELECT id, ROW_NUMBER() OVER (ORDER BY score DESC) AS r FROM (SELECT id, fts_main_messages.match_bm25(id, ?) AS score FROM base) s WHERE score IS NOT NULL LIMIT 50),
         vec AS (SELECT b.id, ROW_NUMBER() OVER (ORDER BY array_cosine_similarity(b.embedding, qe.v) DESC) AS r FROM base b, qe WHERE b.embedding IS NOT NULL LIMIT 50),
         fused AS (SELECT id, SUM(1.0/(60+r)) AS rrf FROM (SELECT id, r FROM fts UNION ALL SELECT id, r FROM vec) GROUP BY id)
-        SELECT fused.rrf, m.role, m.content, m.created_at, c.title, c.source, c.id, c.cwd FROM fused JOIN messages m ON m.id = fused.id JOIN conversations c ON c.id = m.conversation_id
+        SELECT fused.rrf, m.id, m.role, m.content, m.created_at, c.title, c.source, c.id, c.cwd FROM fused JOIN messages m ON m.id = fused.id JOIN conversations c ON c.id = m.conversation_id
         QUALIFY ROW_NUMBER() OVER (PARTITION BY c.id ORDER BY fused.rrf DESC)=1 ORDER BY fused.rrf DESC LIMIT ?""", [qv] + p + [q, limit]).fetchall()
     conn.close()
     if not rows: typer.echo("No results"); return
-    if fmt != "text": emit([dict(score=score, role=r, content=_clip(content, context), created_at=ts, title=title, source=src, conversation_id=cid, cwd=cwd) for score, r, content, ts, title, src, cid, cwd in rows], fmt); return
-    for score, r, content, ts, title, src, cid, cwd in rows: _fmt_hit(content, ts, r, title, src, cid, cwd, q, context, f"score: {score:.4f}")
+    if fmt != "text": emit([dict(score=score, message_id=mid, role=r, content=_clip(content, context), created_at=ts, title=title, source=src, conversation_id=cid, cwd=cwd) for score, mid, r, content, ts, title, src, cid, cwd in rows], fmt); return
+    for score, _, r, content, ts, title, src, cid, cwd in rows: _fmt_hit(content, ts, r, title, src, cid, cwd, q, context, f"score: {score:.4f}")
     typer.echo(f"\n{len(rows)} results")
 
 @app.command("embed")
