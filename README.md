@@ -6,7 +6,7 @@
 
 ## Quick install
 ```bash
-pipx install "git+https://github.com/RobertBiehl/ai-convos-db.git"
+uv tool install "git+https://github.com/RobertBiehl/ai-convos-db.git"
 ```
 
 Local-first, searchable archive for ChatGPT, Claude, and Codex conversations. One file, one DB, fast full-text search.
@@ -25,35 +25,48 @@ Local-first, searchable archive for ChatGPT, Claude, and Codex conversations. On
 - Fetch from ChatGPT and Claude using browser cookies
 - Import exports from ChatGPT, Claude, Claude Code, and Codex
 - Sync Claude Code + Codex sessions on a schedule
+- Optional code-change provenance: blame, timeline, time travel, and graph browsing
 - Export to JSON or CSV
 
 ## Install
 
-Install from GitHub with pipx (adds `convos` to PATH in an isolated environment):
+Install from GitHub with uv (adds `convos` to PATH in an isolated environment):
 
 ```bash
-pipx install "git+https://github.com/RobertBiehl/ai-convos-db.git"
+uv tool install "git+https://github.com/RobertBiehl/ai-convos-db.git"
 ```
+
+`pipx install "git+https://github.com/RobertBiehl/ai-convos-db.git"` is also supported.
 
 Upgrade later with:
 
 ```bash
-pipx upgrade ai-convos-db
+uv tool install --reinstall "git+https://github.com/RobertBiehl/ai-convos-db.git"
 ```
 
-Pipx installs the CLI only. Copy the bundled skills into Codex + Claude Code with:
+`convos init` creates the archive and installs the bundled Codex + Claude Code
+skills automatically. Refresh the skills without initializing the archive with:
 
 ```bash
 convos install-skills
 ```
+
+Optionally add code-change provenance without expanding the core CLI package:
+
+```bash
+uv tool install --reinstall "git+https://github.com/RobertBiehl/ai-convos-db.git" \
+  --with "ai-convos-changegraph @ git+https://github.com/RobertBiehl/ai-convos-db.git#subdirectory=apps/changegraph"
+```
+
+This adds `convos blame`, `timeline`, `at`, `graph`, and `browse`.
 
 ## Quickstart
 
 ```bash
 convos init
-convos install-skills
 convos install-hooks
 convos sync
+convos doctor
 convos search "prompt" -s claude -n 10
 convos query "conceptual search"
 ```
@@ -101,12 +114,20 @@ convos install-hooks --status
 convos install-hooks --remove    # remove only ai-convos-db hook handlers
 ```
 
+Start a new agent session after installing hooks. In Codex, review the user
+hook through `/hooks`; after the first completed turn, `convos doctor` should
+show a recent `ingest: ... last=...` timestamp.
+
 Hooks enqueue only the local transcript path and file metadata, then return
 immediately. A coalescing background drain parses and upserts the transcript;
 read commands flush any pending work before querying. `query` also embeds only
 the changed hook messages, while `search` and `sql` avoid loading the embedding
 model. `sync` remains the reconciliation path for missed local events, web
 providers, pre-hook sessions, and imports rather than a routine local update.
+
+Check the complete local pipeline with `convos doctor`. It reports the running
+version, archive/schema/FTS health, embedding backlog, queued ingestion, hook
+installation, and web-cookie availability without modifying the archive.
 
 Auto-import export paths with:
 

@@ -3,7 +3,14 @@
 Change graph over the convos DB ([spec 02](../../docs/specs/02-change-graph.md)):
 *which conversation -- which prompt -- changed this file, or this line?*
 
-Installs via the `convos.commands` entry-point group and registers under the `convos` CLI:
+Install it beside the core tool from GitHub:
+
+```bash
+uv tool install --reinstall "git+https://github.com/RobertBiehl/ai-convos-db.git" \
+  --with "ai-convos-changegraph @ git+https://github.com/RobertBiehl/ai-convos-db.git#subdirectory=apps/changegraph"
+```
+
+It registers through the `convos.commands` entry-point group:
 
 ```bash
 convos blame <file> [--line N] [--at <conv|ts>]   # per-line attribution
