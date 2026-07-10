@@ -12,8 +12,8 @@ read_when:
 
 Single-file CLI that normalizes conversations from multiple AI providers into a unified DuckDB database with full-text search.
 
-Optional applications add a local provenance projection and self-hosted E2EE
-synchronization without changing the core storage contract. See
+Two optional packages add the remote client, local provenance projection, and
+self-hosted E2EE relay without changing the core storage contract. See
 [`specs/04-remote-sync.md`](specs/04-remote-sync.md) and [`remote.md`](remote.md).
 
 ```

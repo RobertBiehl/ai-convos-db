@@ -4,7 +4,7 @@ import pytest
 from cryptography.exceptions import InvalidSignature, InvalidTag
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
-from ai_convos_remote_protocol import (b64, certificate, digest, event, fingerprint, identity, open_event, open_key,
+from ai_convos_remote.protocol import (b64, certificate, digest, event, fingerprint, identity, open_event, open_key,
                                        public, recover, recovery_bundle, seal_event, seal_key, verify_certificate,
                                        verify_event)
 

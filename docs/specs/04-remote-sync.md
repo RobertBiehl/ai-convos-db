@@ -213,10 +213,12 @@ Applications consume typed projection APIs/views, not envelopes. Initial views:
 - `identity_assertions`
 - `capture_gaps`
 
-The protocol package owns canonical encoding and crypto. The server owns opaque
-storage and ACLs. The remote client owns enrollment, keyring, sync, background
-work, and DuckDB projection. The provenance package owns Git inspection and the
-typed graph projection. None belongs in the 1,000-line core CLI.
+There are two installable packages. The remote client contains internal modules
+for canonical encoding, crypto, enrollment, keyring, synchronization,
+background work, DuckDB projection, Git inspection, and typed graph views. The
+remote server contains opaque storage, ACLs, and the minimal certificate
+validation required at its trust boundary. None belongs in the 1,000-line core
+CLI.
 
 ## Operational invariants
 

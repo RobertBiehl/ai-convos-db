@@ -3,7 +3,7 @@ from pathlib import Path
 
 import duckdb
 from ai_convos.cli import init_schema
-from ai_convos_provenance import query, repository
+from ai_convos_remote.provenance import query, repository
 from ai_convos_remote import add_member, connect, create, load, publish, setup_client, upload
 
 

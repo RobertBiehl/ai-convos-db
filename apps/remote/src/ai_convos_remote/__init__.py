@@ -7,11 +7,11 @@ import typer
 _pending=[]
 def register(app): _pending.append(app) if "remote" not in globals() else app.add_typer(remote,name="remote")
 from ai_convos.cli import DB_PATH, PROJECT_ROOT, drain_hooks, get_db
-from ai_convos_provenance import repository
-from ai_convos_remote_projection import connect, project, project_many, query as graph_query, rebuild as rebuild_projection, scan, sequence
-from ai_convos_remote_protocol import (b64, certificate, digest, event, identity, open_event, open_key, recover,
-                                       recovery_bundle, seal_event, seal_key, unb64)
-from ai_convos_remote_service import edit_hooks, enable
+from .provenance import repository
+from .projection import connect, project, project_many, query as graph_query, rebuild as rebuild_projection, scan, sequence
+from .protocol import (b64, certificate, digest, event, identity, open_event, open_key, recover,
+                       recovery_bundle, seal_event, seal_key, unb64)
+from .service import edit_hooks, enable
 
 remote=typer.Typer(help="End-to-end encrypted personal and team synchronization")
 def paths(root=None):

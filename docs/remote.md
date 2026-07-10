@@ -23,10 +23,6 @@ Install the core and client applications together:
 
 ```bash
 uv tool install --reinstall "git+https://github.com/RobertBiehl/ai-convos-db.git" \
-  --with "ai-convos-remote-protocol @ git+https://github.com/RobertBiehl/ai-convos-db.git#subdirectory=apps/remote_protocol" \
-  --with "ai-convos-provenance @ git+https://github.com/RobertBiehl/ai-convos-db.git#subdirectory=apps/provenance" \
-  --with "ai-convos-remote-projection @ git+https://github.com/RobertBiehl/ai-convos-db.git#subdirectory=apps/remote_projection" \
-  --with "ai-convos-remote-service @ git+https://github.com/RobertBiehl/ai-convos-db.git#subdirectory=apps/remote_service" \
   --with "ai-convos-remote @ git+https://github.com/RobertBiehl/ai-convos-db.git#subdirectory=apps/remote"
 ```
 
@@ -43,8 +39,7 @@ proxy; device bearer tokens must not traverse an untrusted network over HTTP.
 
 ```bash
 uv tool install --reinstall \
-  "ai-convos-remote-server @ git+https://github.com/RobertBiehl/ai-convos-db.git#subdirectory=apps/remote_server" \
-  --with "ai-convos-remote-protocol @ git+https://github.com/RobertBiehl/ai-convos-db.git#subdirectory=apps/remote_protocol"
+  "ai-convos-remote-server @ git+https://github.com/RobertBiehl/ai-convos-db.git#subdirectory=apps/remote_server"
 install -d -m 700 ~/.local/share/convos-server
 convos-server serve \
   --db ~/.local/share/convos-server/server.db \

@@ -1,9 +1,19 @@
 """Opaque self-hosted relay. It authorizes envelopes but never receives content keys."""
-import argparse, hashlib, json, os, secrets, shutil, sqlite3, time
+import argparse, base64, hashlib, json, os, secrets, sqlite3, time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-from ai_convos_remote_protocol import canon, digest, public_id, verify_certificate
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+
+V=1
+def canon(v): return json.dumps(v,sort_keys=True,separators=(",",":"),ensure_ascii=True,allow_nan=False).encode()
+def unb64(v): return base64.urlsafe_b64decode(v+"="*(-len(v)%4))
+def digest(v): return hashlib.sha256(v if isinstance(v,bytes) else canon(v)).hexdigest()
+def public_id(value): return digest(unb64(value))[:32]
+def verify_certificate(cert,root_public):
+    sig,body=unb64(cert["signature"]),{k:v for k,v in cert.items() if k!="signature"}; Ed25519PublicKey.from_public_bytes(unb64(root_public)).verify(sig,canon(body))
+    if body["v"]!=V: raise ValueError(f"Unsupported certificate version {body['v']}")
+    return body
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS users(id TEXT PRIMARY KEY,name TEXT UNIQUE,root_public TEXT NOT NULL,recovery TEXT,created REAL);

@@ -6,12 +6,8 @@ requires-python = ">=3.12"
 members = [
     "ai-convos-changegraph",
     "ai-convos-db",
-    "ai-convos-provenance",
     "ai-convos-remote",
-    "ai-convos-remote-projection",
-    "ai-convos-remote-protocol",
     "ai-convos-remote-server",
-    "ai-convos-remote-service",
 ]
 
 [[package]]
@@ -46,12 +42,8 @@ dependencies = [
 [package.optional-dependencies]
 dev = [
     { name = "ai-convos-changegraph" },
-    { name = "ai-convos-provenance" },
     { name = "ai-convos-remote" },
-    { name = "ai-convos-remote-projection" },
-    { name = "ai-convos-remote-protocol" },
     { name = "ai-convos-remote-server" },
-    { name = "ai-convos-remote-service" },
     { name = "pytest" },
     { name = "pytest-asyncio" },
 ]
@@ -59,12 +51,8 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "ai-convos-changegraph", marker = "extra == 'dev'", editable = "apps/changegraph" },
-    { name = "ai-convos-provenance", marker = "extra == 'dev'", editable = "apps/provenance" },
     { name = "ai-convos-remote", marker = "extra == 'dev'", editable = "apps/remote" },
-    { name = "ai-convos-remote-projection", marker = "extra == 'dev'", editable = "apps/remote_projection" },
-    { name = "ai-convos-remote-protocol", marker = "extra == 'dev'", editable = "apps/remote_protocol" },
     { name = "ai-convos-remote-server", marker = "extra == 'dev'", editable = "apps/remote_server" },
-    { name = "ai-convos-remote-service", marker = "extra == 'dev'", editable = "apps/remote_service" },
     { name = "cryptography", specifier = ">=42.0.0" },
     { name = "duckdb", specifier = ">=1.0.0" },
     { name = "huggingface-hub", specifier = ">=0.20.0" },
@@ -76,82 +64,32 @@ requires-dist = [
 provides-extras = ["dev"]
 
 [[package]]
-name = "ai-convos-provenance"
-version = "0.1.0"
-source = { editable = "apps/provenance" }
-dependencies = [
-    { name = "ai-convos-remote-protocol" },
-]
-
-[package.metadata]
-requires-dist = [{ name = "ai-convos-remote-protocol", editable = "apps/remote_protocol" }]
-
-[[package]]
 name = "ai-convos-remote"
 version = "0.1.0"
 source = { editable = "apps/remote" }
 dependencies = [
     { name = "ai-convos-db" },
-    { name = "ai-convos-provenance" },
-    { name = "ai-convos-remote-projection" },
-    { name = "ai-convos-remote-protocol" },
-    { name = "ai-convos-remote-service" },
+    { name = "cryptography" },
     { name = "typer" },
 ]
 
 [package.metadata]
 requires-dist = [
     { name = "ai-convos-db", editable = "." },
-    { name = "ai-convos-provenance", editable = "apps/provenance" },
-    { name = "ai-convos-remote-projection", editable = "apps/remote_projection" },
-    { name = "ai-convos-remote-protocol", editable = "apps/remote_protocol" },
-    { name = "ai-convos-remote-service", editable = "apps/remote_service" },
+    { name = "cryptography", specifier = ">=42.0.0" },
     { name = "typer", specifier = ">=0.12.0" },
 ]
-
-[[package]]
-name = "ai-convos-remote-projection"
-version = "0.1.0"
-source = { editable = "apps/remote_projection" }
-dependencies = [
-    { name = "ai-convos-db" },
-    { name = "ai-convos-provenance" },
-    { name = "ai-convos-remote-protocol" },
-]
-
-[package.metadata]
-requires-dist = [
-    { name = "ai-convos-db", editable = "." },
-    { name = "ai-convos-provenance", editable = "apps/provenance" },
-    { name = "ai-convos-remote-protocol", editable = "apps/remote_protocol" },
-]
-
-[[package]]
-name = "ai-convos-remote-protocol"
-version = "0.1.0"
-source = { editable = "apps/remote_protocol" }
-dependencies = [
-    { name = "cryptography" },
-]
-
-[package.metadata]
-requires-dist = [{ name = "cryptography", specifier = ">=42.0.0" }]
 
 [[package]]
 name = "ai-convos-remote-server"
 version = "0.1.0"
 source = { editable = "apps/remote_server" }
 dependencies = [
-    { name = "ai-convos-remote-protocol" },
+    { name = "cryptography" },
 ]
 
 [package.metadata]
-requires-dist = [{ name = "ai-convos-remote-protocol", editable = "apps/remote_protocol" }]
-
-[[package]]
-name = "ai-convos-remote-service"
-version = "0.1.0"
-source = { editable = "apps/remote_service" }
+requires-dist = [{ name = "cryptography", specifier = ">=42.0.0" }]
 
 [[package]]
 name = "anyio"

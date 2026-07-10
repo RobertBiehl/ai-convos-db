@@ -5,7 +5,7 @@ import pytest
 from ai_convos.cli import init_schema
 from ai_convos_remote import (add_member, approve_devices, connect, create, fetch_lazy, grant_all, grant_selected, load, pull, publish, refresh, remove_device,
                               setup_client, upload, workspace)
-from ai_convos_remote_projection import scan
+from ai_convos_remote.projection import scan
 from ai_convos_remote_server import action, connect as server_connect
 
 

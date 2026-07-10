@@ -4,7 +4,7 @@ from datetime import datetime, timezone
 from functools import lru_cache
 from pathlib import Path
 
-from ai_convos_remote_protocol import canon, digest
+from .protocol import canon, digest
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS raw_events(id TEXT PRIMARY KEY,workspace TEXT,kind TEXT,entity TEXT,author TEXT,seq INT,observed_at TEXT,payload TEXT);

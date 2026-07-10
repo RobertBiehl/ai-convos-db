@@ -21,8 +21,14 @@ def test_line_budget():
 
 
 def test_app_line_budgets():
-    """Each app package stays under 200 LOC (token-aware): ~100 logic + ~100 for a TUI."""
+    """Budget products honestly; never split one product into packages to evade its limit."""
     root = Path(__file__).resolve().parents[1]
     for src in sorted((root / "apps").glob("*/src")):
         loc = _loc(sorted(src.rglob("*.py")))
-        assert loc < 200, f"App {src.parent.name} budget exceeded: {loc} >= 200"
+        limit = {"remote": 500}.get(src.parent.name, 200)
+        assert loc < limit, f"App {src.parent.name} budget exceeded: {loc} >= {limit}"
+
+
+def test_remote_has_two_product_packages():
+    root = Path(__file__).resolve().parents[1]
+    assert {p.parent.name for p in (root / "apps").glob("remote*/pyproject.toml")} == {"remote", "remote_server"}

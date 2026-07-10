@@ -67,9 +67,9 @@ uv tool install --reinstall "git+https://github.com/RobertBiehl/ai-convos-db.git
 
 This adds `convos blame`, `timeline`, `at`, `graph`, and `browse`.
 
-The encrypted remote is a separate application so the local archive stays
-small and server-free by default. See [self-hosting, recovery, team policy, and
-installation](docs/remote.md).
+The encrypted remote uses one optional client package and one independently
+installable server package, so the local archive stays server-free by default.
+See [self-hosting, recovery, team policy, and installation](docs/remote.md).
 Runnable synthetic scenarios are in [`examples/remote`](examples/remote/README.md).
 See [`examples/insights`](examples/insights/README.md) for local decision,
 comparison, archive-statistics, and prompt-to-change query recipes.

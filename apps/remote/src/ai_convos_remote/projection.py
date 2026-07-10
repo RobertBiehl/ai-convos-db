@@ -5,8 +5,8 @@ from pathlib import Path
 
 import duckdb
 from ai_convos.cli import init_schema
-from ai_convos_provenance import capture as capture_graph, connect as graph_connect, project as project_graph, query as graph_query
-from ai_convos_remote_protocol import digest
+from .provenance import capture as capture_graph, connect as graph_connect, project as project_graph, query as graph_query
+from .protocol import digest
 
 STATE = """
 CREATE TABLE IF NOT EXISTS event_log(workspace TEXT,event TEXT PRIMARY KEY,cursor INT,direction TEXT,event_json TEXT,envelope TEXT);

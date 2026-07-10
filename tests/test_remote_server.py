@@ -1,7 +1,7 @@
 import copy, json
 
 import pytest
-from ai_convos_remote_protocol import certificate, event, identity, seal_event, seal_key
+from ai_convos_remote.protocol import certificate, event, identity, seal_event, seal_key
 from ai_convos_remote_server import action, connect
 
 

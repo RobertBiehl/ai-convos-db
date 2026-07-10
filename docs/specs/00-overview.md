@@ -14,7 +14,9 @@ Supersedes the 2026-05-02 six-option pitch. Detailed specs:
 
 Decided 2026-06-06:
 - Keep the single-file, ~1000-LoC core. Big features ship as separate
-  installable **applications** (~100 LoC each) that sit cleanly on top of core.
+  installable **applications** that sit cleanly on top of core. Package
+  boundaries represent products; internal modules do not become packages to
+  evade a budget.
 
 Updated 2026-07-10: encrypted remote synchronization was revisited and accepted
 as optional applications in [04-remote-sync](04-remote-sync.md). It remains out
@@ -82,15 +84,15 @@ separately from the app's logic.
                           plugin seam   (entry points group: convos.commands)
         _______________________|________________________
        |               |                |                |
-   APPLICATIONS  (separate packages, ~100 LoC each, read-only, no core schema edits)
+   APPLICATIONS  (one package per installable product, explicit line budgets)
    change-graph    time-travel       ask              related
    blame/timeline  file @ conv X     RAG + citations  near-dup nav
      ^needs                            ^needs            ^needs
      old_content +                     retrieve +        embeddings
      cwd/branch                        gen model
 
-   OPTIONAL REMOTE APPLICATIONS (still local-first; see spec 04):
-   protocol -> opaque server -> client/projection -> provenance
+   OPTIONAL REMOTE PRODUCTS (still local-first; see spec 04):
+   remote client [protocol, projection, provenance, service] <-> remote server
    personal workspaces sync all; team workspaces receive policy projections
 ```
 
@@ -117,8 +119,9 @@ changegraph = "ai_convos_changegraph:register"
 
 Core also exposes a tiny **public read API** so apps don't reach into privates:
 `get_db(read_only=True)`, the schema (documented in `docs/database.md`), and the
-`--json`/`sql` surface. **App contract:** depend on `ai-convos-db`, open the DB
-read-only, stay <= ~100 LoC, never edit the core schema.
+`--json`/`sql` surface. **App contract:** depend on `ai-convos-db`, leave the
+core schema stable, and stay within the product budget declared in
+`test_budget.py`.
 
 ## Budget plan
 
@@ -131,9 +134,10 @@ read-only, stay <= ~100 LoC, never edit the core schema.
   heavy dependency gone.
 - **Spend (core):** `sql` ~5, `json`/`jsonl` ~20, `parent_id` ~6, plugin seam
   ~6 -> ~37 LoC. Fits comfortably.
-- **Apps:** each is its own package under `apps/<name>/` (outside the core
-  budget glob, which is `src/ai_convos/*.py`). Enforce a parametrized
-  ~100-LoC-per-app budget test so the discipline carries over.
+- **Apps:** each installable product is one package under `apps/<name>/`
+  (outside the core budget glob, which is `src/ai_convos/*.py`). Small apps
+  default to 200 token-aware lines. Larger cohesive products declare one honest
+  explicit limit rather than splitting implementation modules into packages.
 
 ## Sequencing
 
@@ -149,10 +153,11 @@ read-only, stay <= ~100 LoC, never edit the core schema.
 ## Remote boundary
 
 The June sharing deferral is superseded by [spec 04](04-remote-sync.md). The
-reasoning that kept it out of core still stands. Remote transport, identity,
-membership, encryption, server storage, and graph projection live in separate
-small applications. Core remains a server-free local archive. Existing ids are
-origin ids, not assumed to be universal team identities.
+reasoning that kept it out of core still stands. The feature has exactly two
+installable packages: the remote client and the remote server. Protocol,
+projection, provenance, hooks, and worker code are internal client modules.
+Core remains a server-free local archive. Existing ids are origin ids, not
+assumed to be universal team identities.
 
 ## Open questions
 
