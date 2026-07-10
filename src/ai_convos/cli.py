@@ -746,8 +746,9 @@ def _filt(source, days, role):
     if days: w.append("m.created_at > ?"); p.append(datetime.now() - timedelta(days=days))
     if role: w.append("m.role = ?"); p.append(role)
     return w, p
+def _clip(s, n): return (s or "")[:n] + ("..." if s and len(s) > n else "")
 def _fmt_hit(content, ts, role, title, src, cid, cwd, q, ctx, meta):
-    p = (content or "")[:ctx] + ("..." if content and len(content) > ctx else "")
+    p = _clip(content, ctx)
     for w in q.split(): p = re.sub(f"({re.escape(w)})", r"\033[1;33m\1\033[0m", p, flags=re.I)
     typer.echo(f"\n{'='*60}\n[{src}] {title or 'Untitled'}{f' @ {cwd}' if cwd else ''} ({cid[:8]})\n{role} @ {ts or '?'} ({meta})\n{'-'*40}\n{p}")
 
@@ -802,7 +803,7 @@ def query_cmd(q: str, source: Optional[str] = typer.Option(None, "-s"), days: Op
         QUALIFY ROW_NUMBER() OVER (PARTITION BY c.id ORDER BY fused.rrf DESC)=1 ORDER BY fused.rrf DESC LIMIT ?""", [qv] + p + [q, limit]).fetchall()
     conn.close()
     if not rows: typer.echo("No results"); return
-    if fmt != "text": emit([dict(score=score, role=r, content=content, created_at=ts, title=title, source=src, conversation_id=cid, cwd=cwd) for score, r, content, ts, title, src, cid, cwd in rows], fmt); return
+    if fmt != "text": emit([dict(score=score, role=r, content=_clip(content, context), created_at=ts, title=title, source=src, conversation_id=cid, cwd=cwd) for score, r, content, ts, title, src, cid, cwd in rows], fmt); return
     for score, r, content, ts, title, src, cid, cwd in rows: _fmt_hit(content, ts, r, title, src, cid, cwd, q, context, f"score: {score:.4f}")
     typer.echo(f"\n{len(rows)} results")
 

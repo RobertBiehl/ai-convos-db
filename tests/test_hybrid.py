@@ -72,10 +72,10 @@ def test_query_pipeline_end_to_end(hybrid_db, monkeypatch):
 
 def test_query_returns_one_hit_per_conversation(hybrid_db, monkeypatch):
     monkeypatch.setattr(cli, "embed_text", lambda s, doc=False: _emb(1))
-    r = CliRunner().invoke(cli.app, ["query", "apple", "-n", "5", "-f", "json"])
+    r = CliRunner().invoke(cli.app, ["query", "apple", "-n", "5", "-c", "5", "-f", "json"])
     assert r.exit_code == 0
     hits = __import__("json").loads(r.output)
-    assert len(hits) == 1 and hits[0]["score"] > 0 and "rerank" not in hits[0]
+    assert len(hits) == 1 and hits[0]["score"] > 0 and hits[0]["content"] == "apple..." and "rerank" not in hits[0]
 
 
 def test_query_filters_candidates_and_skips_injected_boilerplate(tmp_path, monkeypatch):
