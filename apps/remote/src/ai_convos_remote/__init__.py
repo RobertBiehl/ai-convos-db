@@ -22,7 +22,7 @@ def load(root=None):
     if not path.exists(): raise ValueError("Remote is not configured. Run `convos remote setup`.")
     return json.loads(path.read_text())
 def save(cfg,root=None):
-    base,path,_=paths(root); base.mkdir(parents=True,exist_ok=True); tmp=path.with_name(f".{path.name}.{os.getpid()}"); tmp.write_text(json.dumps(cfg)); os.chmod(tmp,0o600); os.replace(tmp,path)
+    base,path,_=paths(root); base.mkdir(parents=True,exist_ok=True); os.chmod(base,0o700); tmp=path.with_name(f".{path.name}.{os.getpid()}"); tmp.write_text(json.dumps(cfg)); os.chmod(tmp,0o600); os.replace(tmp,path)
 def safe_url(url):
     parsed=urllib.parse.urlparse(url)
     if parsed.scheme!="https" and parsed.hostname not in ("127.0.0.1","localhost","::1") and os.environ.get("CONVOS_REMOTE_INSECURE")!="1": raise ValueError("Remote URL must use HTTPS (set CONVOS_REMOTE_INSECURE=1 only on a trusted test network)")
