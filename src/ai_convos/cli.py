@@ -697,7 +697,7 @@ def embed_pending(batch: int = 32, ids=None):
     Q = "FROM messages WHERE embedding IS NULL AND content IS NOT NULL AND content != ''" + (f" AND id IN ({','.join(['?']*len(ids))})" if ids is not None else ""); ps = ids or []
     conn = get_db(read_only=True); n = conn.execute(f"SELECT COUNT(*) {Q}", ps).fetchone()[0]; conn.close()
     if not n: return
-    typer.echo(f"Embedding {n} messages..."); done = 0
+    typer.echo(f"Embedding {n} messages...", err=True); done = 0
     while True:
         conn = get_db(read_only=True); rows = conn.execute(f"SELECT id, content {Q} ORDER BY LEAST(length(content),1600) LIMIT ?", ps + [batch]).fetchall(); conn.close()
         if not rows: break
@@ -705,8 +705,8 @@ def embed_pending(batch: int = 32, ids=None):
         for ch in [rows[i:i+_MCFG["n_seq_max"]] for i in range(0, len(rows), _MCFG["n_seq_max"])]:
             updates += [(e, mid) for (mid, _), e in zip(ch, embed_texts([c for _, c in ch], doc=True))]
         conn = get_db(); conn.executemany("UPDATE messages SET embedding=? WHERE id=? AND embedding IS NULL", updates); conn.close()
-        done += len(rows); typer.echo(f"  {done}/{n}\r", nl=False)
-    typer.echo()
+        done += len(rows); typer.echo(f"  {done}/{n}\r", nl=False, err=True)
+    typer.echo(err=True)
 def embed_hook_pending(all_msgs=False, batch=32):
     HOOK_DIR.mkdir(parents=True, exist_ok=True)
     with (HOOK_DIR/".embed.lock").open("w") as embed_lock:
