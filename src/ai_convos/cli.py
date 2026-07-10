@@ -547,8 +547,8 @@ def parse_codex_session(jsonl: Path) -> dict | None:
                  input="{}", output=json.dumps(p.get("output", "")), status="complete", duration_ms=None,
                  created_at=timestamps[i] if i < len(timestamps) else None)
             for i, p in items if p.get("type") == "function_call_output"]
-    tools += [dict(id=gen_id(src, f"custom:{cid}:{i}"), message_id=anchor(i), tool_name=p["name"], input=json.dumps({"code":p.get("input", "")}), output="{}", status={"completed":"complete"}.get(p.get("status"), p.get("status", "pending")), duration_ms=None, created_at=timestamps[i] if i < len(timestamps) else None) for i, p in items if p.get("type") == "custom_tool_call"] + \
-             [dict(id=gen_id(src, f"customout:{cid}:{i}"), message_id=anchor(i), tool_name=p.get("call_id"), input="{}", output=json.dumps(p.get("output", "")), status="complete", duration_ms=None, created_at=timestamps[i] if i < len(timestamps) else None) for i, p in items if p.get("type") == "custom_tool_call_output"]
+    custom_out = {p.get("call_id"):p.get("output", "") for _, p in items if p.get("type") == "custom_tool_call_output"}
+    tools += [dict(id=gen_id(src, f"custom:{cid}:{i}"), message_id=anchor(i), tool_name=p["name"], input=json.dumps({"code":p.get("input", "")}), output=json.dumps(custom_out.get(p.get("call_id"), "")), status="complete" if p.get("call_id") in custom_out or p.get("status") == "completed" else p.get("status", "pending"), duration_ms=None, created_at=timestamps[i] if i < len(timestamps) else None) for i, p in items if p.get("type") == "custom_tool_call"]
 
     def patch_edits(args):
         """File edits from shell commands, exact or skipped: apply_patch hunks (context+minus -> context+plus,

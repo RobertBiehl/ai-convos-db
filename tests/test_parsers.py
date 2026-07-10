@@ -300,7 +300,7 @@ class TestCodexParser:
             {"type":"response_item","timestamp":"2026-01-01T00:00:01Z","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"fix"}]}},
             {"type":"response_item","timestamp":"2026-01-01T00:00:02Z","payload":{"type":"custom_tool_call","name":"exec","call_id":"c1","status":"completed","input":code}},
             {"type":"response_item","timestamp":"2026-01-01T00:00:03Z","payload":{"type":"custom_tool_call_output","call_id":"c1","output":"ok"}}]))
-        result = parse_codex(tmp_path/".codex"); assert len(result.tools) == 2 and result.tools[0]["tool_name"] == "exec" and result.tools[0]["status"] == "complete" and json.loads(result.tools[0]["input"])["code"] == code
+        result = parse_codex(tmp_path/".codex"); assert len(result.tools) == 1 and result.tools[0]["tool_name"] == "exec" and result.tools[0]["status"] == "complete" and json.loads(result.tools[0]["input"])["code"] == code and json.loads(result.tools[0]["output"]) == "ok"
         assert len(result.edits) == 1 and (result.edits[0]["file_path"], result.edits[0]["old_content"], result.edits[0]["content"]) == ("/repo/src/app.py", "old", "new")
 
     def test_custom_exec_patch_text_is_not_an_edit(self, tmp_path):
