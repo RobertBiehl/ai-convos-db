@@ -9,14 +9,14 @@
 uv tool install "git+https://github.com/RobertBiehl/ai-convos-db.git"
 ```
 
-Local-first, searchable archive for ChatGPT, Claude, and Codex conversations. One file, one DB, fast full-text search.
+Local-first memory for coding agents. Capture Claude Code and Codex work automatically, retrieve decisions across providers, and hand the next agent bounded context from one DuckDB file.
 
 ## Why this exists
 
-- Keep all your AI chats in one place
-- Search across providers with DuckDB FTS
-- Import exports or fetch directly from your browser cookies
-- Track tools, attachments, and edits
+- Resume work across coding agents without reconstructing old sessions
+- Retrieve prior decisions, commands, evidence, and edits without dumping whole transcripts
+- Keep ChatGPT, Claude, Claude Code, and Codex history local and searchable
+- Use a CLI skill and lifecycle hooks; no server, daemon, or hosted memory service
 
 ## Features
 
@@ -24,7 +24,7 @@ Local-first, searchable archive for ChatGPT, Claude, and Codex conversations. On
 - Hybrid semantic search (BM25 + embeddings + Reciprocal Rank Fusion) via `convos query`
 - Fetch from ChatGPT and Claude using browser cookies
 - Import exports from ChatGPT, Claude, Claude Code, and Codex
-- Sync Claude Code + Codex sessions on a schedule
+- Capture completed Claude Code + Codex turns just in time with lifecycle hooks
 - Optional code-change provenance: blame, timeline, time travel, and graph browsing
 - Export to JSON or CSV
 
@@ -42,7 +42,11 @@ Upgrade later with:
 
 ```bash
 uv tool install --reinstall "git+https://github.com/RobertBiehl/ai-convos-db.git"
+convos install-skills
 ```
+
+The first install may compile `llama-cpp-python` locally and take about a
+minute on macOS; later reinstalls reuse the built package.
 
 `convos init` creates the archive and installs the bundled Codex + Claude Code
 skills automatically. Refresh the skills without initializing the archive with:
@@ -65,7 +69,7 @@ This adds `convos blame`, `timeline`, `at`, `graph`, and `browse`.
 ```bash
 convos init
 convos install-hooks
-convos sync
+convos sync                  # one-time history/web/import backfill
 convos doctor
 convos search "prompt" -s claude -n 10
 convos query "conceptual search"
