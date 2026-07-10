@@ -82,7 +82,7 @@ def test_search_returns_one_hit_per_conversation(hybrid_db):
     r = CliRunner().invoke(cli.app, ["search", "apple", "-n", "5", "-f", "json"])
     assert r.exit_code == 0
     hits = __import__("json").loads(r.output)
-    assert len(hits) == 1 and hits[0]["conversation_id"] == "c1"
+    assert len(hits) == 1 and hits[0]["conversation_id"] == "c1" and hits[0]["message_id"] in ("m1", "m3")
 
 
 def test_search_structured_output_honors_context(hybrid_db):
