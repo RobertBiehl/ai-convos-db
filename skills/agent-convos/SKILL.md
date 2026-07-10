@@ -11,6 +11,7 @@ Retrieve with these commands:
 convos query "natural language question" -n 8 -f jsonl   # conceptual/paraphrased discovery; default when wording is uncertain
 convos search "exact terms" -n 8 -c 160 -f jsonl         # known terms, quotes, ids, filenames; fast BM25
 convos read abc123 -n 20 -c 2000 -f jsonl                 # bounded recent context from one known conversation
+convos read abc123 --around MESSAGE_ID -n 20 -f jsonl      # bounded context around an exact discovery hit
 convos sql "SELECT ..." -f jsonl                          # structured filters, joins, counts, and history
 ```
 
@@ -40,7 +41,7 @@ convos sql "SELECT source, COUNT(*) FROM conversations GROUP BY source" -f json
 Behavior:
 
 - Discover first with `query` for concepts/paraphrases or `search` for known literal text, then use `read` on the strongest conversation candidates. Use `sql` for structured questions.
-- `read` resolves a unique conversation-id prefix, selects the newest `-n` messages, and returns them chronologically; raise `-n` or `-c` when more history is required.
+- Discovery JSON includes `conversation_id` and `message_id`. `read` returns the newest `-n` messages chronologically, or a bounded neighborhood around `--around MESSAGE_ID`; raise `-n` or `-c` when more context is required.
 - SQL text matching is available but usually a worse discovery path than `query`/`search`; reserve SQL primarily for known ids, fields, relations, ordering, and aggregation.
 - `search`/`query` accept `-s` source, `-d` days, `-r` role, `-n` limit, `-c` context; for any richer filter, use `sql`.
 - Optimize discovery relevance and tokens: keep search/query `-n` <= 8 and `-c` <= 200 unless the user wants more.

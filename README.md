@@ -82,6 +82,7 @@ Read a known conversation using an ID prefix from search/query:
 
 ```bash
 convos read f2b9c5a9 -n 20 -c 2000 -f jsonl
+convos read f2b9c5a9 --around 01ab -n 20 -f jsonl
 ```
 
 List and analyze with read-only DuckDB SQL (schema in `docs/database.md`):

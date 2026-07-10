@@ -779,25 +779,29 @@ def search(query: str, source: Optional[str] = typer.Option(None, "-s"), days: O
     drain_hooks()
     if (conn := _fts_ro()) is None: return
     w, p = _filt(source, days, role)
-    results = conn.execute(f"""SELECT m.content, m.thinking, m.role, m.created_at, fts_main_messages.match_bm25(m.id, ?) as score, c.title, c.source, c.id, c.cwd
+    results = conn.execute(f"""SELECT m.id, m.content, m.thinking, m.role, m.created_at, fts_main_messages.match_bm25(m.id, ?) as score, c.title, c.source, c.id, c.cwd
         FROM messages m JOIN conversations c ON m.conversation_id = c.id WHERE score IS NOT NULL{' AND ' + ' AND '.join(w) if w else ''} ORDER BY score DESC LIMIT ?""", [query] + p + [limit]).fetchall()
     conn.close()
-    if fmt != "text": emit([dict(role=r, content=content, thinking=think, created_at=ts, score=score, title=title, source=src, conversation_id=cid, cwd=cwd) for content, think, r, ts, score, title, src, cid, cwd in results], fmt); return
+    if fmt != "text": emit([dict(message_id=mid, role=r, content=content, thinking=think, created_at=ts, score=score, title=title, source=src, conversation_id=cid, cwd=cwd) for mid, content, think, r, ts, score, title, src, cid, cwd in results], fmt); return
     if not results: typer.echo("No results"); return
-    for content, think, r, ts, score, title, src, cid, cwd in results:
+    for _, content, think, r, ts, score, title, src, cid, cwd in results:
         _fmt_hit(content, ts, r, title, src, cid, cwd, query, context, f"score: {score:.2f}")
         if thinking and think: typer.echo(f"\n[THINKING]\n{think[:500]}{'...' if len(think)>500 else ''}")
     typer.echo(f"\n{len(results)} results")
 
 @app.command("read")
-def read_cmd(conversation: str, limit: int = typer.Option(20, "-n", min=1), context: int = typer.Option(2000, "-c", min=1), thinking: bool = typer.Option(False, "--thinking", "-t"), fmt: str = typer.Option("text", "-f", "--format")):
+def read_cmd(conversation: str, limit: int = typer.Option(20, "-n", min=1), context: int = typer.Option(2000, "-c", min=1), around: Optional[str] = typer.Option(None, "--around", "-a"), thinking: bool = typer.Option(False, "--thinking", "-t"), fmt: str = typer.Option("text", "-f", "--format")):
     drain_hooks()
     if (conn := _ro()) is None: return
     cs = conn.execute("SELECT id,title,source,cwd FROM conversations WHERE starts_with(id, ?) ORDER BY updated_at DESC NULLS LAST LIMIT 2", [conversation]).fetchall()
     if len(cs) != 1:
         conn.close(); typer.echo("No matching conversation" if not cs else "Ambiguous prefix: " + ", ".join(c[0] for c in cs), err=True); raise typer.Exit(1)
     cid, title, src, cwd = cs[0]
-    rows = conn.execute("SELECT * EXCLUDE(rn) FROM (SELECT id,role,content,thinking,created_at,ROW_NUMBER() OVER (ORDER BY created_at DESC NULLS LAST,id DESC) rn FROM messages WHERE conversation_id=? AND json_extract_string(metadata,'$.history_of') IS NULL AND (COALESCE(content,'')!='' OR COALESCE(thinking,'')!='')) WHERE rn<=? ORDER BY rn DESC", [cid, limit]).fetchall(); conn.close()
+    base = "SELECT id,role,content,thinking,created_at,ROW_NUMBER() OVER (ORDER BY created_at NULLS FIRST,id) pos FROM messages WHERE conversation_id=? AND json_extract_string(metadata,'$.history_of') IS NULL AND (COALESCE(content,'')!='' OR COALESCE(thinking,'')!='')"
+    if around and len(mids := conn.execute("SELECT id FROM messages WHERE conversation_id=? AND starts_with(id,?) AND json_extract_string(metadata,'$.history_of') IS NULL LIMIT 2", [cid, around]).fetchall()) != 1:
+        conn.close(); typer.echo("No matching message" if not mids else "Ambiguous message prefix: " + ", ".join(m[0] for m in mids), err=True); raise typer.Exit(1)
+    rows = conn.execute(f"WITH b AS ({base}),t AS (SELECT pos FROM b WHERE id=?) SELECT id,role,content,thinking,created_at FROM (SELECT b.*,abs(b.pos-t.pos) d FROM b,t ORDER BY d,b.pos LIMIT ?) ORDER BY pos", [cid, mids[0][0], limit]).fetchall() if around else conn.execute(f"SELECT id,role,content,thinking,created_at FROM ({base}) ORDER BY pos DESC LIMIT ?", [cid, limit]).fetchall()[::-1]
+    conn.close()
     data = [dict(id=mid, role=role, content=_clip(content, context), thinking=_clip(think, context) if thinking and think else None, created_at=ts) for mid, role, content, think, ts in rows]
     if fmt != "text": emit(data, fmt); return
     typer.echo(f"[{src}] {title or 'Untitled'}{f' @ {cwd}' if cwd else ''} ({cid})")
@@ -817,16 +821,16 @@ def query_cmd(q: str, source: Optional[str] = typer.Option(None, "-s"), days: Op
         fts AS (SELECT id, ROW_NUMBER() OVER (ORDER BY score DESC) AS r FROM (SELECT id, fts_main_messages.match_bm25(id, ?) AS score FROM base) s WHERE score IS NOT NULL LIMIT 50),
         vec AS (SELECT b.id, ROW_NUMBER() OVER (ORDER BY array_cosine_similarity(b.embedding, qe.v) DESC) AS r FROM base b, qe WHERE b.embedding IS NOT NULL LIMIT 50),
         fused AS (SELECT id, SUM(1.0/(60+r)) AS rrf FROM (SELECT id, r FROM fts UNION ALL SELECT id, r FROM vec) GROUP BY id)
-        SELECT m.role, m.content, m.created_at, c.title, c.source, c.id, c.cwd FROM fused JOIN messages m ON m.id = fused.id JOIN conversations c ON c.id = m.conversation_id
+        SELECT m.id, m.role, m.content, m.created_at, c.title, c.source, c.id, c.cwd FROM fused JOIN messages m ON m.id = fused.id JOIN conversations c ON c.id = m.conversation_id
         QUALIFY ROW_NUMBER() OVER (PARTITION BY c.id ORDER BY fused.rrf DESC)=1 ORDER BY fused.rrf DESC LIMIT 16""", [qv] + p + [q]).fetchall()
     conn.close()
     if not rows: typer.echo("No results"); return
-    try: rrs = rerank(q, [r[1] or "" for r in rows])
+    try: rrs = rerank(q, [r[2] or "" for r in rows])
     except Exception as e: typer.echo(f"Hybrid rerank failed: {e}", err=True); return
     W = lambda i: (0.75, 0.25) if i < 3 else (0.6, 0.4) if i < 10 else (0.4, 0.6)
     ranked = sorted([(W(i)[0]*(1.0/(i+1)) + W(i)[1]*rr, row, rr) for i, (row, rr) in enumerate(zip(rows, rrs))], reverse=True, key=lambda x: x[0])
-    if fmt != "text": emit([dict(score=score, role=r, content=content, created_at=ts, title=title, source=src, conversation_id=cid, cwd=cwd, rerank=rr) for score, (r, content, ts, title, src, cid, cwd), rr in ranked[:limit]], fmt); return
-    for score, (r, content, ts, title, src, cid, cwd), rr in ranked[:limit]: _fmt_hit(content, ts, r, title, src, cid, cwd, q, context, f"score: {score:.3f}, rerank: {rr:.2f}")
+    if fmt != "text": emit([dict(score=score, message_id=mid, role=r, content=content, created_at=ts, title=title, source=src, conversation_id=cid, cwd=cwd, rerank=rr) for score, (mid, r, content, ts, title, src, cid, cwd), rr in ranked[:limit]], fmt); return
+    for score, (_, r, content, ts, title, src, cid, cwd), rr in ranked[:limit]: _fmt_hit(content, ts, r, title, src, cid, cwd, q, context, f"score: {score:.3f}, rerank: {rr:.2f}")
     typer.echo(f"\n{min(len(ranked), limit)} results")
 
 @app.command("embed")
