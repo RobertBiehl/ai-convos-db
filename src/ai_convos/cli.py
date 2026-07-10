@@ -267,7 +267,9 @@ def fetch_json(url: str, cookies: dict[str, str], headers: dict = None, timeout:
                 return json.loads(resp.read())
         except Exception as e:
             if i == retries: raise
-            time.sleep(1 + i)
+            delay = 30*(i+1) if getattr(e, "code", None) == 429 else 1+i
+            if getattr(e, "code", None) == 429: typer.echo(f"  rate limited; retrying in {delay}s", err=True)
+            time.sleep(delay)
 
 # ---- result type ----
 class ParseResult:
@@ -331,7 +333,7 @@ def fetch_chatgpt(browser: str = "safari", limit: int = 0, profiles: list[str | 
         def parse_item_raw(item):
             cid = gen_id("chatgpt", item["id"])
             gizmo = item.get("gizmo_id")
-            conv = fetch_json(f"{base}/backend-api/conversation/{item['id']}", cookies, headers, timeout=20, retries=1)
+            conv = fetch_json(f"{base}/backend-api/conversation/{item['id']}", cookies, headers, timeout=20, retries=2)
             msgs, tools, attachs = chatgpt_mapping(cid, conv.get("mapping", {}))
             return dict(conv=dict(id=cid, source="chatgpt", title=item.get("title"), created_at=ts_any(conv.get("create_time") or item.get("create_time")),
                                   updated_at=ts_any(conv.get("update_time") or item.get("update_time")), model=item.get("model"), cwd=None, git_branch=None,
@@ -352,7 +354,7 @@ def fetch_chatgpt(browser: str = "safari", limit: int = 0, profiles: list[str | 
                 try: results.append(parse_item_raw(item))
                 except Exception as e: raise RuntimeError(f"detail fetch failed: {e}") from e
                 if i % 20 == 0 or i == len(page): typer.echo(f"  chatgpt details {fetched+i}")
-                if len(page) > 20: time.sleep(.25)
+                if len(page) > 20: time.sleep(.5)
             r.convs += [x["conv"] for x in results]; r.msgs += [m for x in results for m in x["msgs"]]
             r.tools += [t for x in results for t in x["tools"]]; r.attachs += [a for x in results for a in x["attachs"]]
             fetched += len(results)

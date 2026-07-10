@@ -410,3 +410,11 @@ class TestHTTPErrors:
             with pytest.raises(urllib.error.HTTPError) as exc_info:
                 fetch_json("https://api.example.com", {"session": "test"})
             assert exc_info.value.code == 401
+
+    def test_429_uses_visible_long_backoff(self):
+        from ai_convos.cli import fetch_json
+        import urllib.error
+        error = urllib.error.HTTPError("https://api.example.com", 429, "Too Many Requests", {}, None)
+        with patch("urllib.request.urlopen", side_effect=error), patch("time.sleep") as sleep:
+            with pytest.raises(urllib.error.HTTPError): fetch_json("https://api.example.com", {}, retries=2)
+        assert [x.args[0] for x in sleep.call_args_list] == [30, 60]
