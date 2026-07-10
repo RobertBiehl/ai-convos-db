@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import json, time, zipfile, hashlib, struct, sqlite3, subprocess, ssl, urllib.request, re, os, sysconfig, site, math, csv, sys, shutil, shlex, fcntl
+import json, time, zipfile, hashlib, struct, sqlite3, subprocess, ssl, urllib.request, re, os, sysconfig, site, csv, sys, shutil, shlex, fcntl
 from importlib.metadata import entry_points
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
@@ -673,29 +673,25 @@ def drain_hooks(embed=False):
     return len(done)
 
 # ---- embeddings ----
-_MODELS, _MCFG, _LLAMA_LOG = {}, {"emb": dict(repo_id="ggml-org/embeddinggemma-300m-qat-q8_0-GGUF", filename="embeddinggemma-300m-qat-Q8_0.gguf", embedding=True, n_ctx=16384, n_batch=2048, n_ubatch=2048, n_seq_max=8, n_gpu_layers=-1), "rr": dict(repo_id="ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF", filename="qwen3-reranker-0.6b-q8_0.gguf", n_ctx=4096, logits_all=True, n_gpu_layers=-1)}, None
-def _llama(role: str):
-    global _LLAMA_LOG
-    if role not in _MODELS:
+_MODEL, _MCFG, _LLAMA_LOG = None, dict(repo_id="ggml-org/embeddinggemma-300m-qat-q8_0-GGUF", filename="embeddinggemma-300m-qat-Q8_0.gguf", embedding=True, n_ctx=16384, n_batch=2048, n_ubatch=2048, n_seq_max=8, n_gpu_layers=-1), None
+def _llama():
+    global _MODEL, _LLAMA_LOG
+    if _MODEL is None:
         from llama_cpp import Llama; import llama_cpp.llama_cpp as lc, warnings; warnings.filterwarnings("ignore", message="The `local_dir_use_symlinks` argument is deprecated.*", category=UserWarning)
         if _LLAMA_LOG is None: _LLAMA_LOG = lc.llama_log_callback(lambda *_: None); lc.llama_log_set(_LLAMA_LOG, None)
-        cfg = _MCFG[role].copy(); nseq = cfg.pop("n_seq_max", 0)
+        cfg = _MCFG.copy(); nseq = cfg.pop("n_seq_max", 0)
         if nseq:
             orig = lc.llama_context_default_params
             lc.llama_context_default_params = lambda o=orig, n=nseq: (setattr(p := o(), "n_seq_max", n) or p)
-        try: _MODELS[role] = Llama.from_pretrained(**cfg, verbose=False)
+        try: _MODEL = Llama.from_pretrained(**cfg, verbose=False)
         finally:
             if nseq: lc.llama_context_default_params = orig
-    return _MODELS[role]
+    return _MODEL
 def embed_texts(ss: list[str], doc: bool = False) -> list[list[float]]:
     p = "task: search result | document: " if doc else "task: search result | query: "
-    return [d["embedding"] for d in _llama("emb").create_embedding([p + (s or "")[:1600] for s in ss])["data"]]
+    return [d["embedding"] for d in _llama().create_embedding([p + (s or "")[:1600] for s in ss])["data"]]
 def embed_text(s: str, doc: bool = False) -> list[float]:
     return embed_texts([s], doc)[0]
-RR_PROMPT = '<|im_start|>system\nJudge whether the Document meets the requirements based on the Query and the Instruct provided. Note that the answer can only be "yes" or "no".<|im_end|>\n<|im_start|>user\n<Instruct>: Given a search query, find conversation messages relevant to it.\n<Query>: {q}\n<Document>: {d}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n'
-def rerank(query: str, docs: list[str]) -> list[float]:
-    rr, qq = _llama("rr"), query[:512]
-    return [(lambda l: (math.exp(l.get("yes",-100))/(math.exp(l.get("yes",-100))+math.exp(l.get("no",-100)))) if math.exp(l.get("yes",-100))+math.exp(l.get("no",-100))>0 else 0.0)(rr.create_completion(RR_PROMPT.format(q=qq, d=(d or "")[:3000]), max_tokens=1, temperature=0.0, logprobs=10)["choices"][0]["logprobs"]["top_logprobs"][0]) for d in docs]
 def embed_pending(batch: int = 32, ids=None):
     if ids == []: return
     Q = "FROM messages WHERE embedding IS NULL AND content IS NOT NULL AND content != ''" + (f" AND id IN ({','.join(['?']*len(ids))})" if ids is not None else ""); ps = ids or []
@@ -706,7 +702,7 @@ def embed_pending(batch: int = 32, ids=None):
         conn = get_db(read_only=True); rows = conn.execute(f"SELECT id, content {Q} ORDER BY LEAST(length(content),1600) LIMIT ?", ps + [batch]).fetchall(); conn.close()
         if not rows: break
         updates = []
-        for ch in [rows[i:i+_MCFG["emb"]["n_seq_max"]] for i in range(0, len(rows), _MCFG["emb"]["n_seq_max"])]:
+        for ch in [rows[i:i+_MCFG["n_seq_max"]] for i in range(0, len(rows), _MCFG["n_seq_max"])]:
             updates += [(e, mid) for (mid, _), e in zip(ch, embed_texts([c for _, c in ch], doc=True))]
         conn = get_db(); conn.executemany("UPDATE messages SET embedding=? WHERE id=? AND embedding IS NULL", updates); conn.close()
         done += len(rows); typer.echo(f"  {done}/{n}\r", nl=False)
@@ -804,17 +800,13 @@ def query_cmd(q: str, source: Optional[str] = typer.Option(None, "-s"), days: Op
         fts AS (SELECT id, ROW_NUMBER() OVER (ORDER BY score DESC) AS r FROM (SELECT id, fts_main_messages.match_bm25(id, ?) AS score FROM base) s WHERE score IS NOT NULL LIMIT 50),
         vec AS (SELECT b.id, ROW_NUMBER() OVER (ORDER BY array_cosine_similarity(b.embedding, qe.v) DESC) AS r FROM base b, qe WHERE b.embedding IS NOT NULL LIMIT 50),
         fused AS (SELECT id, SUM(1.0/(60+r)) AS rrf FROM (SELECT id, r FROM fts UNION ALL SELECT id, r FROM vec) GROUP BY id)
-        SELECT m.role, m.content, m.created_at, c.title, c.source, c.id, c.cwd FROM fused JOIN messages m ON m.id = fused.id JOIN conversations c ON c.id = m.conversation_id
-        QUALIFY ROW_NUMBER() OVER (PARTITION BY c.id ORDER BY fused.rrf DESC)=1 ORDER BY fused.rrf DESC LIMIT 16""", [qv] + p + [q]).fetchall()
+        SELECT fused.rrf, m.id, m.role, m.content, m.created_at, c.title, c.source, c.id, c.cwd FROM fused JOIN messages m ON m.id = fused.id JOIN conversations c ON c.id = m.conversation_id
+        QUALIFY ROW_NUMBER() OVER (PARTITION BY c.id ORDER BY fused.rrf DESC)=1 ORDER BY fused.rrf DESC LIMIT ?""", [qv] + p + [q, limit]).fetchall()
     conn.close()
     if not rows: typer.echo("No results"); return
-    try: rrs = rerank(q, [r[1] or "" for r in rows])
-    except Exception as e: typer.echo(f"Hybrid rerank failed: {e}", err=True); return
-    W = lambda i: (0.75, 0.25) if i < 3 else (0.6, 0.4) if i < 10 else (0.4, 0.6)
-    ranked = sorted([(W(i)[0]*(1.0/(i+1)) + W(i)[1]*rr, row, rr) for i, (row, rr) in enumerate(zip(rows, rrs))], reverse=True, key=lambda x: x[0])
-    if fmt != "text": emit([dict(score=score, role=r, content=content, created_at=ts, title=title, source=src, conversation_id=cid, cwd=cwd, rerank=rr) for score, (r, content, ts, title, src, cid, cwd), rr in ranked[:limit]], fmt); return
-    for score, (r, content, ts, title, src, cid, cwd), rr in ranked[:limit]: _fmt_hit(content, ts, r, title, src, cid, cwd, q, context, f"score: {score:.3f}, rerank: {rr:.2f}")
-    typer.echo(f"\n{min(len(ranked), limit)} results")
+    if fmt != "text": emit([dict(score=score, message_id=mid, role=r, content=_clip(content, context), created_at=ts, title=title, source=src, conversation_id=cid, cwd=cwd) for score, mid, r, content, ts, title, src, cid, cwd in rows], fmt); return
+    for score, _, r, content, ts, title, src, cid, cwd in rows: _fmt_hit(content, ts, r, title, src, cid, cwd, q, context, f"score: {score:.4f}")
+    typer.echo(f"\n{len(rows)} results")
 
 @app.command("embed")
 def embed_cmd(batch: int = typer.Option(32, "-b")):

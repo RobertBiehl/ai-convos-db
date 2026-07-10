@@ -1,4 +1,4 @@
-"""Tests for hybrid search pipeline (RRF math + position-tier blend)."""
+"""Tests for the hybrid BM25 + vector RRF search pipeline."""
 import duckdb, pytest
 from typer.testing import CliRunner
 from ai_convos import cli
@@ -63,7 +63,6 @@ def test_rrf_sql_formula():
 def test_query_pipeline_end_to_end(hybrid_db, monkeypatch):
     """Querying for 'apple' returns the strongest relevant message, not unrelated content."""
     monkeypatch.setattr(cli, "embed_text", lambda s, doc=False: _emb(1))
-    monkeypatch.setattr(cli, "rerank", lambda q, ds: [0.5] * len(ds))
     r = CliRunner().invoke(cli.app, ["query", "apple", "-n", "5"])
     assert r.exit_code == 0, r.output
     out = r.output
@@ -72,10 +71,11 @@ def test_query_pipeline_end_to_end(hybrid_db, monkeypatch):
 
 
 def test_query_returns_one_hit_per_conversation(hybrid_db, monkeypatch):
-    monkeypatch.setattr(cli, "embed_text", lambda s, doc=False: _emb(1)); monkeypatch.setattr(cli, "rerank", lambda q, ds: [0.5] * len(ds))
-    r = CliRunner().invoke(cli.app, ["query", "apple", "-n", "5", "-f", "json"])
+    monkeypatch.setattr(cli, "embed_text", lambda s, doc=False: _emb(1))
+    r = CliRunner().invoke(cli.app, ["query", "apple", "-n", "5", "-c", "5", "-f", "json"])
     assert r.exit_code == 0
-    assert len(__import__("json").loads(r.output)) == 1
+    hits = __import__("json").loads(r.output)
+    assert len(hits) == 1 and hits[0]["score"] > 0 and hits[0]["message_id"] in ("m1", "m3") and hits[0]["content"] == "apple..." and "rerank" not in hits[0]
 
 
 def test_search_returns_one_hit_per_conversation(hybrid_db):
@@ -98,7 +98,7 @@ def test_query_filters_candidates_and_skips_injected_boilerplate(tmp_path, monke
     conn.execute("INSERT INTO conversations VALUES ('noise','noise','N',NULL,NULL,NULL,NULL,NULL,NULL,NULL), ('target','target','T',NULL,NULL,NULL,NULL,NULL,NULL,NULL)")
     rows = [(f"n{i}", "noise", "user", "needle noise", _emb(1)) for i in range(55)] + [("skill", "target", "user", "Base directory for this skill: needle", _emb(1)), ("wanted", "target", "user", "needle wanted", _emb(1))]
     conn.executemany("INSERT INTO messages (id,conversation_id,role,content,embedding) VALUES (?,?,?,?,?)", rows); cli.rebuild_fts_index(conn); conn.close()
-    monkeypatch.setattr(cli, "embed_text", lambda s, doc=False: _emb(1)); monkeypatch.setattr(cli, "rerank", lambda q, ds: [0.5] * len(ds))
+    monkeypatch.setattr(cli, "embed_text", lambda s, doc=False: _emb(1))
     r = CliRunner().invoke(cli.app, ["query", "needle", "-s", "target", "-n", "5", "-f", "json"]); hits = __import__("json").loads(r.output)
     assert [h["content"] for h in hits] == ["needle wanted"]
 
@@ -158,17 +158,6 @@ def test_db_waits_for_writer(tmp_path, monkeypatch, read_only):
     monkeypatch.setattr(cli.duckdb, "connect", connect)
     assert cli.get_db(read_only=read_only) == "conn"
     assert calls["n"] == 3
-
-
-def test_tier_blend_top3_weights():
-    """Position-tier blend: ranks 0-2 → 0.75/0.25, 3-9 → 0.6/0.4, 10+ → 0.4/0.6."""
-    W = lambda i: (0.75, 0.25) if i < 3 else (0.6, 0.4) if i < 10 else (0.4, 0.6)
-    assert W(0) == (0.75, 0.25)
-    assert W(2) == (0.75, 0.25)
-    assert W(3) == (0.6, 0.4)
-    assert W(9) == (0.6, 0.4)
-    assert W(10) == (0.4, 0.6)
-    assert W(99) == (0.4, 0.6)
 
 
 def test_sql_select_and_blocks_writes(tmp_path, monkeypatch):
