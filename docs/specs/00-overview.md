@@ -4,7 +4,7 @@ read_when:
   - Deciding whether a new feature belongs in the core or in an application
   - Understanding the dependency picture and sequencing
   - Onboarding to the next-level roadmap
-status: draft (2026-06-06)
+status: accepted core boundary; sharing decision updated 2026-07-10
 ---
 
 # Convos: core vs applications (overview RFC)
@@ -15,8 +15,11 @@ Supersedes the 2026-05-02 six-option pitch. Detailed specs:
 Decided 2026-06-06:
 - Keep the single-file, ~1000-LoC core. Big features ship as separate
   installable **applications** (~100 LoC each) that sit cleanly on top of core.
-- **Defer all sharing** (MCP server, team database, remote/cross-user access).
-  It reverses local-first; revisit later, never in core.
+
+Updated 2026-07-10: encrypted remote synchronization was revisited and accepted
+as optional applications in [04-remote-sync](04-remote-sync.md). It remains out
+of core, keeps plaintext retrieval local, and uses encrypted workspace
+projections rather than merging DuckDB files or trusting a server with content.
 
 ## Target use case (this is what "core" means)
 
@@ -59,8 +62,8 @@ separately from the app's logic.
 | file time-travel (`at`) | APP | reconstruct file @ conversation X | change-graph |
 | `convos ask` (RAG + citations) | APP | synthesis; needs a generation model | retrieve |
 | related conversations | APP | navigation | embeddings |
-| sharing: MCP / team / merge | DEFERRED | reverses local-first | redaction, auth |
-| redaction / secret-scan | DEFERRED | gated on sharing | ingest |
+| encrypted personal/team synchronization | APP/SERVICE | optional E2EE event transport | protocol, projection, provenance |
+| redaction / secret-scan | LATER APP | policy improvement for team projections | remote policy |
 
 ## Dependency picture
 
@@ -86,9 +89,9 @@ separately from the app's logic.
      old_content +                     retrieve +        embeddings
      cwd/branch                        gen model
 
-   DEFERRED (reverses local-first; lives in its own package/repo when revisited):
-   sharing / MCP / team   <-- needs redaction + auth + merge-by-id (gen_id makes
-                              merge cheap, since ids are machine-independent)
+   OPTIONAL REMOTE APPLICATIONS (still local-first; see spec 04):
+   protocol -> opaque server -> client/projection -> provenance
+   personal workspaces sync all; team workspaces receive policy projections
 ```
 
 ## The plugin seam (how apps attach without polluting core)
@@ -140,15 +143,16 @@ read-only, stay <= ~100 LoC, never edit the core schema.
   `ai-convos-changegraph` (`blame` / `timeline` / `at`).
 - **M3 - optional apps.** `ask`, related-conversations, and (if cheap) query
   syntax.
-- **Deferred.** sharing / MCP / team + redaction.
+- **M4 - encrypted remote.** Protocol/server -> personal multi-device -> Git
+  provenance -> team policies and membership. See [04](04-remote-sync.md).
 
-## Deferred, and why
+## Remote boundary
 
-Sharing (the original ideas #1 MCP and #4 team DB) reverses convos's core
-promise that *data never leaves your machine*, and MCP was already parked once.
-Deferred by decision on 2026-06-06. When revisited: redaction/secret-scan and
-per-repo/user scoping are prerequisites, it lives in its own package/repo (never
-core), and the deterministic `gen_id` already makes merge-by-id cheap.
+The June sharing deferral is superseded by [spec 04](04-remote-sync.md). The
+reasoning that kept it out of core still stands. Remote transport, identity,
+membership, encryption, server storage, and graph projection live in separate
+small applications. Core remains a server-free local archive. Existing ids are
+origin ids, not assumed to be universal team identities.
 
 ## Open questions
 

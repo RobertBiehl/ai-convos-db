@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- Add optional self-hosted end-to-end encrypted personal and team synchronization.
+- Add immutable signed events, device enrollment, recovery, epoch rotation, history grants, and opaque server storage.
+- Add path-independent Git provenance, cross-repository changesets, checkpoint gaps, and typed local graph views.
+
 ## 0.4.0
 - Add bundled Codex and Claude Code skills plus just-in-time lifecycle hooks with crash-safe, idempotent queue draining.
 - Make literal and hybrid retrieval conversation-first, bound structured output, expose exact message IDs, and add `convos read` for recent or hit-centered context.

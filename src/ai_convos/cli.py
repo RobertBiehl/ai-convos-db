@@ -874,6 +874,9 @@ def doctor(verbose: bool = typer.Option(False, "-v")):
         except Exception as e: typer.echo(f"archive: unavailable ({e})")
     else: typer.echo(f"archive: missing ({DB_PATH})"); typer.echo("repair: convos init")
     install_hooks(status=True)
+    for ep in entry_points(group="convos.doctor"):
+        try: typer.echo(ep.load()())
+        except Exception as e: typer.echo(f"{ep.name}: unavailable ({e})")
     def has(domains, host): return any(host in d or d in host for d in domains)
     targets = ["chatgpt.com", "chat.openai.com", "openai.com", "claude.ai"]
     for name, getter in [("safari", safari_cookie_domains), ("chrome", chrome_cookie_domains)]:

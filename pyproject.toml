@@ -14,7 +14,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8.0.0", "pytest-asyncio>=0.23.0", "ai-convos-changegraph"]
+dev = ["pytest>=8.0.0", "pytest-asyncio>=0.23.0", "ai-convos-changegraph", "ai-convos-remote-protocol", "ai-convos-remote-server", "ai-convos-provenance", "ai-convos-remote-projection", "ai-convos-remote-service", "ai-convos-remote"]
 
 [project.scripts]
 convos = "ai_convos:app"
@@ -40,6 +40,12 @@ members = ["apps/*"]
 
 [tool.uv.sources]
 ai-convos-changegraph = { workspace = true }
+ai-convos-remote-protocol = { workspace = true }
+ai-convos-remote-server = { workspace = true }
+ai-convos-provenance = { workspace = true }
+ai-convos-remote-projection = { workspace = true }
+ai-convos-remote-service = { workspace = true }
+ai-convos-remote = { workspace = true }
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

@@ -1,0 +1,17 @@
+[project]
+name = "ai-convos-provenance"
+version = "0.1.0"
+description = "Local global provenance projection for ai-convos-db"
+license = "MIT"
+requires-python = ">=3.12"
+dependencies = ["ai-convos-remote-protocol"]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.uv.sources]
+ai-convos-remote-protocol = { workspace = true }
