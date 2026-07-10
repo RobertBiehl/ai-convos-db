@@ -67,6 +67,7 @@ Search:
 ```bash
 convos search "vector database" -s chatgpt -d 30   # BM25 only
 convos search "reasoning" --thinking
+convos read f2b9c5a9 -n 20 -f jsonl              # bounded recent context from one result
 convos embed                                      # backfill embeddings, no web sync
 convos query "how do I store vectors in duckdb"    # hybrid: BM25 + embeddings + rerank
 ```
@@ -77,11 +78,16 @@ embed new/changed messages. Models used: `embeddinggemma-300m-qat-q8_0` for
 embeddings (768d) and `Qwen3-Reranker-0.6B` for reranking. Both are GGUF and
 run locally via llama.cpp.
 
-List and read (read-only DuckDB SQL; schema in `docs/database.md`):
+Read a known conversation using an ID prefix from search/query:
+
+```bash
+convos read f2b9c5a9 -n 20 -c 2000 -f jsonl
+```
+
+List and analyze with read-only DuckDB SQL (schema in `docs/database.md`):
 
 ```bash
 convos sql "SELECT id, title, created_at FROM conversations ORDER BY created_at DESC LIMIT 20" -f json
-convos sql "SELECT role, content FROM messages WHERE conversation_id LIKE 'abc%' ORDER BY created_at" -f jsonl
 ```
 
 Sync:
@@ -143,11 +149,11 @@ f2b9c5a9  ChatGPT  "Indexing embeddings with DuckDB"  2026-01-14T09:22:11Z
 ```
 
 ```bash
-convos sql "SELECT role, content FROM messages WHERE conversation_id LIKE 'f2b9c5a9%' ORDER BY created_at" -f jsonl
+convos read f2b9c5a9 -f jsonl
 ```
 ```text
-{"role": "user", "content": "How do I store vectors in DuckDB?"}
-{"role": "assistant", "content": "Use a table with a FLOAT[] column and an HNSW index..."}
+{"id":"01ab...","role":"user","content":"How do I store vectors in DuckDB?","thinking":null,"created_at":"2026-01-14 09:22:11"}
+{"id":"02cd...","role":"assistant","content":"Use a table with a FLOAT[] column and an HNSW index...","thinking":null,"created_at":"2026-01-14 09:22:42"}
 ```
 
 ## Data model

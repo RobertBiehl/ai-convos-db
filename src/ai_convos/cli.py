@@ -750,6 +750,7 @@ def _filt(source, days, role):
     if days: w.append("m.created_at > ?"); p.append(datetime.now() - timedelta(days=days))
     if role: w.append("m.role = ?"); p.append(role)
     return w, p
+def _clip(s, n): return (s or "")[:n] + ("..." if s and len(s) > n else "")
 def _fmt_hit(content, ts, role, title, src, cid, cwd, q, ctx, meta):
     p = (content or "")[:ctx] + ("..." if content and len(content) > ctx else "")
     for w in q.split(): p = re.sub(f"({re.escape(w)})", r"\033[1;33m\1\033[0m", p, flags=re.I)
@@ -787,6 +788,20 @@ def search(query: str, source: Optional[str] = typer.Option(None, "-s"), days: O
         _fmt_hit(content, ts, r, title, src, cid, cwd, query, context, f"score: {score:.2f}")
         if thinking and think: typer.echo(f"\n[THINKING]\n{think[:500]}{'...' if len(think)>500 else ''}")
     typer.echo(f"\n{len(results)} results")
+
+@app.command("read")
+def read_cmd(conversation: str, limit: int = typer.Option(20, "-n", min=1), context: int = typer.Option(2000, "-c", min=1), thinking: bool = typer.Option(False, "--thinking", "-t"), fmt: str = typer.Option("text", "-f", "--format")):
+    drain_hooks()
+    if (conn := _ro()) is None: return
+    cs = conn.execute("SELECT id,title,source,cwd FROM conversations WHERE starts_with(id, ?) ORDER BY updated_at DESC NULLS LAST LIMIT 2", [conversation]).fetchall()
+    if len(cs) != 1:
+        conn.close(); typer.echo("No matching conversation" if not cs else "Ambiguous prefix: " + ", ".join(c[0] for c in cs), err=True); raise typer.Exit(1)
+    cid, title, src, cwd = cs[0]
+    rows = conn.execute("SELECT * EXCLUDE(rn) FROM (SELECT id,role,content,thinking,created_at,ROW_NUMBER() OVER (ORDER BY created_at DESC NULLS LAST,id DESC) rn FROM messages WHERE conversation_id=? AND json_extract_string(metadata,'$.history_of') IS NULL AND (COALESCE(content,'')!='' OR COALESCE(thinking,'')!='')) WHERE rn<=? ORDER BY rn DESC", [cid, limit]).fetchall(); conn.close()
+    data = [dict(id=mid, role=role, content=_clip(content, context), thinking=_clip(think, context) if thinking and think else None, created_at=ts) for mid, role, content, think, ts in rows]
+    if fmt != "text": emit(data, fmt); return
+    typer.echo(f"[{src}] {title or 'Untitled'}{f' @ {cwd}' if cwd else ''} ({cid})")
+    [typer.echo(f"\n{m['role']} @ {m['created_at'] or '?'}\n{m['content']}{f'''\n[THINKING]\n{m['thinking']}''' if m['thinking'] else ''}") for m in data]; typer.echo(f"\n{len(data)} messages")
 
 @app.command("query")
 def query_cmd(q: str, source: Optional[str] = typer.Option(None, "-s"), days: Optional[int] = typer.Option(None, "-d"), role: Optional[str] = typer.Option(None, "-r"), limit: int = typer.Option(10, "-n"), context: int = typer.Option(300, "-c"), fmt: str = typer.Option("text", "-f", "--format")):

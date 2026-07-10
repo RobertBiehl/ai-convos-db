@@ -78,6 +78,22 @@ def test_query_returns_one_hit_per_conversation(hybrid_db, monkeypatch):
     assert len(__import__("json").loads(r.output)) == 1
 
 
+def test_read_known_conversation_is_bounded_and_chronological(tmp_path, monkeypatch):
+    db = tmp_path/"test.db"; monkeypatch.setattr(cli, "DB_PATH", db); monkeypatch.setattr(cli, "DATA_DIR", tmp_path)
+    conn = duckdb.connect(str(db)); cli.init_schema(conn); conn.execute("INSERT INTO conversations (id,source,title) VALUES ('abcdef1234567890','codex','Work')")
+    conn.executemany("INSERT INTO messages (id,conversation_id,role,content,thinking,created_at,metadata) VALUES (?,'abcdef1234567890','user',?,?,?,?)", [("m1","first message",None,"2026-01-01","{}"),("m2","second message","secret thought","2026-01-02","{}"),("m3","third message",None,"2026-01-03","{}"),("old","stale",None,"2025-01-01",'{"history_of":"m1"}')]); conn.close()
+    r = CliRunner().invoke(cli.app, ["read", "abcdef12", "-n", "2", "-c", "6", "-t", "-f", "jsonl"]); rows = [__import__("json").loads(x) for x in r.output.splitlines()]
+    assert r.exit_code == 0 and [x["id"] for x in rows] == ["m2", "m3"] and [x["content"] for x in rows] == ["second...", "third ..."] and rows[0]["thinking"] == "secret..."
+    assert __import__("json").loads(CliRunner().invoke(cli.app, ["read", "abcdef12", "-f", "json"]).output)[1]["thinking"] is None
+
+
+def test_read_rejects_unknown_or_ambiguous_prefix(tmp_path, monkeypatch):
+    db = tmp_path/"test.db"; monkeypatch.setattr(cli, "DB_PATH", db); monkeypatch.setattr(cli, "DATA_DIR", tmp_path)
+    conn = duckdb.connect(str(db)); cli.init_schema(conn); conn.execute("INSERT INTO conversations (id,source) VALUES ('abc1','x'),('abc2','x')"); conn.close()
+    assert CliRunner().invoke(cli.app, ["read", "missing"]).exit_code == 1
+    r = CliRunner().invoke(cli.app, ["read", "abc"]); assert r.exit_code == 1 and "Ambiguous prefix" in r.output
+
+
 def test_query_filters_candidates_and_skips_injected_boilerplate(tmp_path, monkeypatch):
     db = tmp_path / "test.db"; monkeypatch.setattr(cli, "DB_PATH", db); monkeypatch.setattr(cli, "DATA_DIR", tmp_path)
     conn = duckdb.connect(str(db)); cli.init_schema(conn)
