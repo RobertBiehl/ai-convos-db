@@ -90,6 +90,24 @@ def test_search_structured_output_honors_context(hybrid_db):
     r = CliRunner().invoke(cli.app, ["search", "cherry", "-c", "5", "-t", "-f", "json"]); hit = __import__("json").loads(r.output)[0]
     assert hit["content"] == "apple..." and hit["thinking"] == "reaso..."
     assert __import__("json").loads(CliRunner().invoke(cli.app, ["search", "cherry", "-c", "5", "-f", "json"]).output)[0]["thinking"] is None
+def test_read_known_conversation_is_bounded_and_chronological(tmp_path, monkeypatch):
+    db = tmp_path/"test.db"; monkeypatch.setattr(cli, "DB_PATH", db); monkeypatch.setattr(cli, "DATA_DIR", tmp_path)
+    conn = duckdb.connect(str(db)); cli.init_schema(conn); conn.execute("INSERT INTO conversations (id,source,title) VALUES ('abcdef1234567890','codex','Work')")
+    conn.executemany("INSERT INTO messages (id,conversation_id,role,content,thinking,created_at,metadata) VALUES (?,'abcdef1234567890','user',?,?,?,?)", [("m1","first message",None,"2026-01-01","{}"),("m2","second message","secret thought","2026-01-02","{}"),("m3","third message",None,"2026-01-03","{}"),("m4","fourth message",None,"2026-01-04","{}"),("m5","fifth message",None,"2026-01-05","{}"),("old","stale",None,"2025-01-01",'{"history_of":"m1"}')]); conn.close()
+    r = CliRunner().invoke(cli.app, ["read", "abcdef12", "-n", "2", "-c", "6", "-t", "-f", "jsonl"]); rows = [__import__("json").loads(x) for x in r.output.splitlines()]
+    assert r.exit_code == 0 and [x["id"] for x in rows] == ["m4", "m5"] and [x["content"] for x in rows] == ["fourth...", "fifth ..."]
+    around = __import__("json").loads(CliRunner().invoke(cli.app, ["read", "abcdef12", "-a", "m2", "-n", "3", "-f", "json"]).output)
+    assert [x["id"] for x in around] == ["m1", "m2", "m3"] and around[1]["thinking"] is None
+    shown = __import__("json").loads(CliRunner().invoke(cli.app, ["read", "abcdef12", "-a", "m2", "-n", "1", "-c", "6", "-t", "-f", "json"]).output)
+    assert shown[0]["thinking"] == "secret..."
+
+
+def test_read_rejects_unknown_or_ambiguous_prefix(tmp_path, monkeypatch):
+    db = tmp_path/"test.db"; monkeypatch.setattr(cli, "DB_PATH", db); monkeypatch.setattr(cli, "DATA_DIR", tmp_path)
+    conn = duckdb.connect(str(db)); cli.init_schema(conn); conn.execute("INSERT INTO conversations (id,source) VALUES ('abc1','x'),('abc2','x')"); conn.close()
+    assert CliRunner().invoke(cli.app, ["read", "missing"]).exit_code == 1
+    r = CliRunner().invoke(cli.app, ["read", "abc"]); assert r.exit_code == 1 and "Ambiguous prefix" in r.output
+    assert CliRunner().invoke(cli.app, ["read", "abc1", "-a", "missing"]).exit_code == 1
 
 
 def test_query_filters_candidates_and_skips_injected_boilerplate(tmp_path, monkeypatch):

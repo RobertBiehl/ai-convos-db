@@ -103,7 +103,7 @@ snapshot under a short writer connection, marks changed text for one coalesced
 FTS rebuild, and records the processed snapshot. New events cannot be deleted
 by an older in-flight claim, and orphaned claims are retried after a process crash.
 
-`search`, `query`, and `sql` drain pending records before opening their read
+`search`, `query`, `read`, and `sql` drain pending records before opening their read
 connection. `search` and `query` rebuild FTS once when dirty, while `query`
 also atomically claims and embeds only dirty message ids;
 concurrent queries share an embedding lock without holding DuckDB open. Ingest
