@@ -1,22 +1,19 @@
-import json, os, shutil, sqlite3, subprocess, sys, time
+import json, shutil, sqlite3, subprocess, time
 from pathlib import Path
 
 from typer.testing import CliRunner
 from ai_convos import cli
-from ai_convos_remote import edit_hooks, hook_cmd, setup_client
+from ai_convos_remote import edit_hooks, setup_client
 from ai_convos_remote_server import action, connect
 
 
 def test_remote_hooks_are_private_fast_idempotent_and_removable(tmp_path,monkeypatch):
     claude,codex=tmp_path/"claude",tmp_path/"codex"; claude.mkdir(); codex.mkdir(); monkeypatch.setenv("CLAUDE_CONFIG_DIR",str(claude)); monkeypatch.setenv("CODEX_HOME",str(codex)); monkeypatch.setenv("CONVOS_PROJECT_ROOT",str(tmp_path/"archive"))
-    (claude/"settings.json").write_text(json.dumps({"keep":1,"hooks":{"Stop":[{"hooks":[{"type":"command","command":"keep"}]}]}})); edit_hooks(); edit_hooks()
+    (claude/"settings.json").write_text(json.dumps({"keep":1,"hooks":{"Stop":[{"hooks":[{"type":"command","command":"keep"}]}]}})); cmd=edit_hooks(); edit_hooks()
     c,x=json.loads((claude/"settings.json").read_text()),json.loads((codex/"hooks.json").read_text()); assert c["keep"]==1 and sum(h["command"].endswith("remote hook") for gs in c["hooks"].values() for g in gs for h in g["hooks"])==2 and sum(h["command"].endswith("remote hook") for gs in x["hooks"].values() for g in gs for h in g["hooks"])==1
     samples=[]
-    for _ in range(30): start=time.perf_counter(); hook_cmd(); samples.append((time.perf_counter()-start)*1000)
+    for _ in range(30): start=time.perf_counter(); subprocess.run(cmd,shell=True,check=True); samples.append((time.perf_counter()-start)*1000)
     assert sorted(samples)[28] < 100 and (tmp_path/"archive/remote/wake").exists()
-    env={**os.environ,"CONVOS_PROJECT_ROOT":str(tmp_path/"cli-archive")}; subprocess.run((shutil.which("convos"),"remote","hook"),env=env,check=True); samples=[]
-    for _ in range(25): start=time.perf_counter(); subprocess.run((shutil.which("convos"),"remote","hook"),env=env,check=True); samples.append((time.perf_counter()-start)*1000)
-    assert sorted(samples)[23] < 100
     edit_hooks(True); c=json.loads((claude/"settings.json").read_text()); assert c["hooks"]=={"Stop":[{"hooks":[{"type":"command","command":"keep"}]}]}
 
 

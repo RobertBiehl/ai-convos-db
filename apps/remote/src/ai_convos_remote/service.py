@@ -3,10 +3,10 @@ import json, os, plistlib, shlex, shutil, subprocess, sys
 from pathlib import Path
 
 def edit_hooks(remove=False):
-    cmd=f"{shlex.quote(shutil.which('convos') or 'convos')} remote hook"; configs=((Path(os.environ.get("CLAUDE_CONFIG_DIR",Path.home()/".claude"))/"settings.json",("Stop","SessionEnd")),(Path(os.environ.get("CODEX_HOME",Path.home()/".codex"))/"hooks.json",("Stop",)))
+    wake=Path(os.environ.get("CONVOS_PROJECT_ROOT",Path.home()/".convos"))/"remote/wake"; cmd=f"mkdir -p {shlex.quote(str(wake.parent))} && touch {shlex.quote(str(wake))} # ai-convos remote hook"; configs=((Path(os.environ.get("CLAUDE_CONFIG_DIR",Path.home()/".claude"))/"settings.json",("Stop","SessionEnd")),(Path(os.environ.get("CODEX_HOME",Path.home()/".codex"))/"hooks.json",("Stop",)))
     for path,events in configs:
         data=json.loads(path.read_text()) if path.exists() else {}; hooks=data.setdefault("hooks",{})
-        for name in list(hooks): hooks[name]=[g for g in hooks[name] if not any(h.get("command")==cmd for h in g.get("hooks",[]))]; hooks[name] or hooks.pop(name)
+        for name in list(hooks): hooks[name]=[g for g in hooks[name] if not any(h.get("command","").endswith("convos remote hook") for h in g.get("hooks",[]))]; hooks[name] or hooks.pop(name)
         if not remove:
             for name in events: hooks.setdefault(name,[]).append({"hooks":[{"type":"command","command":cmd,"timeout":1,"statusMessage":"Queueing encrypted conversation sync"}]})
         path.parent.mkdir(parents=True,exist_ok=True); path.write_text(json.dumps(data))
