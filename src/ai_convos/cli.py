@@ -17,7 +17,7 @@ def find_root():
 PROJECT_ROOT = find_root()
 DATA_DIR, DB_PATH = PROJECT_ROOT / "data", PROJECT_ROOT / "data" / "convos.db"
 STATE_PATH = DATA_DIR / "sync_state.json"
-HOOK_DIR, HOOK_STATE, HOOK_EMBED_DIRTY = DATA_DIR/"hook_inbox", DATA_DIR/"hook_state.json", DATA_DIR/"hook_embeddings_dirty"
+HOOK_DIR, HOOK_STATE, HOOK_EMBED_DIRTY, HOOK_FTS_DIRTY = DATA_DIR/"hook_inbox", DATA_DIR/"hook_state.json", DATA_DIR/"hook_embeddings_dirty", DATA_DIR/"hook_fts_dirty"
 
 # ---- db helpers ----
 def get_db(read_only: bool = False):
@@ -663,7 +663,7 @@ def drain_hooks(embed=False):
             except Exception as e: retry_hook(work); log_parse_error(f"hook inbox {q}", e)
         if done:
             dirty = set().union(*(d for _, _, _, d in done))
-            if dirty: conn = get_db(); rebuild_fts_index(conn); conn.close(); merge_embed_dirty(dirty)
+            if dirty: HOOK_FTS_DIRTY.touch(); merge_embed_dirty(dirty)
             for _, key, snap, _ in done: state[key] = snap
             atomic_json(HOOK_STATE, state)
             [work.unlink(missing_ok=True) for work, _, _, _ in done]
@@ -671,6 +671,21 @@ def drain_hooks(embed=False):
         try: embed_hook_pending()
         except Exception as e: log_parse_error("hook embeddings", e)
     return len(done)
+
+def flush_fts():
+    HOOK_DIR.mkdir(parents=True, exist_ok=True)
+    with (HOOK_DIR/".fts.lock").open("w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX); claims = list(DATA_DIR.glob(f".{HOOK_FTS_DIRTY.name}.*"))
+        if claims: HOOK_FTS_DIRTY.touch(); [p.unlink(missing_ok=True) for p in claims]
+        if not HOOK_FTS_DIRTY.exists(): return False
+        claim = HOOK_FTS_DIRTY.with_name(f".{HOOK_FTS_DIRTY.name}.{os.getpid()}"); os.replace(HOOK_FTS_DIRTY, claim)
+        try:
+            conn = get_db()
+            try: rebuild_fts_index(conn)
+            finally: conn.close()
+        except Exception: HOOK_FTS_DIRTY.touch(); raise
+        finally: claim.unlink(missing_ok=True)
+    return True
 
 # ---- embeddings ----
 _MODEL, _MCFG, _LLAMA_LOG = None, dict(repo_id="ggml-org/embeddinggemma-300m-qat-q8_0-GGUF", filename="embeddinggemma-300m-qat-Q8_0.gguf", embedding=True, n_ctx=16384, n_batch=2048, n_ubatch=2048, n_seq_max=8, n_gpu_layers=-1), None
@@ -734,6 +749,8 @@ def _hybrid_ro():
     if c.execute("SELECT 1 FROM information_schema.columns WHERE table_name='messages' AND column_name='embedding'").fetchone(): return c
     c.close(); c = get_db(); init_schema(c); c.close(); return _ro()
 def _fts_ro(hybrid=False):
+    try: flush_fts()
+    except Exception as e: typer.echo(f"FTS refresh failed: {e}", err=True); return None
     if (c := _hybrid_ro() if hybrid else _ro()) is None: return None
     try: load_fts(c)
     except ValueError as e: c.close(); typer.echo(str(e)); return None
@@ -766,7 +783,7 @@ def drain_hooks_cmd(): drain_hooks()
 
 @app.command()
 def init():
-    conn = get_db(); init_schema(conn); rebuild_fts_index(conn); conn.close()
+    conn = get_db(); init_schema(conn); rebuild_fts_index(conn); conn.close(); HOOK_FTS_DIRTY.unlink(missing_ok=True)
     install_skills()
     typer.echo(f"Database initialized at {DB_PATH}")
 
@@ -1010,7 +1027,8 @@ def sync(watch: bool = typer.Option(False, "-w"), interval: int = typer.Option(3
                     if st := j.get("state"): set_state(*st)
                     if dirty: save_state(state); dirty = False
                     if src := j.get("source"): typer.echo(f"Updated {j['label']} ({n} new, {u} updated convs; {fmt([c, m, t, a, e])} processed){' in %.2fs' % (time.perf_counter()-j['t']) if verbose else ''}")
-        if changed: conn = get_db(); rebuild_fts_index(conn); conn.close()
+        if changed: HOOK_FTS_DIRTY.touch()
+        flush_fts()
         try: embed_hook_pending(True)
         except ImportError: pass
         if dirty: save_state(state)

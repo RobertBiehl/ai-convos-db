@@ -120,7 +120,8 @@ show a recent `ingest: ... last=...` timestamp.
 
 Hooks enqueue only the local transcript path and file metadata, then return
 immediately. A coalescing background drain parses and upserts the transcript;
-read commands flush any pending work before querying. `query` also embeds only
+`search` and `query` rebuild FTS once for all pending changes before reading.
+`query` also embeds only
 the changed hook messages, while `search` and `sql` avoid loading the embedding
 model. `sync` remains the reconciliation path for missed local events, web
 providers, pre-hook sessions, and imports rather than a routine local update.
