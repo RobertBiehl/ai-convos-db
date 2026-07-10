@@ -1,5 +1,5 @@
 ---
-summary: "Codex CLI integration: session files, JSONL format, and function calls."
+summary: "Codex CLI integration: session files, JSONL format, tool calls, and file edits."
 read_when:
   - Syncing Codex sessions
   - Understanding Codex log format
@@ -94,7 +94,7 @@ Messages and function calls:
 }
 ```
 
-**Function output:**
+**Function output (legacy format):**
 ```json
 {
   "type": "response_item",
@@ -104,6 +104,15 @@ Messages and function calls:
     "output": "file contents..."
   }
 }
+```
+
+Current Codex versions emit custom tool calls. The `exec` input is JavaScript
+which can call nested tools such as `apply_patch`; the matching output carries
+the same `call_id`:
+
+```json
+{"type":"response_item","payload":{"type":"custom_tool_call","name":"exec","call_id":"call_xyz","status":"completed","input":"..."}}
+{"type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"call_xyz","output":"..."}}
 ```
 
 ## Extracted Data
@@ -124,17 +133,17 @@ Messages and function calls:
 
 ### Tool Calls
 
-Function calls mapped to tool_calls:
-- `tool_name`: Function name (e.g., `shell`)
-- `input`: Function arguments
-- `output`: From function_call_output
+Legacy function calls and current custom calls are mapped to `tool_calls`:
+- `tool_name`: Function name (for example, `shell` or `exec`)
+- `input`: Function arguments or custom tool code
+- `output`: Function or custom tool output
 
 ### File Edits
 
-Extracted from shell commands that modify files:
-- Pattern matching for `cat >`, `echo >`, `sed`, `awk`
-- Edit type: `shell`
-- Content: Full command
+Extracted from legacy shell commands and current custom `exec` calls:
+- `apply_patch` calls produce exact per-hunk old/new content
+- Heredoc redirects produce exact writes
+- Plain redirects retain the modifying command when content is unknown
 
 ## Usage
 
@@ -158,9 +167,9 @@ uv run convos sql "SELECT id, title, created_at FROM conversations WHERE source=
 |--------|-------------|-------|
 | Provider | Anthropic | OpenAI |
 | Event types | system, human, assistant | session_meta, response_item |
-| Tool format | tool_use/tool_result blocks | function_call/function_call_output |
+| Tool format | tool_use/tool_result blocks | function or custom tool call/output |
 | Thinking | Explicit thinking blocks | Not available |
-| File edits | Write/Edit tools | Shell command patterns |
+| File edits | Write/Edit tools | Shell commands and nested `apply_patch` calls |
 
 ## Troubleshooting
 
