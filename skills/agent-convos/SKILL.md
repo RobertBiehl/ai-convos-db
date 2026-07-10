@@ -5,12 +5,14 @@ description: Retrieve prior AI conversation context and keep the local archive c
 
 # Agent Convos
 
-Retrieve with one of three commands:
+Retrieve with these commands:
 
 ```bash
 convos query "natural language question" -n 8 -f jsonl   # conceptual/paraphrased discovery; default when wording is uncertain
 convos search "exact terms" -n 8 -c 160 -f jsonl         # known terms, quotes, ids, filenames; one hit/conversation
-convos sql "SELECT ..." -f jsonl                          # open known conversations; structured filters, joins, counts, history
+convos read abc123 -n 20 -c 2000 -f jsonl                 # bounded recent context from one known conversation
+convos read abc123 --around MESSAGE_ID -n 20 -f jsonl      # bounded context around an exact discovery hit
+convos sql "SELECT ..." -f jsonl                          # structured filters, joins, counts, and history
 ```
 
 Output: add `-f jsonl` (stream, one JSON object per line) or `-f json` (array);
@@ -28,8 +30,6 @@ Schema (write `convos sql` against these tables):
 Common `sql` recipes:
 
 ```bash
-# read one conversation in order (ids from search/query are prefixes)
-convos sql "SELECT role, content FROM messages WHERE conversation_id LIKE 'abc%' ORDER BY created_at" -f jsonl
 # recent conversations for a source
 convos sql "SELECT id, title, created_at FROM conversations WHERE source='claude' ORDER BY created_at DESC LIMIT 20" -f json
 # which conversation/prompt touched a file
@@ -40,11 +40,12 @@ convos sql "SELECT source, COUNT(*) FROM conversations GROUP BY source" -f json
 
 Behavior:
 
-- Discover first with `query` for concepts/paraphrases or `search` for known literal text, then use `sql` to read the strongest conversation candidates in order or answer structured questions.
+- Discover first with `query` for concepts/paraphrases or `search` for known literal text, then use `read` on the strongest conversation candidates. Use `sql` for structured questions.
 - Both discovery commands return at most one strongest message per conversation, so `-n` budgets distinct conversation candidates.
+- Discovery JSON includes `conversation_id` and `message_id`. `read` returns the newest `-n` messages chronologically, or a bounded neighborhood around `--around MESSAGE_ID`; raise `-n` or `-c` when more context is required.
 - SQL text matching is available but usually a worse discovery path than `query`/`search`; reserve SQL primarily for known ids, fields, relations, ordering, and aggregation.
 - `search`/`query` accept `-s` source, `-d` days, `-r` role, `-n` limit, `-c` context; for any richer filter, use `sql`.
-- Optimize relevance and tokens: keep `-n` <= 8 and `-c` <= 200 unless the user wants more.
+- Optimize discovery relevance and tokens: keep search/query `-n` <= 8 and `-c` <= 200 unless the user wants more.
 - `sql` runs on a read-only connection, so writes fail by construction; it is safe for arbitrary `SELECT`s.
 - Installed coding-agent hooks make local Claude Code and Codex turns available just in time; read commands flush pending hook work automatically.
 - If retrieval is stale, empty, or unavailable, run `convos doctor` before syncing; it reports archive/schema/FTS health, ingestion and embedding backlog, hooks, and web access.
