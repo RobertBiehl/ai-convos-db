@@ -138,6 +138,12 @@ def test_query_migrates_old_db_before_embedding_check(tmp_path, monkeypatch):
     conn.close()
 
 
+def test_embedding_progress_keeps_stdout_clean(hybrid_db, monkeypatch, capsys):
+    conn = duckdb.connect(str(hybrid_db)); conn.execute("UPDATE messages SET embedding=NULL WHERE id='m1'"); conn.close()
+    monkeypatch.setattr(cli, "embed_texts", lambda ss, doc=False: [_emb(1) for _ in ss]); cli.embed_pending(ids=["m1"])
+    out = capsys.readouterr(); assert out.out == "" and "Embedding 1 messages" in out.err and "1/1" in out.err
+
+
 def test_read_commands_handle_locked_db(monkeypatch):
     """Read commands should print a friendly lock message instead of a traceback."""
     monkeypatch.setattr(cli, "get_db", lambda read_only=False: (_ for _ in ()).throw(ValueError("Database is locked by another convos process.")))
