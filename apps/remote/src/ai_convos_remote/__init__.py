@@ -81,11 +81,17 @@ def publish(cfg,state,ws,record,root=None,defer=False,known=None):
     project(core_path(root),state,value,ws,cfg["device"]["id"]); return value["id"]
 def membership_event(cfg,ws,epoch,members,root=None):
     state=connect(paths(root)[2]); publish(cfg,state,ws,{"kind":"workspace.membership","entity":f"membership:{epoch}","payload":{"epoch":epoch,"members":members}},root); upload(cfg,state,root); state.close()
+def _upload_batches(rows,limit=8*1024*1024):
+    batch,size=[],0
+    for row in rows:
+        if batch and (len(batch)==500 or size+len(row[3])>limit): yield batch; batch,size=[],0
+        batch.append(row); size+=len(row[3])
+    if batch: yield batch
 def upload(cfg,state,root=None):
     refresh(cfg,root)
     rows=state.execute("SELECT workspace,event,event_json,envelope FROM event_log WHERE direction='out' AND cursor=0 ORDER BY rowid").fetchall()
-    for start in range(0,len(rows),500):
-        batch=rows[start:start+500]; envs=[]
+    for batch in _upload_batches(rows):
+        envs=[]
         for ws,eid,raw,wrapped in batch:
             current=cfg["workspaces"][ws]["epoch"]; env=json.loads(wrapped)
             if env["epoch"]!=current: env=seal_event(json.loads(raw),ws,current,key(cfg,ws,current)); state.execute("UPDATE event_log SET envelope=? WHERE event=?",(json.dumps(env),eid))

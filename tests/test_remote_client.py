@@ -3,7 +3,7 @@ import json, os
 import duckdb
 import pytest
 from ai_convos.cli import init_schema
-from ai_convos_remote import (add_member, approve_devices, connect, create, fetch_lazy, grant_all, grant_selected, load, pull, publish, refresh, remove_device,
+from ai_convos_remote import (_upload_batches, add_member, approve_devices, connect, create, fetch_lazy, grant_all, grant_selected, load, pull, publish, refresh, remove_device,
                               setup_client, upload, workspace)
 from ai_convos_remote.projection import scan
 from ai_convos_remote_server import action, connect as server_connect
@@ -15,6 +15,10 @@ def transport(db):
 def conversation(title="shared",id="c"):
     cols=["id","source","title","created_at","updated_at","model","cwd","git_branch","project_id","metadata"]
     return {"kind":"conversation.record","entity":f"conversations:{id}","payload":{"table":"conversations","columns":cols,"row":[id,"codex",title,"2026-01-01","2026-01-01",None,None,None,None,"{}"]}}
+
+def test_upload_batches_bound_count_and_wire_size():
+    row=lambda size:(None,None,None,"x"*size)
+    assert [len(x) for x in _upload_batches([row(1)]*501,1000)]==[500,1] and [len(x) for x in _upload_batches([row(6)]*2,10)]==[1,1]
 
 
 def test_personal_recovery_multidevice_delivery_and_replay(tmp_path,monkeypatch):
