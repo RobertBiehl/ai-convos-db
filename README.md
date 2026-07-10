@@ -21,7 +21,7 @@ Local-first, searchable archive for ChatGPT, Claude, and Codex conversations. On
 ## Features
 
 - Fast full-text search with filters (source, days, role, thinking)
-- Hybrid semantic search (BM25 + embeddings + Qwen3 reranker) via `convos query`
+- Hybrid semantic search (BM25 + embeddings + Reciprocal Rank Fusion) via `convos query`
 - Fetch from ChatGPT and Claude using browser cookies
 - Import exports from ChatGPT, Claude, Claude Code, and Codex
 - Sync Claude Code + Codex sessions on a schedule
@@ -68,7 +68,7 @@ Search:
 convos search "vector database" -s chatgpt -d 30   # BM25 only
 convos search "reasoning" --thinking
 convos embed                                      # backfill embeddings, no web sync
-convos query "how do I store vectors in duckdb"    # hybrid: BM25 + embeddings + rerank
+convos query "how do I store vectors in duckdb"    # hybrid: BM25 + embeddings + RRF
 ```
 
 Both discovery commands return the strongest matching message from each
@@ -76,9 +76,8 @@ conversation, so `-n` controls the number of distinct conversation candidates.
 
 Semantic search is included by default. Run `convos embed` or `convos sync`
 after install to backfill embeddings with a progress bar; subsequent syncs only
-embed new/changed messages. Models used: `embeddinggemma-300m-qat-q8_0` for
-embeddings (768d) and `Qwen3-Reranker-0.6B` for reranking. Both are GGUF and
-run locally via llama.cpp.
+embed new/changed messages. The `embeddinggemma-300m-qat-q8_0` model produces
+768d embeddings and runs locally via llama.cpp.
 
 List and read (read-only DuckDB SQL; schema in `docs/database.md`):
 

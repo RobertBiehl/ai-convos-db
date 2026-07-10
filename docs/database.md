@@ -126,10 +126,7 @@ ORDER BY score DESC
 `convos query` combines FTS (BM25) with vector similarity over the
 `embedding` column using DuckDB's built-in `array_cosine_similarity`. Top-50
 from each source is fused with Reciprocal Rank Fusion (`SUM(1/(60+rank))`),
-the strongest message from each of the top 16 conversations is reranked with
-Qwen3-Reranker-0.6B, and final order
-is a position-tier blend of retrieval rank and reranker score: ranks 0-2 use
-0.75/0.25, ranks 3-9 use 0.6/0.4, the rest use 0.4/0.6.
+then the strongest message from each conversation is returned in fused order.
 Source/day/role filters are applied before candidate selection; injected skill
 and local-command wrapper messages are excluded from semantic candidates.
 
