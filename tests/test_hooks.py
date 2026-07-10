@@ -78,6 +78,12 @@ def test_sync_defers_fts_and_embeddings(hooks, tmp_path, monkeypatch):
     finally: signal.signal(signal.SIGINT, old)
     assert (data/"hook_fts_dirty").exists() and json.loads((data/"hook_embeddings_dirty").read_text()) == ["sync-m"]
 
+def test_sync_rechecks_chatgpt_head_without_timestamp(hooks, monkeypatch):
+    _, data = hooks; monkeypatch.setattr(cli, "STATE_PATH", data/"sync_state.json"); cli.atomic_json(cli.STATE_PATH, {"web":{"chatgpt":{"browser":"safari","head":"default:c1:None"}}}); called = []
+    monkeypatch.setattr(cli, "chatgpt_profiles", lambda _: [None]); monkeypatch.setattr(cli, "chatgpt_cookie_base", lambda *a: ({}, "https://chatgpt.com")); monkeypatch.setattr(cli, "chatgpt_headers", lambda *a, **k: {}); monkeypatch.setattr(cli, "fetch_json", lambda *a, **k: {"items":[{"id":"c1","update_time":None}]}); monkeypatch.setattr(cli, "fetch_chatgpt", lambda *a, **k: called.append(k) or cli.ParseResult()); monkeypatch.setattr(cli, "get_cookies", lambda *_: {})
+    cli.sync(False, 300, False, False, False, False)
+    assert called and called[0]["profiles"] == [None]
+
 def test_sync_sigint_exits_during_blocked_source(tmp_path):
     src, blocked, ready, done = tmp_path/"import.json", tmp_path/"blocked.json", tmp_path/"ready", tmp_path/"done"; src.write_text("[]"); blocked.write_text("[]")
     code = '''import hashlib,os,sys
@@ -87,6 +93,7 @@ class C:
  def close(self): pass
  def execute(self,*_): return self
  def fetchone(self): return [0]
+ def fetchall(self): return []
 cli.get_db=lambda *a,**k:C(); cli.init_schema=lambda _:None; cli.drain_hooks=lambda *a,**k:cli.HOOK_DIR.mkdir(parents=True,exist_ok=True) or 0; cli.counts_by_source=lambda _:{}
 cli.chatgpt_profiles=lambda _:[]; cli.get_cookies=lambda *_:{}
 def parsed(path):

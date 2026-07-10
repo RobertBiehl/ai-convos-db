@@ -315,13 +315,14 @@ def chatgpt_mapping(cid: str, mapping: dict) -> tuple[list, list, list]:
         attachs += att
     return msgs, tools, attachs
 
-def fetch_chatgpt(browser: str = "safari", limit: int = 0, profiles: list[str | None] | None = None) -> ParseResult:
+def fetch_chatgpt(browser: str = "safari", limit: int = 0, profiles: list[str | None] | None = None, known: dict | None = None) -> ParseResult:
     hosts = [("https://chatgpt.com", ["chatgpt.com"]),
              ("https://chat.openai.com", ["chat.openai.com", "openai.com"])]
     debug = os.environ.get("CONVOS_CHATGPT_DEBUG")
     ua = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15"
           if browser == "safari" else
           "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+    known = known or {}
 
     def fetch_with_profile(profile: str | None) -> ParseResult:
         cookies, base = chatgpt_cookie_base(browser, hosts, profile)
@@ -343,20 +344,20 @@ def fetch_chatgpt(browser: str = "safari", limit: int = 0, profiles: list[str | 
             items, keys = data.get("items", []), ",".join(data.keys())
             if debug: print(f"  chatgpt page offset={offset} items={len(items)} total={total} keys={keys}", flush=True)
             if not items: break
-            page = [it for it in items if it["id"] not in seen][: (limit - fetched) if limit > 0 else len(items)]
-            results = []; seen.update(it["id"] for it in page); batches = [page[i:i+4] for i in range(0, len(page), 4)]
-            for i, batch in enumerate(batches, 1):
-                try:
-                    with ThreadPoolExecutor(max_workers=len(batch)) as ex: results += ex.map(parse_item_raw, batch)
+            fresh = [it for it in items if it["id"] not in seen]; seen.update(it["id"] for it in fresh)
+            if not fresh: break
+            page = [it for it in fresh if (cid := gen_id("chatgpt", it["id"])) not in known or known[cid] is None or (updated := ts_any(it.get("update_time"))) is None or updated.timestamp() > known[cid]][: (limit - fetched) if limit > 0 else len(fresh)]
+            results = []
+            for i, item in enumerate(page, 1):
+                try: results.append(parse_item_raw(item))
                 except Exception as e: raise RuntimeError(f"detail fetch failed: {e}") from e
-                if i % 5 == 0 or i == len(batches): typer.echo(f"  chatgpt fetched {fetched+len(results)}{'/' + str(total) if total else ''}")
+                if i % 20 == 0 or i == len(page): typer.echo(f"  chatgpt details {fetched+i}")
+                if len(page) > 20: time.sleep(.25)
             r.convs += [x["conv"] for x in results]; r.msgs += [m for x in results for m in x["msgs"]]
             r.tools += [t for x in results for t in x["tools"]]; r.attachs += [a for x in results for a in x["attachs"]]
             fetched += len(results)
             offset += len(items)
-            if not page: break
             if limit > 0 and fetched >= limit: break
-            if total and fetched > total: total = None
         return r
     out, errs = ParseResult(), []
     for profile in profiles if profiles is not None else chatgpt_profiles(browser):
@@ -1003,7 +1004,7 @@ def sync(watch: bool = typer.Option(False, "-w"), interval: int = typer.Option(3
         if not items: return None
         item = items[0]
         return f"{item['uuid']}:{item.get('updated_at') or item.get('created_at')}"
-    def plan_web(name, fetcher, probe):
+    def plan_web(name, fetcher, probe, known=None):
         pref = web.get(name, {})
         forced = os.environ.get(f"CONVOS_{name.upper()}_BROWSER")
         order = [forced] if forced else [pref.get("browser")] + [b for b in ("safari", "chrome") if b != pref.get("browser")]
@@ -1011,12 +1012,12 @@ def sync(watch: bool = typer.Option(False, "-w"), interval: int = typer.Option(3
         for b in [x for x in order if x]:
             try:
                 head = probe(b); lu = head.split(":", 1)[1] if (name == "claude" and head and ":" in head) else None
-                if head is not None and head == pref.get("head") and not full:
+                if head is not None and head == pref.get("head") and not full and (name != "chatgpt" or ":None" not in head):
                     set_state("web", name, {"browser": b, "head": head, **({"last_updated": lu} if lu else {})}); return None
                 last = pref.get("last_updated")
                 since = ts_from_iso(last) if (name == "claude" and last and not full) else None
                 st = {"browser": b, "head": head, **({"last_updated": lu} if lu else {})}
-                func = (lambda b=b, since=since: fetcher(b, since=since)) if name == "claude" else (lambda b=b: fetcher(b, profiles=chatgpt_ok[b]))
+                func = (lambda b=b, since=since: fetcher(b, since=since)) if name == "claude" else (lambda b=b: fetcher(b, profiles=chatgpt_ok[b], known=known))
                 return dict(name=name, label=name.title(), source=name, func=func, state=("web", name, st))
             except Exception as e:
                 errors.append(f"{b}: {e}")
@@ -1030,7 +1031,7 @@ def sync(watch: bool = typer.Option(False, "-w"), interval: int = typer.Option(3
     def do_sync():
         nonlocal dirty
         t0 = time.perf_counter(); dirty, total, changed, jobs, newc, updc = False, [0]*5, set(), [], 0, 0
-        conn = get_db(read_only=True); cur = counts_by_source(conn); conn.close(); fmt = lambda v: f"{v[0]} convs, {v[1]} msgs, {v[2]} tools, {v[3]} attachs, {v[4]} edits"
+        conn = get_db(read_only=True); cur = counts_by_source(conn); known = {cid: ts.timestamp() if ts else None for cid, ts in conn.execute("SELECT id,updated_at FROM conversations WHERE source='chatgpt'").fetchall()}; conn.close(); fmt = lambda v: f"{v[0]} convs, {v[1]} msgs, {v[2]} tools, {v[3]} attachs, {v[4]} edits"
         start = lambda label, src=None: typer.echo(f"Syncing {label}" if not src else f"Syncing {label} ({fmt(cur.setdefault(src, [0]*5))})")
         if paths := [Path(p).expanduser() for p in os.environ.get("CONVOS_IMPORT_PATHS", "").split(",") if p.strip()]:
             start("imports")
@@ -1039,7 +1040,7 @@ def sync(watch: bool = typer.Option(False, "-w"), interval: int = typer.Option(3
             start("Claude Code", "claude-code"); jobs += [j for j in [plan_local("claude-code", p, parse_claude_code)] if j]
         if codex and (p := Path.home() / ".codex").exists():
             start("Codex", "codex"); jobs += [j for j in [plan_local("codex", p, parse_codex)] if j]
-        start("ChatGPT", "chatgpt"); jobs += [j for j in [plan_web("chatgpt", fetch_chatgpt, probe_chatgpt)] if j]
+        start("ChatGPT", "chatgpt"); jobs += [j for j in [plan_web("chatgpt", fetch_chatgpt, probe_chatgpt, {} if full else known)] if j]
         start("Claude", "claude"); jobs += [j for j in [plan_web("claude", fetch_claude, probe_claude)] if j]
         verbose and typer.echo(f"Planning took {time.perf_counter()-t0:.2f}s")
         if jobs:
