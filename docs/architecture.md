@@ -69,7 +69,7 @@ Web fetchers extract cookies from Safari or Chrome to authenticate with APIs. No
 
 ### FTS via DuckDB
 
-Full-text search uses DuckDB's FTS extension with BM25 scoring. The index covers `content` and `thinking` columns. Index is rebuilt after each sync.
+Full-text search uses DuckDB's FTS extension with BM25 scoring. The index covers `content` and `thinking` columns. Ingest marks it dirty and the next search rebuilds it.
 
 ### Hybrid Semantic Search (optional)
 
@@ -81,8 +81,8 @@ scale (tens of thousands of messages) this is fast enough that a vector index
 
 Pipeline: filtered BM25 top-50 ∪ cosine top-50 → Reciprocal Rank Fusion → one
 strongest message per conversation.
-The embedding model loads lazily, so users pay model startup/download cost only when using
-`convos query`, `convos embed`, or sync-time embedding.
+The embedding model loads lazily, so users pay model startup/download cost only
+when using `convos query` or `convos embed`.
 
 Literal `search` is conversation-first as well: BM25 ranks messages, then only
 the strongest matching message from each conversation consumes a result slot.

@@ -102,10 +102,11 @@ convos query "how do I store vectors in duckdb"    # hybrid: BM25 + embeddings +
 Both discovery commands return the strongest matching message from each
 conversation, so `-n` controls the number of distinct conversation candidates.
 
-Semantic search is included by default. Run `convos embed` or `convos sync`
-after install to backfill embeddings with a progress bar; subsequent syncs only
-embed new/changed messages. The `embeddinggemma-300m-qat-q8_0` model produces
-768d embeddings and runs locally via llama.cpp.
+Semantic search is included by default. Run `convos embed` after install to
+backfill embeddings with a progress bar. Hooks and `convos sync` queue new or
+changed messages; `convos query` embeds that queue just in time. The
+`embeddinggemma-300m-qat-q8_0` model produces 768d embeddings locally via
+llama.cpp.
 
 Read a known conversation using an ID prefix from search/query:
 

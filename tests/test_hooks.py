@@ -1,4 +1,4 @@
-import json
+import json, os, signal, subprocess, sys, time
 from pathlib import Path
 import duckdb, pytest
 from typer.testing import CliRunner
@@ -69,15 +69,54 @@ def test_hook_defers_fts_until_fresh_search(hooks):
     hits = json.loads(CliRunner().invoke(cli.app, ["search", "remember alpha", "-f", "json"]).output)
     assert hits[0]["content"] == "remember alpha" and not (data/"hook_fts_dirty").exists()
 
+def test_sync_defers_fts_and_embeddings(hooks, tmp_path, monkeypatch):
+    _, data = hooks; src = tmp_path/"import.json"; src.write_text("[]"); monkeypatch.setenv("CONVOS_IMPORT_PATHS", str(src)); monkeypatch.setattr(cli, "STATE_PATH", data/"sync_state.json")
+    result = cli.ParseResult(convs=[dict(id="sync-c", source="chatgpt", title="T", created_at=None, updated_at=None, model=None, cwd=None, git_branch=None, project_id=None, metadata="{}")], msgs=[dict(id="sync-m", conversation_id="sync-c", role="user", content="alpha", thinking=None, created_at=None, model=None, metadata="{}", parent_id=None)])
+    monkeypatch.setattr(cli, "parse_source", lambda _: result); monkeypatch.setattr(cli, "chatgpt_profiles", lambda _: []); monkeypatch.setattr(cli, "get_cookies", lambda *_: {})
+    fail = lambda *_: (_ for _ in ()).throw(AssertionError("foreground consolidation")); monkeypatch.setattr(cli, "flush_fts", fail); monkeypatch.setattr(cli, "embed_hook_pending", fail); old = signal.getsignal(signal.SIGINT)
+    try: cli.sync(False, 300, False, False, False, False); assert signal.getsignal(signal.SIGINT) == old
+    finally: signal.signal(signal.SIGINT, old)
+    assert (data/"hook_fts_dirty").exists() and json.loads((data/"hook_embeddings_dirty").read_text()) == ["sync-m"]
+
+def test_sync_sigint_exits_during_blocked_source(tmp_path):
+    src, blocked, ready, done = tmp_path/"import.json", tmp_path/"blocked.json", tmp_path/"ready", tmp_path/"done"; src.write_text("[]"); blocked.write_text("[]")
+    code = '''import hashlib,os,sys
+from pathlib import Path
+from ai_convos import cli
+class C:
+ def close(self): pass
+ def execute(self,*_): return self
+ def fetchone(self): return [0]
+cli.get_db=lambda *a,**k:C(); cli.init_schema=lambda _:None; cli.drain_hooks=lambda *a,**k:cli.HOOK_DIR.mkdir(parents=True,exist_ok=True) or 0; cli.counts_by_source=lambda _:{}
+cli.chatgpt_profiles=lambda _:[]; cli.get_cookies=lambda *_:{}
+def parsed(path):
+ if path.name=="blocked.json" and os.environ.get("BLOCK")!="0": Path(os.environ["READY"]).touch(); hashlib.pbkdf2_hmac("sha256",b"x",b"y",500_000_000)
+ return cli.ParseResult()
+def upsert(*_): Path(os.environ["DONE"]).touch(); return 0,0,0,0,0,0,0,{"m"}
+cli.parse_source=parsed; cli.upsert=upsert; sys.argv[1:]=["sync"]; cli.sync(False,300,False,False,False,False)'''
+    root = tmp_path/"archive"; (root/"data").mkdir(parents=True); (root/"data/sync_state.json").write_text('{"sentinel":1}'); env = {**os.environ, "CONVOS_PROJECT_ROOT":str(root), "CONVOS_IMPORT_PATHS":f"{src},{blocked}", "READY":str(ready), "DONE":str(done)}; p = subprocess.Popen([sys.executable, "-c", code], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        deadline = time.monotonic() + 5
+        while not (ready.exists() and done.exists()) and p.poll() is None and time.monotonic() < deadline: time.sleep(.02)
+        assert ready.exists() and done.exists(), f"sync sources did not start (exit={p.poll()})"; time.sleep(.1); p.send_signal(signal.SIGINT)
+        try: p.wait(timeout=2)
+        except subprocess.TimeoutExpired: p.kill(); p.wait(); pytest.fail("sync ignored Ctrl-C for more than 2 seconds")
+        assert p.returncode == -signal.SIGINT and json.loads((root/"data/sync_state.json").read_text()) == {"sentinel":1}
+        assert subprocess.run([sys.executable, "-c", code], env={**env, "BLOCK":"0"}, capture_output=True).returncode == 0
+        state = json.loads((root/"data/sync_state.json").read_text()); assert len(state["imports"]) == 2 and (root/"data/hook_fts_dirty").exists() and json.loads((root/"data/hook_embeddings_dirty").read_text()) == ["m"]
+    finally:
+        if p.poll() is None: p.kill(); p.wait()
+
 def test_fts_claim_preserves_new_work(hooks, monkeypatch):
     _, data = hooks; (data/"hook_inbox").mkdir(parents=True); (data/"hook_fts_dirty").touch(); conn = duckdb.connect(str(data/"convos.db")); cli.init_schema(conn); conn.close()
     monkeypatch.setattr(cli, "rebuild_fts_index", lambda _: (data/"hook_fts_dirty").touch()); assert cli.flush_fts()
     assert (data/"hook_fts_dirty").exists() and not list(data.glob(".hook_fts_dirty.*"))
 
-def test_failed_fts_claim_is_restored(hooks, monkeypatch):
+@pytest.mark.parametrize("error", [RuntimeError("index failed"), KeyboardInterrupt()])
+def test_failed_fts_claim_is_restored(hooks, monkeypatch, error):
     _, data = hooks; (data/"hook_inbox").mkdir(parents=True); (data/"hook_fts_dirty").touch()
-    monkeypatch.setattr(cli, "rebuild_fts_index", lambda _: (_ for _ in ()).throw(RuntimeError("index failed")))
-    with pytest.raises(RuntimeError, match="index failed"): cli.flush_fts()
+    monkeypatch.setattr(cli, "rebuild_fts_index", lambda _: (_ for _ in ()).throw(error))
+    with pytest.raises(type(error)): cli.flush_fts()
     assert (data/"hook_fts_dirty").exists() and not list(data.glob(".hook_fts_dirty.*"))
 
 def test_orphaned_fts_claim_is_retried(hooks, monkeypatch):
@@ -91,10 +130,11 @@ def test_embedding_claim_is_scoped_and_preserves_new_work(hooks, monkeypatch):
     monkeypatch.setattr(cli, "embed_pending", embed); cli.embed_hook_pending()
     assert seen == {"batch":32, "ids":["old"]} and json.loads((data/"hook_embeddings_dirty").read_text()) == ["new"]
 
-def test_failed_embedding_restores_claimed_ids(hooks, monkeypatch):
+@pytest.mark.parametrize("error", [RuntimeError("model failed"), KeyboardInterrupt()])
+def test_failed_embedding_restores_claimed_ids(hooks, monkeypatch, error):
     _, data = hooks; (data/"hook_inbox").mkdir(parents=True); cli.atomic_json(data/"hook_embeddings_dirty", ["old"])
-    monkeypatch.setattr(cli, "embed_pending", lambda *_: (_ for _ in ()).throw(RuntimeError("model failed")))
-    with pytest.raises(RuntimeError, match="model failed"): cli.embed_hook_pending()
+    monkeypatch.setattr(cli, "embed_pending", lambda *_: (_ for _ in ()).throw(error))
+    with pytest.raises(type(error)): cli.embed_hook_pending()
     assert json.loads((data/"hook_embeddings_dirty").read_text()) == ["old"]
 
 def test_init_still_installs_skills(hooks, monkeypatch):

@@ -145,11 +145,12 @@ Embeddings are produced by embeddinggemma-300M (768d) with the
 time. Truncation only — no chunking — at 1600 chars.
 
 Use `convos embed` to backfill missing embeddings without fetching from web
-APIs. `convos sync` also embeds new or changed messages after upsert. Embedding
-inference runs without a database lock; only each result batch update is locked.
+APIs. Hooks and `convos sync` queue new or changed messages for just-in-time
+embedding by `convos query`. Inference runs without a database lock; only each
+result batch update is locked.
 
 The `embedding` column is preserved across upserts when message `content`
-is unchanged, so sync only re-embeds new or edited messages.
+is unchanged, so only new or edited messages are queued again.
 
 ## ID Generation
 

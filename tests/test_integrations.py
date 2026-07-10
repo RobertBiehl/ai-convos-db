@@ -130,11 +130,42 @@ class TestChatGPTAPI:
         assert r.convs[0]["created_at"] == cli.ts_from_epoch(1709294400)
         assert r.convs[0]["updated_at"] == cli.ts_from_epoch(1709294500)
 
+    def test_fetch_chatgpt_rejects_partial_detail_failure(self, monkeypatch):
+        from ai_convos import cli
+        monkeypatch.setattr(cli, "chatgpt_profiles", lambda _: [None]); monkeypatch.setattr(cli, "chatgpt_cookie_base", lambda *a, **k: ({}, "https://chatgpt.com")); monkeypatch.setattr(cli, "chatgpt_headers", lambda *a, **k: {})
+        def fake(url, *a, **k):
+            if "/conversations?" in url: return {"items":[{"id":"ok"},{"id":"bad"}], "total":2}
+            if url.endswith("/bad"): raise TimeoutError("detail timeout")
+            return {"mapping":{}}
+        monkeypatch.setattr(cli, "fetch_json", fake)
+        with pytest.raises(ValueError, match="detail timeout"): cli.fetch_chatgpt("safari")
+
+    def test_fetch_chatgpt_skips_unrelated_chrome_profile(self, monkeypatch):
+        from ai_convos import cli
+        monkeypatch.setattr(cli, "chatgpt_profiles", lambda _: ["Good", "Unused"]); monkeypatch.setattr(cli, "chatgpt_cookie_base", lambda _, __, p: ({}, "https://chatgpt.com") if p == "Good" else (_ for _ in ()).throw(ValueError("no cookies"))); monkeypatch.setattr(cli, "chatgpt_headers", lambda *a, **k: {})
+        def fake(url, *a, **k):
+            if "offset=0" in url: return {"items":[{"id":"ok"}], "total":1}
+            if "/conversations?" in url: return {"items":[], "total":1}
+            return {"mapping":{}}
+        monkeypatch.setattr(cli, "fetch_json", fake)
+        assert [c["id"] for c in cli.fetch_chatgpt("chrome").convs] == [cli.gen_id("chatgpt", "ok")]
+
 
 # ---- Claude API Tests ----
 
 class TestClaudeAPI:
     """Tests for Claude.ai API structure."""
+
+    def test_fetch_claude_rejects_partial_detail_failure(self, monkeypatch):
+        from ai_convos import cli
+        monkeypatch.setattr(cli, "get_cookies", lambda *_: {"session":"x"})
+        def fake(url, *a, **k):
+            if url.endswith("/api/organizations"): return [{"uuid":"org"}]
+            if url.endswith("/chat_conversations"): return [{"uuid":"ok"}, {"uuid":"bad"}]
+            if url.endswith("/bad"): raise TimeoutError("detail timeout")
+            return {"chat_messages":[]}
+        monkeypatch.setattr(cli, "fetch_json", fake)
+        with pytest.raises(TimeoutError, match="detail timeout"): cli.fetch_claude("safari")
 
     @pytest.mark.integration
     def test_organizations_schema(self):
