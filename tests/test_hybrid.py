@@ -85,6 +85,13 @@ def test_search_returns_one_hit_per_conversation(hybrid_db):
     assert len(hits) == 1 and hits[0]["conversation_id"] == "c1"
 
 
+def test_search_structured_output_honors_context(hybrid_db):
+    conn = duckdb.connect(str(hybrid_db)); conn.execute("UPDATE messages SET thinking='reasoning detail' WHERE id='m1'"); cli.rebuild_fts_index(conn); conn.close()
+    r = CliRunner().invoke(cli.app, ["search", "cherry", "-c", "5", "-t", "-f", "json"]); hit = __import__("json").loads(r.output)[0]
+    assert hit["content"] == "apple..." and hit["thinking"] == "reaso..."
+    assert __import__("json").loads(CliRunner().invoke(cli.app, ["search", "cherry", "-c", "5", "-f", "json"]).output)[0]["thinking"] is None
+
+
 def test_query_filters_candidates_and_skips_injected_boilerplate(tmp_path, monkeypatch):
     db = tmp_path / "test.db"; monkeypatch.setattr(cli, "DB_PATH", db); monkeypatch.setattr(cli, "DATA_DIR", tmp_path)
     conn = duckdb.connect(str(db)); cli.init_schema(conn)
