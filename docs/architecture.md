@@ -81,6 +81,9 @@ message per conversation → Qwen3-Reranker top-16 → position-tier blend (rank
 Models load lazily, so users pay model startup/download cost only when using
 `convos query`, `convos embed`, or sync-time embedding.
 
+Literal `search` is conversation-first as well: BM25 ranks messages, then only
+the strongest matching message from each conversation consumes a result slot.
+
 The package depends on `llama-cpp-python` + `huggingface-hub`. Both models are
 GGUF, downloaded on first call and cached by huggingface-hub.
 

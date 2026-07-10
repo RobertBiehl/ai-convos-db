@@ -750,8 +750,9 @@ def _filt(source, days, role):
     if days: w.append("m.created_at > ?"); p.append(datetime.now() - timedelta(days=days))
     if role: w.append("m.role = ?"); p.append(role)
     return w, p
+def _clip(s, n): return (s or "")[:n] + ("..." if s and len(s) > n else "")
 def _fmt_hit(content, ts, role, title, src, cid, cwd, q, ctx, meta):
-    p = (content or "")[:ctx] + ("..." if content and len(content) > ctx else "")
+    p = _clip(content, ctx)
     for w in q.split(): p = re.sub(f"({re.escape(w)})", r"\033[1;33m\1\033[0m", p, flags=re.I)
     typer.echo(f"\n{'='*60}\n[{src}] {title or 'Untitled'}{f' @ {cwd}' if cwd else ''} ({cid[:8]})\n{role} @ {ts or '?'} ({meta})\n{'-'*40}\n{p}")
 
@@ -778,14 +779,15 @@ def search(query: str, source: Optional[str] = typer.Option(None, "-s"), days: O
     drain_hooks()
     if (conn := _fts_ro()) is None: return
     w, p = _filt(source, days, role)
-    results = conn.execute(f"""SELECT m.content, m.thinking, m.role, m.created_at, fts_main_messages.match_bm25(m.id, ?) as score, c.title, c.source, c.id, c.cwd
-        FROM messages m JOIN conversations c ON m.conversation_id = c.id WHERE score IS NOT NULL{' AND ' + ' AND '.join(w) if w else ''} ORDER BY score DESC LIMIT ?""", [query] + p + [limit]).fetchall()
+    results = conn.execute(f"""SELECT m.id, m.content, m.thinking, m.role, m.created_at, fts_main_messages.match_bm25(m.id, ?) as score, c.title, c.source, c.id, c.cwd
+        FROM messages m JOIN conversations c ON m.conversation_id = c.id WHERE score IS NOT NULL{' AND ' + ' AND '.join(w) if w else ''}
+        QUALIFY ROW_NUMBER() OVER (PARTITION BY c.id ORDER BY score DESC)=1 ORDER BY score DESC LIMIT ?""", [query] + p + [limit]).fetchall()
     conn.close()
-    if fmt != "text": emit([dict(role=r, content=content, thinking=think, created_at=ts, score=score, title=title, source=src, conversation_id=cid, cwd=cwd) for content, think, r, ts, score, title, src, cid, cwd in results], fmt); return
+    if fmt != "text": emit([dict(message_id=mid, role=r, content=_clip(content, context), thinking=_clip(think, context) if thinking and think else None, created_at=ts, score=score, title=title, source=src, conversation_id=cid, cwd=cwd) for mid, content, think, r, ts, score, title, src, cid, cwd in results], fmt); return
     if not results: typer.echo("No results"); return
-    for content, think, r, ts, score, title, src, cid, cwd in results:
+    for _, content, think, r, ts, score, title, src, cid, cwd in results:
         _fmt_hit(content, ts, r, title, src, cid, cwd, query, context, f"score: {score:.2f}")
-        if thinking and think: typer.echo(f"\n[THINKING]\n{think[:500]}{'...' if len(think)>500 else ''}")
+        if thinking and think: typer.echo(f"\n[THINKING]\n{_clip(think, context)}")
     typer.echo(f"\n{len(results)} results")
 
 @app.command("query")
