@@ -1,9 +1,9 @@
-import json, shutil, sqlite3, subprocess, time
+import json, plistlib, shutil, sqlite3, subprocess, time
 from pathlib import Path
 
 from typer.testing import CliRunner
 from ai_convos import cli
-from ai_convos_remote import edit_hooks, setup_client
+from ai_convos_remote import edit_hooks, enable, setup_client
 from ai_convos_remote_server import action, connect
 
 
@@ -15,6 +15,13 @@ def test_remote_hooks_are_private_fast_idempotent_and_removable(tmp_path,monkeyp
     for _ in range(30): start=time.perf_counter(); subprocess.run(cmd,shell=True,check=True); samples.append((time.perf_counter()-start)*1000)
     assert sorted(samples)[28] < 100 and (tmp_path/"archive/remote/wake").exists()
     edit_hooks(True); c=json.loads((claude/"settings.json").read_text()); assert c["hooks"]=={"Stop":[{"hooks":[{"type":"command","command":"keep"}]}]}
+
+
+def test_background_services_preserve_custom_root(tmp_path,monkeypatch):
+    home=tmp_path/"home"; root=tmp_path/"custom % archive"; calls=[]; binary=home/"custom % bin/convos"; monkeypatch.setenv("HOME",str(home)); monkeypatch.setenv("CLAUDE_CONFIG_DIR",str(home/"claude")); monkeypatch.setenv("CODEX_HOME",str(home/"codex")); monkeypatch.setattr("ai_convos_remote.service.subprocess.run",lambda *a,**k:calls.append(a[0])); monkeypatch.setattr("ai_convos_remote.service.shutil.which",lambda _:str(binary))
+    monkeypatch.setattr("ai_convos_remote.service.sys.platform","darwin"); enable(root/"remote"); plist=plistlib.loads((home/"Library/LaunchAgents/com.ai-convos.remote.plist").read_bytes()); hooks=json.loads((home/"codex/hooks.json").read_text()); command=hooks["hooks"]["Stop"][0]["hooks"][0]["command"]; assert plist["EnvironmentVariables"]=={"CONVOS_PROJECT_ROOT":str(root.resolve())} and plist["ProgramArguments"][0]==str(binary) and str(root.resolve()/"remote/wake") in command
+    monkeypatch.setattr("ai_convos_remote.service.sys.platform","linux"); enable(root/"remote"); path=home/".config/systemd/user/convos-remote.service"; unit=path.read_text(); assert f'Environment="CONVOS_PROJECT_ROOT={str(root.resolve()).replace("%","%%")}"' in unit and f'ExecStart="{str(binary).replace("%","%%")}"' in unit
+    enable(root/"remote",True); assert not path.exists() and calls[-1]==("systemctl","--user","daemon-reload")
 
 
 def test_server_backup_is_consistent_and_restorable(tmp_path):

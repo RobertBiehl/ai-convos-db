@@ -3,7 +3,7 @@ import json, subprocess
 import duckdb
 from ai_convos.cli import init_schema
 from ai_convos_remote.projection import connect, project, rebuild, scan, sequence
-from ai_convos_remote.protocol import event, identity
+from ai_convos_remote.protocol import event, identity, seal_history
 
 
 def git(path,*args): return subprocess.run(("git","-C",str(path),*args),check=True,capture_output=True).stdout.decode().strip()
@@ -27,6 +27,12 @@ def test_out_of_order_revisions_converge_and_replay_deduplicates(tmp_path):
     new=event(device,2,"conversation.record","conversations:c",{"table":"conversations","columns":cols,"row":["c","codex","new","2026-01-01","2026-01-02",None,None,None,None,"{}"]},[old["id"]],"2026-01-02T00:00:00Z")
     assert project(tmp_path/"db",state,new,"w","different") and not project(tmp_path/"db",state,old,"w","different") and not project(tmp_path/"db",state,new,"w","different")
     assert duckdb.connect(str(tmp_path/"db"),read_only=True).execute("SELECT title FROM conversations").fetchone()[0]=="new"
+
+
+def test_rebuild_unwraps_republished_history(tmp_path):
+    state=connect(tmp_path/"state.db"); source_device,admin,recipient=identity("source"),identity("admin"),identity("recipient"); cols=["id","source","title","created_at","updated_at","model","cwd","git_branch","project_id","metadata"]; inner=event(source_device,1,"conversation.record","conversations:c",{"table":"conversations","columns":cols,"row":["c","codex","granted","2026-01-01","2026-01-01",None,None,None,None,"{}"]}); entity="history:c"; outer=event(admin,1,"history.republish",entity,{"target":"recipient","sealed":seal_history(inner,[recipient],entity)})
+    state.execute("INSERT INTO event_log VALUES (?,?,?,?,?,?)",("team",outer["id"],1,"in",json.dumps(outer),None)); assert rebuild(tmp_path/"rebuilt.db",state,device=recipient)==1
+    assert duckdb.connect(str(tmp_path/"rebuilt.db"),read_only=True).execute("SELECT title FROM conversations").fetchone()[0]=="granted"
 
 
 def test_record_schema_is_fixed_and_same_origin_ids_from_authors_do_not_collide(tmp_path):

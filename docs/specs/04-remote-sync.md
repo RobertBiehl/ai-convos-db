@@ -42,13 +42,15 @@ provider transcripts -> local convos DuckDB -> event projector -> encrypted outb
 - Semantic search, embeddings, Git inspection, and graph queries execute only
   on authorized clients.
 
-Server compromise can disclose accounts, workspace membership, device public
-keys, event authors, epochs, timing, sizes, IP addresses, and access patterns.
-It must not disclose conversation text, tool data, paths, repository URLs,
-project names, embeddings, file contents, Git fingerprints, or workspace keys.
-The protocol does not hide ciphertext length or prevent denial of service,
-rollback, traffic analysis, endpoint compromise, or an authorized recipient
-from retaining plaintext.
+A database, backup, or passive relay compromise can disclose accounts,
+workspace membership, device public keys, event authors, epochs, timing, sizes,
+IP addresses, and access patterns. It does not disclose conversation text, tool
+data, paths, repository URLs, project names, embeddings, file contents, Git
+fingerprints, or workspace keys. An actively malicious relay can deny service,
+roll back state, or manipulate ACL and membership views before a later signed
+rotation; v1 does not provide a transparency log or MLS consensus. The protocol
+also does not hide ciphertext length or prevent traffic analysis, endpoint
+compromise, or an authorized recipient from retaining plaintext.
 
 ## Identities
 
@@ -83,6 +85,12 @@ protocol versions. The envelope header is AEAD associated data. It binds the
 protocol version, workspace, epoch, event id, author device, and device
 sequence. The decrypted event author and id must equal the header. The event
 signature must verify against the registered author key.
+
+Before sealing any key to a device, clients verify that the device certificate
+is signed by the root key committed to by its user ID and binds the device ID,
+Ed25519 key, and X25519 key. Team invitations use a user ID exchanged through
+an authenticated channel; relay-provided display-name lookup is not an
+authenticated identity-discovery mechanism.
 
 This profile provides authenticated encryption, authorship, tamper detection,
 and future-key exclusion after epoch rotation. It does not provide message
@@ -147,15 +155,16 @@ recovery key. Server login tokens authorize API access but cannot sign events or
 decrypt data. The user root signs device certificates. An existing device or a
 recovered user root can enroll another device.
 
-Workspace admins sign membership events. Every add or removal advances the
-epoch and creates key envelopes for every currently authorized device. Removed
-devices receive no new envelope and cannot decrypt future events. They retain
-all plaintext and old keys already obtained.
+Workspace admins sign membership events and key-control requests. Every add or
+removal advances the epoch and creates key envelopes for every currently
+authorized device. Removed devices receive no new envelope and cannot decrypt
+future events. They retain all plaintext and old keys already obtained.
 
 New members receive only the new epoch by default. Complete-history grant seals
 selected old epoch keys to their devices. Selected-history grant republishes
-chosen immutable events under the current epoch so unrelated old content and
-keys are not disclosed.
+chosen immutable events under the current epoch, with the event content key
+sealed only to the target member's authorized devices, so unrelated old content
+and keys are not disclosed to the server or other workspace members.
 
 The recovery bundle contains the user root private material and personal
 workspace keyring, encrypted by the recovery key and stored as an opaque server

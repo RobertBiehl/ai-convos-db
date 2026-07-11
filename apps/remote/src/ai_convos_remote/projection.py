@@ -6,7 +6,7 @@ from pathlib import Path
 import duckdb
 from ai_convos.cli import init_schema
 from .provenance import capture as capture_graph, connect as graph_connect, project as project_graph, query as graph_query
-from .protocol import digest
+from .protocol import digest, material_event
 
 STATE = """
 CREATE TABLE IF NOT EXISTS event_log(workspace TEXT,event TEXT PRIMARY KEY,cursor INT,direction TEXT,event_json TEXT,envelope TEXT);
@@ -124,7 +124,7 @@ def project_many(db_path,state,items,local_device=None):
     finally:
         if db: db.close()
     state.commit(); return len(items)
-def rebuild(db_path,state,local_device=None):
+def rebuild(db_path,state,local_device=None,device=None):
     path=Path(db_path); path.unlink(missing_ok=True); [state.execute(f"DELETE FROM {table}") for table in ("raw_events","repositories","files","file_versions","changesets","edits","changeset_repositories","checkpoints","checkpoint_changesets","assertions","gaps","boundaries","heads","imported_rows","attachment_chunks","attachment_blobs")]; rows=state.execute("SELECT workspace,event_json FROM event_log ORDER BY json_extract(event_json,'$.observed_at'),event").fetchall()
-    project_many(path,state,[(workspace,json.loads(raw)) for workspace,raw in rows]); return len(rows)
+    project_many(path,state,[(workspace,value) for workspace,raw in rows if (value:=material_event(json.loads(raw),device=device))]); return len(rows)
 def query(state,name,arg=None): return graph_query(state,name,arg)

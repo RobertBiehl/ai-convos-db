@@ -3,6 +3,7 @@ import argparse, base64, hashlib, json, os, secrets, sqlite3, time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
+from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 
 V=1
@@ -18,6 +19,7 @@ def verify_certificate(cert,root_public):
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS users(id TEXT PRIMARY KEY,name TEXT UNIQUE,root_public TEXT NOT NULL,recovery TEXT,created REAL);
 CREATE TABLE IF NOT EXISTS devices(id TEXT PRIMARY KEY,user_id TEXT NOT NULL,name TEXT,sign_public TEXT NOT NULL,box_public TEXT NOT NULL,token_hash TEXT UNIQUE NOT NULL,active INT NOT NULL DEFAULT 1,created REAL);
+CREATE TABLE IF NOT EXISTS device_certificates(device TEXT PRIMARY KEY,certificate TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS workspaces(id TEXT PRIMARY KEY,kind TEXT NOT NULL,epoch INT NOT NULL,created_by TEXT NOT NULL,created REAL);
 CREATE TABLE IF NOT EXISTS members(workspace TEXT,user_id TEXT,role TEXT,active INT,joined_epoch INT,history_from INT,PRIMARY KEY(workspace,user_id));
 CREATE TABLE IF NOT EXISTS key_envelopes(workspace TEXT,epoch INT,device TEXT,envelope TEXT,PRIMARY KEY(workspace,epoch,device));
@@ -41,6 +43,13 @@ def device_member(db,workspace,actor):
     result=member(db,workspace,actor["user_id"]); epoch=db.execute("SELECT epoch FROM workspaces WHERE id=?",(workspace,)).fetchone()[0]
     if db.execute("SELECT 1 FROM workspace_device_exclusions WHERE workspace=? AND device=?",(workspace,actor["id"])).fetchone() or not db.execute("SELECT 1 FROM key_envelopes WHERE workspace=? AND epoch=? AND device=?",(workspace,epoch,actor["id"])).fetchone(): raise PermissionError("device is not authorized for current workspace epoch")
     return result
+def verify_control(actor,req):
+    try: Ed25519PublicKey.from_public_bytes(unb64(actor["sign_public"])).verify(unb64(req["control_signature"]),canon({k:v for k,v in req.items() if k!="control_signature"}))
+    except (InvalidSignature,KeyError,TypeError,ValueError) as e: raise PermissionError("invalid control signature") from e
+def certify(db,actor,req):
+    root=db.execute("SELECT root_public FROM users WHERE id=?",(actor["user_id"],)).fetchone()[0]; body=verify_certificate(req["certificate"],root); target=db.execute("SELECT * FROM devices WHERE id=? AND user_id=?",(body["device"]["id"],actor["user_id"])).fetchone(); expected={k:target[k] for k in ("id","name","sign_public","box_public")} if target else None
+    if body["user"]!=actor["user_id"] or body["device"]!=expected: raise PermissionError("device certificate does not match account")
+    db.execute("INSERT OR REPLACE INTO device_certificates VALUES (?,?)",(body["device"]["id"],json.dumps(req["certificate"]))); db.commit(); return {"certified":body["device"]["id"]}
 def rows(db, sql, args=()): return [dict(r) for r in db.execute(sql, args).fetchall()]
 
 def register(db, req):
@@ -49,14 +58,15 @@ def register(db, req):
     old = db.execute("SELECT root_public FROM users WHERE id=?", (user,)).fetchone()
     if old and old[0] != root: raise PermissionError("user root mismatch")
     if not old: db.execute("INSERT INTO users VALUES (?,?,?,?,?)", (user,req["user_name"],root,json.dumps(req.get("recovery")),time.time()))
-    token = secrets.token_urlsafe(32); db.execute("INSERT INTO devices VALUES (?,?,?,?,?,?,?,?)", (dev["id"],user,dev["name"],dev["sign_public"],dev["box_public"],token_hash(token),1,time.time()))
+    token = secrets.token_urlsafe(32); db.execute("INSERT INTO devices VALUES (?,?,?,?,?,?,?,?)", (dev["id"],user,dev["name"],dev["sign_public"],dev["box_public"],token_hash(token),1,time.time())); db.execute("INSERT INTO device_certificates VALUES (?,?)",(dev["id"],json.dumps(cert)))
     db.commit(); return dict(user=user, device=dev["id"], token=token)
 
 def rotate(db, actor, req):
-    ws = req["workspace"]; member(db, ws, actor["user_id"], "admin"); current = db.execute("SELECT epoch FROM workspaces WHERE id=?", (ws,)).fetchone()[0]
-    if req["epoch"] != current + 1: raise ValueError(f"epoch must be {current + 1}")
+    ws = req["workspace"]; member(db, ws, actor["user_id"], "admin"); current = db.execute("SELECT epoch,kind FROM workspaces WHERE id=?", (ws,)).fetchone(); excluded={r[0] for r in db.execute("SELECT device FROM workspace_device_exclusions WHERE workspace=?",(ws,)).fetchall()}
+    if actor["id"] in excluded or (current["kind"]!="personal" and not db.execute("SELECT 1 FROM key_envelopes WHERE workspace=? AND epoch=? AND device=?",(ws,current["epoch"],actor["id"])).fetchone()): raise PermissionError("device is not authorized for current workspace epoch")
+    if req["epoch"] != current["epoch"] + 1: raise ValueError(f"epoch must be {current['epoch'] + 1}")
     wanted, envelopes = req["members"], req["envelopes"]; devices = rows(db, "SELECT * FROM devices WHERE active=1")
-    excluded={r[0] for r in db.execute("SELECT device FROM workspace_device_exclusions WHERE workspace=?",(ws,)).fetchall()}|set(req.get("deactivate_devices",[])); excluded-=set(req.get("activate_devices",[])); expected={d["id"] for d in devices if d["user_id"] in wanted and d["id"] not in excluded}
+    excluded|=set(req.get("deactivate_devices",[])); excluded-=set(req.get("activate_devices",[])); expected={d["id"] for d in devices if d["user_id"] in wanted and d["id"] not in excluded}
     if set(envelopes) != expected: raise ValueError("one key envelope required for every active member device")
     for old in rows(db, "SELECT user_id,joined_epoch,history_from FROM members WHERE workspace=?", (ws,)):
         if old["user_id"] not in wanted: db.execute("UPDATE members SET active=0 WHERE workspace=? AND user_id=?", (ws,old["user_id"]))
@@ -83,15 +93,17 @@ def action(db, req, token=None):
         if not row or not row[0]: raise ValueError("recovery bundle not found")
         return {"bundle":json.loads(row[0])}
     actor = auth(db, token)
+    if op == "certify": return certify(db,actor,req)
+    if op in ("create","rotate","grant_all","recovery"): verify_control(actor,req)
     if op == "create":
         ws, env = req["workspace"], req["envelope"]; db.execute("INSERT INTO workspaces VALUES (?,?,?,?,?)", (ws,req["kind"],1,actor["user_id"],time.time())); db.execute("INSERT INTO members VALUES (?,?,?,?,?,?)", (ws,actor["user_id"],"admin",1,1,1)); db.execute("INSERT INTO key_envelopes VALUES (?,?,?,?)", (ws,1,actor["id"],json.dumps(env))); db.commit(); return {"workspace":ws,"epoch":1}
     if op == "rotate": return rotate(db, actor, req)
     if op == "directory":
-        return {"users":rows(db, "SELECT id,name FROM users WHERE name=? OR id=?", (req["user"],req["user"])), "devices":rows(db, "SELECT id,user_id,name,sign_public,box_public FROM devices WHERE active=1 AND user_id IN (SELECT id FROM users WHERE name=? OR id=?)", (req["user"],req["user"]))}
+        return {"users":rows(db, "SELECT id,name,root_public FROM users WHERE name=? OR id=?", (req["user"],req["user"])), "devices":rows(db, "SELECT d.id,d.user_id,d.name,d.sign_public,d.box_public,c.certificate,u.root_public FROM devices d JOIN users u ON u.id=d.user_id LEFT JOIN device_certificates c ON c.device=d.id WHERE d.active=1 AND d.user_id IN (SELECT id FROM users WHERE name=? OR id=?)", (req["user"],req["user"]))}
     if op == "state":
         memberships = rows(db, "SELECT w.id,w.kind,w.epoch,m.role,m.joined_epoch,m.history_from FROM workspaces w JOIN members m ON w.id=m.workspace WHERE m.user_id=? AND m.active=1", (actor["user_id"],))
         for w in memberships:
-            w["keys"] = rows(db, "SELECT epoch,envelope FROM key_envelopes WHERE workspace=? AND device=? ORDER BY epoch", (w["id"],actor["id"])); w["devices"] = rows(db, "SELECT DISTINCT d.id,d.user_id,d.name,d.sign_public,d.box_public,d.active,NOT EXISTS(SELECT 1 FROM workspace_device_exclusions x WHERE x.workspace=? AND x.device=d.id) allowed FROM devices d JOIN members m ON d.user_id=m.user_id WHERE m.workspace=?", (w["id"],w["id"])); w["members"] = rows(db,"SELECT user_id,role,active,joined_epoch,history_from FROM members WHERE workspace=?",(w["id"],)); w["device_authorized"]=bool(db.execute("SELECT 1 FROM key_envelopes WHERE workspace=? AND epoch=? AND device=?",(w["id"],w["epoch"],actor["id"])).fetchone()) and not bool(db.execute("SELECT 1 FROM workspace_device_exclusions WHERE workspace=? AND device=?",(w["id"],actor["id"])).fetchone())
+            w["keys"] = rows(db, "SELECT epoch,envelope FROM key_envelopes WHERE workspace=? AND device=? ORDER BY epoch", (w["id"],actor["id"])); w["devices"] = rows(db, "SELECT DISTINCT d.id,d.user_id,d.name,d.sign_public,d.box_public,d.active,c.certificate,u.root_public,NOT EXISTS(SELECT 1 FROM workspace_device_exclusions x WHERE x.workspace=? AND x.device=d.id) allowed,EXISTS(SELECT 1 FROM key_envelopes k WHERE k.workspace=? AND k.epoch=? AND k.device=d.id) authorized FROM devices d JOIN users u ON u.id=d.user_id LEFT JOIN device_certificates c ON c.device=d.id JOIN members m ON d.user_id=m.user_id WHERE m.workspace=?", (w["id"],w["id"],w["epoch"],w["id"])); w["members"] = rows(db,"SELECT user_id,role,active,joined_epoch,history_from FROM members WHERE workspace=?",(w["id"],)); w["device_authorized"]=bool(db.execute("SELECT 1 FROM key_envelopes WHERE workspace=? AND epoch=? AND device=?",(w["id"],w["epoch"],actor["id"])).fetchone()) and not bool(db.execute("SELECT 1 FROM workspace_device_exclusions WHERE workspace=? AND device=?",(w["id"],actor["id"])).fetchone())
         return {"user":actor["user_id"],"device":actor["id"],"workspaces":memberships}
     if op == "upload":
         result=store_event(db,actor,req["envelope"]); db.commit(); return result
@@ -106,7 +118,13 @@ def action(db, req, token=None):
         if not row: raise ValueError("event not found")
         return {"envelope":json.loads(row[0])}
     if op == "grant_all":
-        member(db,req["workspace"],actor["user_id"],"admin"); db.execute("UPDATE members SET history_from=1 WHERE workspace=? AND user_id=?", (req["workspace"],req["user"])); [db.execute("INSERT OR REPLACE INTO key_envelopes VALUES (?,?,?,?)", (req["workspace"],int(epoch),dev,json.dumps(env))) for epoch,values in req["envelopes"].items() for dev,env in values.items()]; db.commit(); return {"granted":"all"}
+        if device_member(db,req["workspace"],actor)["role"]!="admin": raise PermissionError("workspace access denied")
+        member(db,req["workspace"],req["user"]); current=db.execute("SELECT epoch FROM workspaces WHERE id=?",(req["workspace"],)).fetchone()[0]; expected={r[0] for r in db.execute("SELECT id FROM devices WHERE user_id=? AND active=1 AND NOT EXISTS(SELECT 1 FROM workspace_device_exclusions WHERE workspace=? AND device=devices.id) AND EXISTS(SELECT 1 FROM key_envelopes WHERE workspace=? AND epoch=? AND device=devices.id)",(req["user"],req["workspace"],req["workspace"],current)).fetchall()}; epochs={int(epoch) for epoch in req["envelopes"]}
+        if len(epochs)!=len(req["envelopes"]) or any(not 1<=epoch<=current for epoch in epochs): raise ValueError("history grant epoch is outside the workspace history")
+        if any(set(values)!=expected for values in req["envelopes"].values()): raise ValueError("one key envelope required for every authorized target device")
+        existing={(r[0],r[1]) for r in db.execute("SELECT epoch,device FROM key_envelopes WHERE workspace=?",(req["workspace"],)).fetchall()}; provided={(int(epoch),dev) for epoch,values in req["envelopes"].items() for dev in values}; needed={(epoch,dev) for epoch in range(1,current+1) for dev in expected}
+        if not expected or not needed<=existing|provided: raise ValueError("history grant does not cover every workspace epoch")
+        db.execute("UPDATE members SET history_from=1 WHERE workspace=? AND user_id=?", (req["workspace"],req["user"])); [db.execute("INSERT OR REPLACE INTO key_envelopes VALUES (?,?,?,?)", (req["workspace"],int(epoch),dev,json.dumps(env))) for epoch,values in req["envelopes"].items() for dev,env in values.items()]; db.commit(); return {"granted":"all"}
     if op == "recovery":
         db.execute("UPDATE users SET recovery=? WHERE id=?", (json.dumps(req["bundle"]),actor["user_id"])); db.commit(); return {"updated":True}
     raise ValueError(f"unknown operation {op}")

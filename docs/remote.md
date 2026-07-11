@@ -16,6 +16,10 @@ attachments, or workspace keys. Search and graph queries remain local.
 This is a security-sensitive preview. It uses established primitives through
 `cryptography` and has protocol/acceptance tests, but has not received the
 independent review required before calling it production-grade encryption.
+Payloads and keys remain opaque to a passive relay or database compromise.
+Version 1 does not provide a transparency log or MLS consensus, so an actively
+malicious relay can still manipulate availability and membership views before a
+later client-signed rotation.
 
 ## Install from this repository
 
@@ -81,8 +85,9 @@ convos doctor
 ```
 
 `setup` creates the user root, device identity, personal workspace, epoch key,
-and recovery key. Store the printed recovery key offline. Personal policy is
-always `all`: no path or repository allowlist is required.
+and recovery key. Store the printed recovery key offline and share the printed
+user ID through an authenticated channel before joining a team. Personal policy
+is always `all`: no path or repository allowlist is required.
 
 On another computer:
 
@@ -93,10 +98,10 @@ convos remote enable
 
 The CLI prompts for the recovery key without placing it in shell history or the
 process list. Recovery enrolls a new independently signed device, restores the
-complete personal history, and rotates every workspace where the user is an
-administrator. It never copies a DuckDB file. Team keys are deliberately not in
-the recovery bundle: a new team device remains pending until a workspace admin
-runs `convos remote approve-devices WORKSPACE`.
+complete personal history, and rotates the personal workspace. It never copies
+a DuckDB file. Team keys are deliberately not in the recovery bundle: a new
+team device remains pending until a workspace admin runs
+`convos remote approve-devices WORKSPACE`.
 
 `enable` adds lightweight Claude Code and Codex hooks and installs a persistent
 user service: launchd on macOS and systemd on Linux. Hooks only touch a wake
@@ -111,11 +116,16 @@ Users create their own account before an administrator adds them:
 # New team member, on one of their devices
 convos remote setup https://convos.example.com alice --device laptop
 
-# Administrator
+# Administrator; use Alice's out-of-band user ID, not a directory name
 convos remote workspace backend
-convos remote invite backend alice
+convos remote invite backend ALICE_USER_ID
 convos remote link ~/src/backend backend
 ```
+
+Name lookup is a convenience for a trusted relay. An out-of-band user ID binds
+the invitation to the intended root key even if the relay directory is later
+compromised. Before wrapping any workspace or history key, clients verify each
+device's user-root-signed certificate and its signing and encryption keys.
 
 Linking a Git checkout stores its checkout root only on that device. Encrypted
 root-commit and remote evidence identifies other clones. A linked non-Git path
@@ -137,11 +147,12 @@ convos remote approve-devices backend
 ```
 
 New members receive no old events or keys by default. `grant-selected`
-republishes chosen signed evidence under the current epoch. `grant-all` wraps
-old epoch keys to the member's devices and resets their history boundary.
-User or device removal rotates the epoch. Device removal is workspace-specific,
-so it does not disable the device's personal workspace or unrelated teams. It
-cannot erase plaintext or keys already obtained.
+republishes chosen signed evidence with its content key wrapped only to the
+member's authorized devices. `grant-all` wraps old epoch keys to those devices
+and resets their history boundary. User or device removal rotates the epoch.
+Device removal is workspace-specific, so it does not disable the device's
+personal workspace or unrelated teams. It cannot erase plaintext or keys
+already obtained.
 
 ## Daily operation
 
@@ -154,9 +165,10 @@ convos remote fetch                 # materialize deferred large events
 convos remote sync                  # explicit repair/backfill only
 ```
 
-The worker writes errors to `~/.convos/remote/last_error`. Queries never wait
-for the server. `doctor` reports connectivity, identity, workspaces, epochs,
-pending uploads, deferred events, and last successful synchronization.
+The worker writes errors to `<root>/remote/last_error` (by default,
+`~/.convos/remote/last_error`). Queries never wait for the server. `doctor`
+reports connectivity, identity, workspaces, epochs, pending uploads, deferred
+events, and last successful synchronization.
 
 ## Backup and restore
 
@@ -179,7 +191,8 @@ of every enrolled device and the recovery key is permanent data loss.
 
 ## Local files
 
-Remote client state lives under `~/.convos/remote/`:
+Remote client state lives under `<root>/remote/` (by default,
+`~/.convos/remote/`):
 
 - `config.json`: mode `0600`, device private keys, token, encrypted-workspace
   keyring, and local workspace labels

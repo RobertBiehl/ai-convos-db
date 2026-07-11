@@ -1,7 +1,6 @@
 """Client-side enrollment, E2EE keyring, automatic sync, membership, and local queries."""
 import json, os, time, urllib.error, urllib.parse, urllib.request
-from pathlib import Path
-from typing import Optional
+from pathlib import Path; from typing import Optional
 
 import typer
 _pending=[]
@@ -9,8 +8,8 @@ def register(app): _pending.append(app) if "remote" not in globals() else app.ad
 from ai_convos.cli import DB_PATH, PROJECT_ROOT, drain_hooks, get_db
 from .provenance import repository
 from .projection import connect, project, project_many, query as graph_query, rebuild as rebuild_projection, scan, sequence
-from .protocol import (b64, certificate, digest, event, identity, open_event, open_key, recover,
-                       recovery_bundle, seal_event, seal_key, unb64)
+from .protocol import (b64, certificate, digest, event, identity, material_event, open_event, open_key, public, public_id, recover,
+                       recovery_bundle, seal_event, seal_history, seal_key, sign_control, signer, unb64, verify_certificate)
 from .service import edit_hooks, enable
 
 remote=typer.Typer(help="End-to-end encrypted personal and team synchronization")
@@ -23,9 +22,7 @@ def load(root=None):
     return json.loads(path.read_text())
 def save(cfg,root=None):
     base,path,_=paths(root); base.mkdir(parents=True,exist_ok=True); os.chmod(base,0o700); tmp=path.with_name(f".{path.name}.{os.getpid()}"); tmp.write_text(json.dumps(cfg)); os.chmod(tmp,0o600); os.replace(tmp,path)
-def safe_url(url):
-    parsed=urllib.parse.urlparse(url)
-    if parsed.scheme!="https" and parsed.hostname not in ("127.0.0.1","localhost","::1") and os.environ.get("CONVOS_REMOTE_INSECURE")!="1": raise ValueError("Remote URL must use HTTPS (set CONVOS_REMOTE_INSECURE=1 only on a trusted test network)")
+def safe_url(url): parsed=urllib.parse.urlparse(url); parsed.scheme=="https" or parsed.hostname in ("127.0.0.1","localhost","::1") or os.environ.get("CONVOS_REMOTE_INSECURE")=="1" or (_ for _ in ()).throw(ValueError("Remote URL must use HTTPS (set CONVOS_REMOTE_INSECURE=1 only on a trusted test network)"))
 def request(cfg,body,auth=True):
     safe_url(cfg["url"])
     headers={"Content-Type":"application/json"};
@@ -39,20 +36,24 @@ def workspace(cfg,value):
     if len(hits)!=1: raise ValueError(f"Workspace must match exactly one of: {', '.join(v['name'] for v in cfg['workspaces'].values())}")
     return hits[0]
 def key(cfg,ws,epoch): return unb64(cfg["keys"][f"{ws}:{epoch}"])
+def trusted(devices):
+    for d in devices: d["certificate"] or (_ for _ in ()).throw(ValueError("device certificate missing")); body=verify_certificate(json.loads(d["certificate"]),d["root_public"]); signer({d["id"]:d},d["id"]); (public_id(d["root_public"])==d["user_id"] and body["user"]==d["user_id"] and body["device"]==public(d)) or (_ for _ in ()).throw(ValueError("device certificate mismatch"))
+    return devices
+def directory_user(found,user): field="id" if len(user)==32 and all(c in "0123456789abcdef" for c in user) else "name"; values=[v for v in found["users"] if v[field]==user]; return values[0] if len(values)==1 and public_id(values[0]["root_public"])==values[0]["id"] else (_ for _ in ()).throw(ValueError("directory user mismatch"))
 def update_recovery(cfg,root=None):
-    personal={ws for ws,v in cfg["workspaces"].items() if v["kind"]=="personal"}; keys={name:value for name,value in cfg["keys"].items() if name.rsplit(":",1)[0] in personal}; _,bundle=recovery_bundle({"root":cfg["root"],"keys":keys,"workspaces":cfg["workspaces"]},unb64(cfg["recovery"])); request(cfg,{"op":"recovery","bundle":bundle}); save(cfg,root)
+    personal={ws for ws,v in cfg["workspaces"].items() if v["kind"]=="personal"}; keys={name:value for name,value in cfg["keys"].items() if name.rsplit(":",1)[0] in personal}; _,bundle=recovery_bundle({"root":cfg["root"],"keys":keys,"workspaces":cfg["workspaces"]},unb64(cfg["recovery"])); request(cfg,sign_control(cfg["device"],{"op":"recovery","bundle":bundle})); save(cfg,root)
 def refresh(cfg,root=None):
-    state=request(cfg,{"op":"state"}); cfg["server_state"]=state; changed=False
+    state=request(cfg,{"op":"state"}); missing={d["id"]:d for w in state["workspaces"] for d in w["devices"] if d["user_id"]==cfg["user"] and not d["certificate"]}; [request(cfg,{"op":"certify","certificate":certificate(cfg["root"],cfg["user"],d)}) for d in missing.values()]; state=request(cfg,{"op":"state"}) if missing else state; cfg["server_state"]=state; changed=False
     for ws in state["workspaces"]:
         cfg["workspaces"].setdefault(ws["id"],{"name":ws["id"][:8],"kind":ws["kind"],"epoch":ws["epoch"]}); cfg["workspaces"][ws["id"]]["epoch"]=ws["epoch"]
         for wrapped in ws["keys"]:
             name=f"{ws['id']}:{wrapped['epoch']}"
-            if name not in cfg["keys"]: cfg["keys"][name]=b64(open_key(json.loads(wrapped["envelope"]),cfg["device"]["box_private"])); changed=True
+            if name not in cfg["keys"]: cfg["keys"][name]=b64(open_key(json.loads(wrapped["envelope"]),cfg["device"]["box_private"],f"workspace:{ws['id']}:epoch:{wrapped['epoch']}")); changed=True
     save(cfg,root)
     if changed: update_recovery(cfg,root)
     return state
 def create(cfg,name,kind="team",root=None):
-    ws,key_=digest(os.urandom(32))[:32],os.urandom(32); env=seal_key(key_,cfg["device"]["box_public"],f"workspace:{ws}:epoch:1"); request(cfg,{"op":"create","workspace":ws,"kind":kind,"envelope":env}); cfg["workspaces"][ws]={"name":name,"kind":kind,"epoch":1}; cfg["keys"][f"{ws}:1"]=b64(key_); update_recovery(cfg,root); membership_event(cfg,ws,1,{cfg["user"]:"admin"},root); return ws
+    ws,key_=digest(os.urandom(32))[:32],os.urandom(32); env=seal_key(key_,cfg["device"]["box_public"],f"workspace:{ws}:epoch:1"); request(cfg,sign_control(cfg["device"],{"op":"create","workspace":ws,"kind":kind,"envelope":env})); cfg["workspaces"][ws]={"name":name,"kind":kind,"epoch":1}; cfg["keys"][f"{ws}:1"]=b64(key_); update_recovery(cfg,root); membership_event(cfg,ws,1,{cfg["user"]:"admin"},root); return ws
 def setup_client(url,user,device="computer",recovery=None,root=None):
     if recovery:
         bundle=request({"url":url},{"op":"recovery_fetch","user":user},False)["bundle"]; recovered=recover(bundle,recovery); root_id=recovered["root"]; keys,workspaces=recovered["keys"],recovered["workspaces"]
@@ -64,13 +65,13 @@ def setup_client(url,user,device="computer",recovery=None,root=None):
     if not workspaces: create(cfg,"Personal","personal",root)
     else:
         state=refresh(cfg,root)
-        for ws in [w for w in state["workspaces"] if w["role"]=="admin"]:
+        for ws in [w for w in state["workspaces"] if w["role"]=="admin" and w["kind"]=="personal"]:
             rotate(cfg,ws["id"],{m["user_id"]:m["role"] for m in ws["members"] if m["active"]},[d for d in ws["devices"] if d["active"] and d.get("allowed",1)],root=root)
             if ws["kind"]=="personal": grant_all(cfg,ws["id"],uid,root)
     return cfg,recovery
 def rotate(cfg,ws,members,devices,deactivate=(),root=None):
-    state=refresh(cfg,root); current=next(w for w in state["workspaces"] if w["id"]==ws); epoch=current["epoch"]+1; new=os.urandom(32); envs={d["id"]:seal_key(new,d["box_public"],f"workspace:{ws}:epoch:{epoch}") for d in devices if d["user_id"] in members and d.get("active",1) and d.get("allowed",1)}
-    request(cfg,{"op":"rotate","workspace":ws,"epoch":epoch,"members":members,"envelopes":envs,"deactivate_devices":list(deactivate)}); cfg["keys"][f"{ws}:{epoch}"]=b64(new); cfg["workspaces"][ws]["epoch"]=epoch; update_recovery(cfg,root); membership_event(cfg,ws,epoch,members,root); return epoch
+    state=refresh(cfg,root); current=next(w for w in state["workspaces"] if w["id"]==ws); epoch=current["epoch"]+1; new=os.urandom(32); devices=trusted(devices); envs={d["id"]:seal_key(new,d["box_public"],f"workspace:{ws}:epoch:{epoch}") for d in devices if d["user_id"] in members and d.get("active",1) and d.get("allowed",1)}
+    request(cfg,sign_control(cfg["device"],{"op":"rotate","workspace":ws,"epoch":epoch,"members":members,"envelopes":envs,"deactivate_devices":list(deactivate)})); cfg["keys"][f"{ws}:{epoch}"]=b64(new); cfg["workspaces"][ws]["epoch"]=epoch; update_recovery(cfg,root); membership_event(cfg,ws,epoch,members,root); return epoch
 def publish(cfg,state,ws,record,root=None,defer=False,known=None):
     revision=digest(record["payload"]); old=(record["entity"],revision) in known if known is not None else state.execute("SELECT event FROM published WHERE workspace=? AND entity=? AND revision=?",(ws,record["entity"],revision)).fetchone()
     if old: return old[0] if known is None else None
@@ -107,15 +108,17 @@ def pull(cfg,state,root=None):
         for item in result["events"]:
             if item.get("lazy"):
                 state.execute("INSERT OR IGNORE INTO lazy_events VALUES (?,?,?,?)",(ws["id"],item["event"],item["cursor"],item["size"])); after=max(after,item["cursor"]); continue
-            env=item["envelope"]; value=open_event(env,key(cfg,ws["id"],env["epoch"]),devices[env["author"]]["sign_public"]); sequence(state,ws["id"],value); state.execute("INSERT OR IGNORE INTO event_log VALUES (?,?,?,?,?,NULL)",(ws["id"],value["id"],item["cursor"],"in",json.dumps(value)))
-            incoming.append((ws["id"],value["payload"]["event"] if value["kind"]=="history.republish" else value))
+            env=item["envelope"]; value=open_event(env,key(cfg,ws["id"],env["epoch"]),signer(devices,env["author"])); material=material_event(value,devices,cfg["device"]); sequence(state,ws["id"],value); state.execute("INSERT OR IGNORE INTO event_log VALUES (?,?,?,?,?,NULL)",(ws["id"],value["id"],item["cursor"],"in",json.dumps(value)))
+            if material: incoming.append((ws["id"],material))
             after=max(after,item["cursor"])
         project_many(core_path(root),state,incoming,cfg["device"]["id"])
         state.execute("INSERT OR REPLACE INTO cursors VALUES (?,?)",(ws["id"],after)); state.execute("INSERT OR REPLACE INTO meta VALUES (?,?)",(f"history_from:{ws['id']}",str(ws["history_from"]))); state.commit()
 def fetch_lazy(cfg,state,event_id=None,root=None):
     server=refresh(cfg,root); devices={d["id"]:d for ws in server["workspaces"] for d in ws["devices"]}; sql="SELECT workspace,event,cursor FROM lazy_events"+(" WHERE event=?" if event_id else ""); rows=state.execute(sql,(event_id,) if event_id else ()).fetchall()
     for ws,eid,cursor in rows:
-        env=request(cfg,{"op":"fetch","workspace":ws,"event":eid})["envelope"]; value=open_event(env,key(cfg,ws,env["epoch"]),devices[env["author"]]["sign_public"]); sequence(state,ws,value); state.execute("INSERT OR IGNORE INTO event_log VALUES (?,?,?,?,?,NULL)",(ws,eid,cursor,"in",json.dumps(value))); project(core_path(root),state,value["payload"]["event"] if value["kind"]=="history.republish" else value,ws,cfg["device"]["id"]); state.execute("DELETE FROM lazy_events WHERE event=?",(eid,))
+        env=request(cfg,{"op":"fetch","workspace":ws,"event":eid})["envelope"]
+        if (env["workspace"],env["event"])!=(ws,eid): raise ValueError("lazy event response mismatch")
+        value=open_event(env,key(cfg,ws,env["epoch"]),signer(devices,env["author"])); material=material_event(value,devices,cfg["device"]); sequence(state,ws,value); state.execute("INSERT OR IGNORE INTO event_log VALUES (?,?,?,?,?,NULL)",(ws,eid,cursor,"in",json.dumps(value))); material and project(core_path(root),state,material,ws,cfg["device"]["id"]); state.execute("DELETE FROM lazy_events WHERE event=?",(eid,))
     state.commit(); return len(rows)
 def sync_once(root=None,force=False):
     cfg=load(root); _,_,state_path=paths(root); state=connect(state_path); drain_hooks(); upload(cfg,state,root); core=get_db(read_only=True)
@@ -131,26 +134,27 @@ def sync_once(root=None,force=False):
 def add_member(cfg,ws,user,remove=False,root=None):
     state=refresh(cfg,root); w=next(x for x in state["workspaces"] if x["id"]==ws); members={m["user_id"]:m["role"] for m in w["members"] if m["active"]}; devices=[d for d in w["devices"] if d["active"] and d.get("allowed",1)]
     if remove:
-        found=request(cfg,{"op":"directory","user":user}); target=found["users"][0] if found["users"] else {"id":user}; members.pop(target["id"],None)
+        found=request(cfg,{"op":"directory","user":user}); target=directory_user(found,user) if found["users"] else {"id":user}; members.pop(target["id"],None)
     else:
-        found=request(cfg,{"op":"directory","user":user}); target=found["users"][0]; members[target["id"]]="member"; devices+=found["devices"]
-    return rotate(cfg,ws,members,{d["id"]:d for d in devices}.values(),root=root)
+        found=request(cfg,{"op":"directory","user":user}); trusted(found["devices"]); target=directory_user(found,user); members[target["id"]]="member"; devices+=found["devices"]
+    return rotate(cfg,ws,members,[d for d in {d["id"]:d for d in devices}.values() if d["user_id"] in members],root=root)
 def grant_all(cfg,ws,user,root=None):
-    found=request(cfg,{"op":"directory","user":user}); target=found["users"][0]; devices=found["devices"]; envelopes={}
+    found=request(cfg,{"op":"directory","user":user}); target=directory_user(found,user); devices=trusted([d for w in refresh(cfg,root)["workspaces"] if w["id"]==ws for d in w["devices"] if d["user_id"]==target["id"] and d["active"] and d["allowed"] and d["authorized"]]); envelopes={}
     for name,value in cfg["keys"].items():
         if name.startswith(ws+":"):
             epoch=int(name.rsplit(":",1)[1]); envelopes[str(epoch)]={d["id"]:seal_key(unb64(value),d["box_public"],f"workspace:{ws}:epoch:{epoch}") for d in devices}
-    request(cfg,{"op":"grant_all","workspace":ws,"user":target["id"],"envelopes":envelopes}); return len(envelopes)
+    request(cfg,sign_control(cfg["device"],{"op":"grant_all","workspace":ws,"user":target["id"],"envelopes":envelopes})); return len(envelopes)
 def grant_selected(cfg,state,ws,user,event_ids,root=None):
-    found=request(cfg,{"op":"directory","user":user}); target=found["users"][0]["id"]; rows=state.execute(f"SELECT event,event_json FROM event_log WHERE event IN ({','.join('?'*len(event_ids))})",tuple(event_ids)).fetchall()
-    [publish(cfg,state,ws,{"kind":"history.republish","entity":f"history:{target}:{eid}","payload":{"event":json.loads(raw)}} ,root) for eid,raw in rows]; upload(cfg,state,root); return len(rows)
+    found=request(cfg,{"op":"directory","user":user}); target=directory_user(found,user); devices=trusted([d for w in refresh(cfg,root)["workspaces"] if w["id"]==ws for d in w["devices"] if d["user_id"]==target["id"] and d["active"] and d["allowed"] and d["authorized"]]); rows=state.execute(f"SELECT event,event_json FROM event_log WHERE workspace=? AND event IN ({','.join('?'*len(event_ids))})",(ws,*event_ids)).fetchall()
+    if not devices: raise ValueError("target has no authorized workspace devices")
+    [publish(cfg,state,ws,{"kind":"history.republish","entity":(entity:=f"history:{target['id']}:{eid}"),"payload":{"target":target["id"],"sealed":seal_history(json.loads(raw),devices,entity)}} ,root) for eid,raw in rows]; upload(cfg,state,root); return len(rows)
 def remove_device(cfg,ws,device_id,root=None):
     state=refresh(cfg,root); w=next(x for x in state["workspaces"] if x["id"]==ws); members={m["user_id"]:m["role"] for m in w["members"] if m["active"]}; devices=[d for d in w["devices"] if d["active"] and d.get("allowed",1) and d["id"]!=device_id]; return rotate(cfg,ws,members,devices,[device_id],root)
 def approve_devices(cfg,ws,root=None):
     state=refresh(cfg,root); w=next(x for x in state["workspaces"] if x["id"]==ws); members={m["user_id"]:m["role"] for m in w["members"] if m["active"]}; return rotate(cfg,ws,members,[d for d in w["devices"] if d["active"] and d.get("allowed",1)],root=root)
 
 @remote.command("setup")
-def setup_cmd(url:str,user:str,device:str=typer.Option("computer","--device")): cfg,recovery=setup_client(url,user,device); typer.echo(f"Personal workspace ready. Recovery key (store offline): {recovery}")
+def setup_cmd(url:str,user:str,device:str=typer.Option("computer","--device")): cfg,recovery=setup_client(url,user,device); typer.echo(f"Personal workspace ready. User ID: {cfg['user']}. Recovery key (store offline): {recovery}")
 @remote.command("recover")
 def recover_cmd(url:str,user:str,device:str=typer.Option("computer","--device"),recovery:Optional[str]=typer.Option(None,"--recovery")): setup_client(url,user,device,recovery or typer.prompt("Recovery key",hide_input=True)); typer.echo("Device enrolled and keys rotated")
 @remote.command("workspace")
@@ -193,5 +197,5 @@ def doctor_cmd(): typer.echo(doctor_status())
 @remote.command("graph")
 def graph_cmd(view:str,arg:Optional[str]=None): typer.echo(json.dumps(graph_query(connect(paths()[2]),view,arg),default=str))
 @remote.command("rebuild")
-def rebuild_cmd(output:Path): typer.echo(f"Projected {rebuild_projection(output,connect(paths()[2]))} events into {output}")
+def rebuild_cmd(output:Path): cfg=load(); typer.echo(f"Projected {rebuild_projection(output,connect(paths()[2]),device=cfg['device'])} events into {output}")
 [register(app) for app in _pending]; _pending.clear()
