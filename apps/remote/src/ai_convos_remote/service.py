@@ -1,7 +1,8 @@
 """Install a persistent per-user sync worker and remove obsolete wake hooks."""
-import json, os, plistlib, shutil, subprocess, sys
+import json, os, plistlib, shutil, subprocess, sys, time
 from pathlib import Path
 
+def launch(plist,label): subprocess.run(("launchctl","bootout",f"gui/{os.getuid()}/{label}"),capture_output=True); any(not subprocess.run(("launchctl","bootstrap",f"gui/{os.getuid()}",str(plist)),capture_output=True).returncode or time.sleep(.25) for _ in range(20)) or subprocess.run(("launchctl","bootstrap",f"gui/{os.getuid()}",str(plist)),check=True)
 def edit_hooks(remove=False,root=None):
     configs=(Path(os.environ.get("CLAUDE_CONFIG_DIR",Path.home()/".claude"))/"settings.json",Path(os.environ.get("CODEX_HOME",Path.home()/".codex"))/"hooks.json")
     for path in configs:
@@ -19,4 +20,4 @@ def enable(data_dir,remove=False):
         unit.parent.mkdir(parents=True,exist_ok=True); unit.write_text(f"[Unit]\nDescription=Convos encrypted synchronization\n[Service]\nEnvironment={json.dumps('CONVOS_PROJECT_ROOT='+root.replace('%','%%'))}\nExecStart={json.dumps((shutil.which('convos') or 'convos').replace('%','%%'))} remote watch --interval 2\nRestart=always\n[Install]\nWantedBy=default.target\n"); subprocess.run(("systemctl","--user","daemon-reload"),check=True); subprocess.run(("systemctl","--user","enable","--now","convos-remote.service"),check=True); return "Remote background sync enabled"
     plist=Path.home()/"Library/LaunchAgents/com.ai-convos.remote.plist"
     if remove: subprocess.run(("launchctl","bootout",f"gui/{os.getuid()}/{label}"),capture_output=True); plist.unlink(missing_ok=True); return "Remote background sync removed"
-    plist.parent.mkdir(parents=True,exist_ok=True); plist.write_bytes(plistlib.dumps({"Label":label,"ProgramArguments":[shutil.which("convos") or "convos","remote","watch","--interval","2"],"EnvironmentVariables":{"CONVOS_PROJECT_ROOT":root},"KeepAlive":True,"RunAtLoad":True,"StandardOutPath":str(data_dir/"worker.log"),"StandardErrorPath":str(data_dir/"worker.log")})); subprocess.run(("launchctl","bootout",f"gui/{os.getuid()}/{label}"),capture_output=True); subprocess.run(("launchctl","bootstrap",f"gui/{os.getuid()}",str(plist)),check=True); return "Remote background sync enabled"
+    plist.parent.mkdir(parents=True,exist_ok=True); plist.write_bytes(plistlib.dumps({"Label":label,"ProgramArguments":[shutil.which("convos") or "convos","remote","watch","--interval","2"],"EnvironmentVariables":{"CONVOS_PROJECT_ROOT":root},"KeepAlive":True,"RunAtLoad":True,"StandardOutPath":str(data_dir/"worker.log"),"StandardErrorPath":str(data_dir/"worker.log")})); launch(plist,label); return "Remote background sync enabled"

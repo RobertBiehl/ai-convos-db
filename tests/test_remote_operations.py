@@ -20,8 +20,10 @@ def test_remote_enable_removes_obsolete_wake_hooks(tmp_path,monkeypatch):
 
 
 def test_background_services_preserve_custom_root(tmp_path,monkeypatch):
-    home=tmp_path/"home"; root=tmp_path/"custom % archive"; calls=[]; binary=home/"custom % bin/convos"; monkeypatch.setenv("HOME",str(home)); monkeypatch.setenv("CLAUDE_CONFIG_DIR",str(home/"claude")); monkeypatch.setenv("CODEX_HOME",str(home/"codex")); monkeypatch.setattr("ai_convos_remote.service.subprocess.run",lambda *a,**k:calls.append(a[0])); monkeypatch.setattr("ai_convos_remote.service.shutil.which",lambda _:str(binary))
-    monkeypatch.setattr("ai_convos_remote.service.sys.platform","darwin"); enable(root/"remote"); plist=plistlib.loads((home/"Library/LaunchAgents/com.ai-convos.remote.plist").read_bytes()); assert plist["EnvironmentVariables"]=={"CONVOS_PROJECT_ROOT":str(root.resolve())} and plist["ProgramArguments"][0]==str(binary) and not (home/"codex/hooks.json").exists()
+    home=tmp_path/"home"; root=tmp_path/"custom % archive"; calls=[]; attempts={"bootstrap":0}; binary=home/"custom % bin/convos"; monkeypatch.setenv("HOME",str(home)); monkeypatch.setenv("CLAUDE_CONFIG_DIR",str(home/"claude")); monkeypatch.setenv("CODEX_HOME",str(home/"codex"))
+    def run(args,**kwargs): calls.append(args); attempts["bootstrap"]+=args[:2]==("launchctl","bootstrap"); return subprocess.CompletedProcess(args,5 if args[:2]==("launchctl","bootstrap") and attempts["bootstrap"]==1 else 0)
+    monkeypatch.setattr("ai_convos_remote.service.subprocess.run",run); monkeypatch.setattr("ai_convos_remote.service.time.sleep",lambda _:None); monkeypatch.setattr("ai_convos_remote.service.shutil.which",lambda _:str(binary))
+    monkeypatch.setattr("ai_convos_remote.service.sys.platform","darwin"); enable(root/"remote"); plist=plistlib.loads((home/"Library/LaunchAgents/com.ai-convos.remote.plist").read_bytes()); assert plist["EnvironmentVariables"]=={"CONVOS_PROJECT_ROOT":str(root.resolve())} and plist["ProgramArguments"][0]==str(binary) and not (home/"codex/hooks.json").exists() and attempts["bootstrap"]==2
     monkeypatch.setattr("ai_convos_remote.service.sys.platform","linux"); enable(root/"remote"); path=home/".config/systemd/user/convos-remote.service"; unit=path.read_text(); assert f'Environment="CONVOS_PROJECT_ROOT={str(root.resolve()).replace("%","%%")}"' in unit and f'ExecStart="{str(binary).replace("%","%%")}"' in unit
     enable(root/"remote",True); assert not path.exists() and calls[-1]==("systemctl","--user","daemon-reload")
 
