@@ -1,25 +1,27 @@
-import json, plistlib, shutil, sqlite3, subprocess, time
+import json, plistlib, shutil, sqlite3, subprocess
 from pathlib import Path
 
 from typer.testing import CliRunner
+import ai_convos_remote as remote_client
 from ai_convos import cli
 from ai_convos_remote import edit_hooks, enable, setup_client
 from ai_convos_remote_server import action, connect
 
 
-def test_remote_hooks_are_private_fast_idempotent_and_removable(tmp_path,monkeypatch):
+def test_remote_enable_installs_archive_hooks_but_remove_retains_them(monkeypatch):
+    installs,services=[],[]; monkeypatch.setattr(remote_client,"install_hooks",lambda remove,status: installs.append((remove,status))); monkeypatch.setattr(remote_client,"enable",lambda path,remove: services.append(remove) or "ok"); runner=CliRunner()
+    assert runner.invoke(remote_client.remote,["enable"]).exit_code==0 and runner.invoke(remote_client.remote,["enable","--remove"]).exit_code==0 and installs==[(False,False)] and services==[False,True]
+
+
+def test_remote_enable_removes_obsolete_wake_hooks(tmp_path,monkeypatch):
     claude,codex=tmp_path/"claude",tmp_path/"codex"; claude.mkdir(); codex.mkdir(); monkeypatch.setenv("CLAUDE_CONFIG_DIR",str(claude)); monkeypatch.setenv("CODEX_HOME",str(codex)); monkeypatch.setenv("CONVOS_PROJECT_ROOT",str(tmp_path/"archive"))
-    (claude/"settings.json").write_text(json.dumps({"keep":1,"hooks":{"Stop":[{"hooks":[{"type":"command","command":"keep"}]}]}})); cmd=edit_hooks(); edit_hooks()
-    c,x=json.loads((claude/"settings.json").read_text()),json.loads((codex/"hooks.json").read_text()); assert c["keep"]==1 and sum(h["command"].endswith("remote hook") for gs in c["hooks"].values() for g in gs for h in g["hooks"])==2 and sum(h["command"].endswith("remote hook") for gs in x["hooks"].values() for g in gs for h in g["hooks"])==1
-    samples=[]
-    for _ in range(30): start=time.perf_counter(); subprocess.run(cmd,shell=True,check=True); samples.append((time.perf_counter()-start)*1000)
-    assert sorted(samples)[28] < 100 and (tmp_path/"archive/remote/wake").exists()
-    edit_hooks(True); c=json.loads((claude/"settings.json").read_text()); assert c["hooks"]=={"Stop":[{"hooks":[{"type":"command","command":"keep"}]}]}
+    remote={"type":"command","command":"mkdir -p /tmp/x && touch /tmp/x/wake # ai-convos remote hook"}; core={"type":"command","command":"/opt/convos capture claude-code","statusMessage":"Saving conversation to Convos"}; (claude/"settings.json").write_text(json.dumps({"keep":1,"hooks":{"Stop":[{"hooks":[core,remote]}],"SessionEnd":[{"hooks":[remote]}]}})); (codex/"hooks.json").write_text(json.dumps({"hooks":{"Stop":[{"hooks":[{"type":"command","command":"/opt/convos remote hook"}]}]}})); edit_hooks(); edit_hooks()
+    c,x=json.loads((claude/"settings.json").read_text()),json.loads((codex/"hooks.json").read_text()); assert c=={"keep":1,"hooks":{"Stop":[{"hooks":[core]}]}} and x=={"hooks":{}} and not (tmp_path/"archive/remote/wake").exists()
 
 
 def test_background_services_preserve_custom_root(tmp_path,monkeypatch):
     home=tmp_path/"home"; root=tmp_path/"custom % archive"; calls=[]; binary=home/"custom % bin/convos"; monkeypatch.setenv("HOME",str(home)); monkeypatch.setenv("CLAUDE_CONFIG_DIR",str(home/"claude")); monkeypatch.setenv("CODEX_HOME",str(home/"codex")); monkeypatch.setattr("ai_convos_remote.service.subprocess.run",lambda *a,**k:calls.append(a[0])); monkeypatch.setattr("ai_convos_remote.service.shutil.which",lambda _:str(binary))
-    monkeypatch.setattr("ai_convos_remote.service.sys.platform","darwin"); enable(root/"remote"); plist=plistlib.loads((home/"Library/LaunchAgents/com.ai-convos.remote.plist").read_bytes()); hooks=json.loads((home/"codex/hooks.json").read_text()); command=hooks["hooks"]["Stop"][0]["hooks"][0]["command"]; assert plist["EnvironmentVariables"]=={"CONVOS_PROJECT_ROOT":str(root.resolve())} and plist["ProgramArguments"][0]==str(binary) and str(root.resolve()/"remote/wake") in command
+    monkeypatch.setattr("ai_convos_remote.service.sys.platform","darwin"); enable(root/"remote"); plist=plistlib.loads((home/"Library/LaunchAgents/com.ai-convos.remote.plist").read_bytes()); assert plist["EnvironmentVariables"]=={"CONVOS_PROJECT_ROOT":str(root.resolve())} and plist["ProgramArguments"][0]==str(binary) and not (home/"codex/hooks.json").exists()
     monkeypatch.setattr("ai_convos_remote.service.sys.platform","linux"); enable(root/"remote"); path=home/".config/systemd/user/convos-remote.service"; unit=path.read_text(); assert f'Environment="CONVOS_PROJECT_ROOT={str(root.resolve()).replace("%","%%")}"' in unit and f'ExecStart="{str(binary).replace("%","%%")}"' in unit
     enable(root/"remote",True); assert not path.exists() and calls[-1]==("systemctl","--user","daemon-reload")
 

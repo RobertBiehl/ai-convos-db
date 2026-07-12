@@ -17,14 +17,14 @@ def transcript(path, user="remember alpha", assistant=None):
     if assistant: rows.append({"type":"response_item","timestamp":"2026-01-01T00:00:02Z","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":assistant}]}})
     path.write_text("\n".join(json.dumps(x) for x in rows))
 
-def enqueue(path):
-    r = CliRunner().invoke(cli.app, ["hook", "codex"], input=json.dumps({"transcript_path":str(path), "cwd":"/private", "session_id":"secret"}))
+def enqueue(path,command="capture"):
+    r = CliRunner().invoke(cli.app, [command, "codex"], input=json.dumps({"transcript_path":str(path), "cwd":"/private", "session_id":"secret"}))
     assert r.exit_code == 0
 
 def test_hook_is_nonblocking_coalesced_and_private(hooks, monkeypatch):
     sessions, data = hooks; path = sessions/"s.jsonl"; transcript(path)
     monkeypatch.setattr(cli, "get_db", lambda *a, **k: (_ for _ in ()).throw(AssertionError("hook touched db")))
-    enqueue(path); enqueue(path)
+    enqueue(path); enqueue(path,"hook")
     queued = list((data/"hook_inbox").glob("*.json")); assert len(queued) == 1
     raw = queued[0].read_text(); assert "remember alpha" not in raw and "secret" not in raw and set(json.loads(raw)) == {"source", "path", "mtime", "size"}
 
@@ -167,11 +167,11 @@ def test_hook_rejects_paths_outside_provider_root(hooks):
     with pytest.raises(ValueError, match="Invalid codex transcript path"): cli.enqueue_hook("codex", {"transcript_path":str(path)})
 
 def test_install_status_reinstall_and_remove_hooks(tmp_path, monkeypatch):
-    claude, codex = tmp_path/"claude", tmp_path/"codex"; claude.mkdir(); codex.mkdir(); monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(claude)); monkeypatch.setenv("CODEX_HOME", str(codex)); monkeypatch.setattr(cli.shutil, "which", lambda _: "/opt/convos")
-    (claude/"settings.json").write_text(json.dumps({"x":1,"hooks":{"Stop":[{"hooks":[{"type":"command","command":"keep me"},{"type":"command","command":"other hook claude-code"}]}]}})); runner = CliRunner()
+    claude, codex, archive = tmp_path/"claude", tmp_path/"codex", tmp_path/"archive root"; claude.mkdir(); codex.mkdir(); monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(claude)); monkeypatch.setenv("CODEX_HOME", str(codex)); monkeypatch.setenv("CONVOS_PROJECT_ROOT",str(archive)); monkeypatch.setattr(cli.shutil, "which", lambda _: "/opt/convos")
+    (claude/"settings.json").write_text(json.dumps({"x":1,"hooks":{"Stop":[{"hooks":[{"type":"command","command":"keep me"},{"type":"command","command":"other hook claude-code"},{"type":"command","command":"/old/convos hook claude-code","statusMessage":"Updating conversation archive"},{"type":"command","command":"touch /tmp/wake # ai-convos remote hook"}]}]}})); runner = CliRunner()
     first = runner.invoke(cli.app, ["install-hooks"]); second = runner.invoke(cli.app, ["install-hooks"]); assert first.exit_code == second.exit_code == 0 and "`/hooks`" in first.output
     c, x = json.loads((claude/"settings.json").read_text()), json.loads((codex/"hooks.json").read_text())
-    assert c["x"] == 1 and sum(len(g["hooks"]) for g in c["hooks"]["Stop"]) == 3 and len(c["hooks"]["SessionEnd"]) == 1 and len(x["hooks"]["Stop"]) == 1
+    handler=x["hooks"]["Stop"][0]["hooks"][0]; assert c["x"] == 1 and sum(len(g["hooks"]) for g in c["hooks"]["Stop"]) == 3 and len(c["hooks"]["SessionEnd"]) == 1 and len(x["hooks"]["Stop"]) == 1 and handler["command"]==f"CONVOS_PROJECT_ROOT='{archive}' /opt/convos capture codex" and handler["timeout"]==5 and handler["statusMessage"]=="Saving conversation to Convos"
     status = runner.invoke(cli.app, ["install-hooks", "--status"]).output; assert "claude-code: 2 hooks" in status and "`/hooks`" not in status
     assert runner.invoke(cli.app, ["install-hooks", "--remove"]).exit_code == 0
     c, x = json.loads((claude/"settings.json").read_text()), json.loads((codex/"hooks.json").read_text())

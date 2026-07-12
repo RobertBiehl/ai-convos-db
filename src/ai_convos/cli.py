@@ -3,8 +3,7 @@ import json, time, zipfile, hashlib, struct, sqlite3, subprocess, ssl, urllib.re
 from importlib.metadata import entry_points, version
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
-from pathlib import Path
-from typing import Optional
+from pathlib import Path; from typing import Optional
 from hashlib import pbkdf2_hmac
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 
@@ -786,8 +785,9 @@ def emit(data, fmt):
     if fmt == "jsonl" and isinstance(data, list): [typer.echo(json.dumps(r, default=str)) for r in data]
     else: typer.echo(json.dumps(data, default=str))
 
-@app.command(hidden=True)
-def hook(source: str):
+@app.command("hook", hidden=True)
+@app.command("capture", hidden=True)
+def capture(source: str):
     try: enqueue_hook(source, json.loads(sys.stdin.read() or "{}"))
     except Exception as e: log_parse_error(f"{source} hook", e)
 
@@ -911,15 +911,15 @@ def install_skills():
         typer.echo(f"Installed {dest}")
 
 def edit_hook_config(path, events, source, remove=False):
-    data = json.loads(path.read_text()) if path.exists() else {}; hooks = data.setdefault("hooks", {}); suffix = f" hook {source}"
+    data = json.loads(path.read_text()) if path.exists() else {}; hooks = data.setdefault("hooks", {}); suffixes, messages = (f" hook {source}", f" capture {source}"), ("Updating conversation archive", "Saving conversation to Convos")
     for event in list(hooks):
-        for group in hooks[event]: group["hooks"] = [h for h in group.get("hooks", []) if not (h.get("command", "").endswith(suffix) and h.get("statusMessage") == "Updating conversation archive")]
+        for group in hooks[event]: group["hooks"] = [h for h in group.get("hooks", []) if not (h.get("command", "").endswith("convos remote hook") or h.get("command", "").endswith(suffixes) and h.get("statusMessage") in messages)]
         hooks[event] = [g for g in hooks[event] if g.get("hooks")]
         if not hooks[event]: del hooks[event]
     if not remove:
-        cmd = f"{shlex.quote(shutil.which('convos') or 'convos')} hook {source}"
-        for event in events: hooks.setdefault(event, []).append(dict(hooks=[dict(type="command", command=cmd, timeout=5, statusMessage="Updating conversation archive")]))
-    atomic_json(path, data); return sum(h.get("command", "").endswith(suffix) and h.get("statusMessage") == "Updating conversation archive" for gs in hooks.values() for g in gs for h in g.get("hooks", []))
+        root=Path(os.environ.get("CONVOS_PROJECT_ROOT",PROJECT_ROOT)).expanduser().resolve(); cmd = f"{f'CONVOS_PROJECT_ROOT={shlex.quote(str(root))} ' if root!=Path.home()/'.convos' else ''}{shlex.quote(shutil.which('convos') or 'convos')} capture {source}"
+        for event in events: hooks.setdefault(event, []).append(dict(hooks=[dict(type="command", command=cmd, timeout=5, statusMessage="Saving conversation to Convos")]))
+    atomic_json(path, data); return sum(h.get("command", "").endswith(suffixes) and h.get("statusMessage") in messages for gs in hooks.values() for g in gs for h in g.get("hooks", []))
 
 @app.command("install-hooks")
 def install_hooks(remove: bool = typer.Option(False, "--remove"), status: bool = typer.Option(False, "--status")):
@@ -927,7 +927,7 @@ def install_hooks(remove: bool = typer.Option(False, "--remove"), status: bool =
             (Path(os.environ.get("CODEX_HOME", Path.home()/".codex"))/"hooks.json", ("Stop",), "codex")]
     for path, events, source in cfgs:
         if status:
-            data = json.loads(path.read_text()) if path.exists() else {}; n = sum(h.get("command", "").endswith(f" hook {source}") and h.get("statusMessage") == "Updating conversation archive" for gs in data.get("hooks", {}).values() for g in gs for h in g.get("hooks", []))
+            data = json.loads(path.read_text()) if path.exists() else {}; n = sum(h.get("command", "").endswith((f" hook {source}", f" capture {source}")) and h.get("statusMessage") in ("Updating conversation archive", "Saving conversation to Convos") for gs in data.get("hooks", {}).values() for g in gs for h in g.get("hooks", []))
         else: n = edit_hook_config(path, events, source, remove)
         typer.echo(f"{source}: {n} hook{'s' if n != 1 else ''}{' installed' if not status and not remove else ''} ({path})")
     if not status and not remove: typer.echo("Start a new agent session; in Codex, review the user hook with `/hooks`.")

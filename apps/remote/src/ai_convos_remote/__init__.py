@@ -5,7 +5,7 @@ from pathlib import Path; from typing import Optional
 import typer
 _pending=[]
 def register(app): _pending.append(app) if "remote" not in globals() else app.add_typer(remote,name="remote")
-from ai_convos.cli import DB_PATH, PROJECT_ROOT, drain_hooks, get_db
+from ai_convos.cli import DB_PATH, PROJECT_ROOT, drain_hooks, get_db, install_hooks
 from .provenance import repository
 from .projection import connect, project, project_many, query as graph_query, rebuild as rebuild_projection, scan, sequence
 from .protocol import (b64, certificate, digest, event, identity, material_event, open_event, open_key, public, public_id, recover,
@@ -184,10 +184,8 @@ def watch(interval:int=typer.Option(2,"--interval")):
         try: sync_once()
         except Exception as e: paths()[0].mkdir(parents=True,exist_ok=True); (paths()[0]/"last_error").write_text(str(e))
         time.sleep(interval)
-@remote.command("hook",hidden=True)
-def hook_cmd(): paths()[0].mkdir(parents=True,exist_ok=True); (paths()[0]/"wake").touch()
 @remote.command("enable")
-def enable_cmd(remove:bool=typer.Option(False,"--remove")): typer.echo(enable(paths()[0],remove))
+def enable_cmd(remove:bool=typer.Option(False,"--remove")): not remove and install_hooks(False,False); typer.echo(enable(paths()[0],remove))
 def doctor_status():
     try:
         cfg=load(); state=connect(paths()[2]); pending=state.execute("SELECT COUNT(*) FROM event_log WHERE direction='out' AND cursor=0").fetchone()[0]; lazy=state.execute("SELECT COUNT(*) FROM lazy_events").fetchone()[0]; last=(state.execute("SELECT value FROM meta WHERE key='last_sync'").fetchone() or ["never"])[0]; online="reachable" if health(cfg)["ok"] else "error"; return f"remote: {online}, user={cfg['user'][:8]}, device={cfg['device']['id'][:8]}, workspaces={len(cfg['workspaces'])}, epochs={len(cfg['keys'])}, pending={pending}, lazy={lazy}, last={last}"

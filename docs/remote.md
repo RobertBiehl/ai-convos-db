@@ -103,10 +103,12 @@ a DuckDB file. Team keys are deliberately not in the recovery bundle: a new
 team device remains pending until a workspace admin runs
 `convos remote approve-devices WORKSPACE`.
 
-`enable` adds lightweight Claude Code and Codex hooks and installs a persistent
-user service: launchd on macOS and systemd on Linux. Hooks only touch a wake
-marker. The worker performs Git inspection, encryption, network I/O, pulling,
-and projection. Normal work never requires `convos remote sync`.
+`enable` installs the standard Convos conversation-capture hooks and a
+persistent user service: launchd on macOS and systemd on Linux. Each lifecycle
+event has one `convos capture <agent>` command; obsolete remote wake-only hooks
+are removed automatically. The hook only updates the local archive. The worker
+observes those changes and performs Git inspection, encryption, network I/O,
+pulling, and projection. Normal work never requires `convos remote sync`.
 
 ## Team workspaces
 
@@ -198,7 +200,7 @@ Remote client state lives under `<root>/remote/` (by default,
   keyring, and local workspace labels
 - `state.db`: signed event ledger, cursors, outbox, typed graph projection,
   local checkout mappings, and deferred-event manifests
-- `worker.log`, `last_error`, `wake`: operational state
+- `worker.log`, `last_error`: operational state
 
 Absolute checkout roots remain only in `state.db`. They are not placed in event
 payloads, server storage, repository fixtures, CI artifacts, or logs.
