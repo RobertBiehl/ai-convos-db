@@ -9,14 +9,16 @@
 uv tool install "git+https://github.com/RobertBiehl/ai-convos-db.git"
 ```
 
-Local-first memory for coding agents. Capture Claude Code and Codex work automatically, retrieve decisions across providers, and hand the next agent bounded context from one DuckDB file.
+Local-first memory for coding agents. Capture Claude Code and Codex work automatically, retrieve decisions across providers, and optionally synchronize encrypted personal or team memory through a self-hosted relay.
 
 ## Why this exists
 
 - Resume work across coding agents without reconstructing old sessions
 - Retrieve prior decisions, commands, evidence, and edits without dumping whole transcripts
-- Keep ChatGPT, Claude, Claude Code, and Codex history local and searchable
-- Use a CLI skill and lifecycle hooks; no server, daemon, or hosted memory service
+- Keep ChatGPT, Claude, Claude Code, and Codex history locally searchable
+- Keep the same encrypted memory available across computers without path allowlists
+- Share project-associated prompts and changes automatically with encrypted team workspaces
+- Use a CLI skill and lifecycle hooks; the self-hosted relay is optional
 
 ## Features
 
@@ -26,6 +28,7 @@ Local-first memory for coding agents. Capture Claude Code and Codex work automat
 - Import exports from ChatGPT, Claude, Claude Code, and Codex
 - Capture completed Claude Code + Codex turns just in time with lifecycle hooks
 - Optional code-change provenance: blame, timeline, time travel, and graph browsing
+- Optional end-to-end encrypted personal multi-device and team synchronization
 - Export to JSON or CSV
 
 ## Install
@@ -64,6 +67,13 @@ uv tool install --reinstall "git+https://github.com/RobertBiehl/ai-convos-db.git
 
 This adds `convos blame`, `timeline`, `at`, `graph`, and `browse`.
 
+The encrypted remote uses one optional client package and one independently
+installable server package, so the local archive stays server-free by default.
+See [self-hosting, recovery, team policy, and installation](docs/remote.md).
+Runnable synthetic scenarios are in [`examples/remote`](examples/remote/README.md).
+See [`examples/insights`](examples/insights/README.md) for local decision,
+comparison, archive-statistics, and prompt-to-change query recipes.
+
 ## Quickstart
 
 ```bash
@@ -92,10 +102,11 @@ convos query "how do I store vectors in duckdb"    # hybrid: BM25 + embeddings +
 Both discovery commands return the strongest matching message from each
 conversation, so `-n` controls the number of distinct conversation candidates.
 
-Semantic search is included by default. Run `convos embed` or `convos sync`
-after install to backfill embeddings with a progress bar; subsequent syncs only
-embed new/changed messages. The `embeddinggemma-300m-qat-q8_0` model produces
-768d embeddings and runs locally via llama.cpp.
+Semantic search is included by default. Run `convos embed` after install to
+backfill embeddings with a progress bar. Hooks and `convos sync` queue new or
+changed messages; `convos query` embeds that queue just in time. The
+`embeddinggemma-300m-qat-q8_0` model produces 768d embeddings locally via
+llama.cpp.
 
 Read a known conversation using an ID prefix from search/query:
 
@@ -198,7 +209,9 @@ Data lives in `<root>/data/convos.db` (DuckDB). Default root is `~/.convos` (ove
 
 ## Privacy and security
 
-This is local-first. Your data never leaves your machine unless you export it.
+This is local-first. Your data never leaves your machine unless you export it
+or explicitly configure the optional encrypted remote. The remote receives
+ciphertext and synchronization metadata, never workspace keys or plaintext.
 
 On macOS, Safari cookie access requires Full Disk Access for your terminal.
 If you prefer not to grant it, use Chrome cookies with `-b chrome`.

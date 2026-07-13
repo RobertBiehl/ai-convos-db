@@ -6,6 +6,8 @@ requires-python = ">=3.12"
 members = [
     "ai-convos-changegraph",
     "ai-convos-db",
+    "ai-convos-remote",
+    "ai-convos-remote-server",
 ]
 
 [[package]]
@@ -40,6 +42,8 @@ dependencies = [
 [package.optional-dependencies]
 dev = [
     { name = "ai-convos-changegraph" },
+    { name = "ai-convos-remote" },
+    { name = "ai-convos-remote-server" },
     { name = "pytest" },
     { name = "pytest-asyncio" },
 ]
@@ -47,6 +51,8 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "ai-convos-changegraph", marker = "extra == 'dev'", editable = "apps/changegraph" },
+    { name = "ai-convos-remote", marker = "extra == 'dev'", editable = "apps/remote" },
+    { name = "ai-convos-remote-server", marker = "extra == 'dev'", editable = "apps/remote_server" },
     { name = "cryptography", specifier = ">=42.0.0" },
     { name = "duckdb", specifier = ">=1.0.0" },
     { name = "huggingface-hub", specifier = ">=0.20.0" },
@@ -56,6 +62,34 @@ requires-dist = [
     { name = "typer", specifier = ">=0.12.0" },
 ]
 provides-extras = ["dev"]
+
+[[package]]
+name = "ai-convos-remote"
+version = "0.1.0"
+source = { editable = "apps/remote" }
+dependencies = [
+    { name = "ai-convos-db" },
+    { name = "cryptography" },
+    { name = "typer" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "ai-convos-db", editable = "." },
+    { name = "cryptography", specifier = ">=42.0.0" },
+    { name = "typer", specifier = ">=0.12.0" },
+]
+
+[[package]]
+name = "ai-convos-remote-server"
+version = "0.1.0"
+source = { editable = "apps/remote_server" }
+dependencies = [
+    { name = "cryptography" },
+]
+
+[package.metadata]
+requires-dist = [{ name = "cryptography", specifier = ">=42.0.0" }]
 
 [[package]]
 name = "anyio"

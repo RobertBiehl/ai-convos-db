@@ -26,6 +26,11 @@ Line Budget
 
 Stay below 1000 lines of code total (tinygrad-style constraint, enforced by `tests/test_budget.py` via a token-aware count). Any new feature must fit in the remaining budget, so design for minimal line growth and high density. Prefer no new dependencies when possible.
 
+Package boundaries must represent user-installable products, not internal
+modules or a way to evade line budgets. A cohesive product may declare one
+explicit larger budget in `test_budget.py`; keep its implementation compact
+inside that boundary.
+
 **Do:**
 - Pack meaning into each line - comprehensions over loops with append
 - Construct results at the end, not via mutation in loops

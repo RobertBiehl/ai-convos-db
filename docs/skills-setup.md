@@ -39,6 +39,8 @@ convos install-hooks --status
 
 Claude Code uses `Stop` plus `SessionEnd`; Codex uses `Stop`. Remove only these
 ai-convos-db handlers with `convos install-hooks --remove`. Codex may require
-reviewing the new command hook through `/hooks` after installation. Start a new
-agent session, complete one turn, then use `convos doctor` to verify that
-`ingest: ... last=...` is recent.
+reviewing the new command hook through `/hooks` after installation. The approval
+screen shows the literal `convos capture codex` command; Codex has no separate
+handler display-name field, while `Saving conversation to Convos` is shown as
+its runtime status. Start a new agent session, complete one turn, then use
+`convos doctor` to verify that `ingest: ... last=...` is recent.

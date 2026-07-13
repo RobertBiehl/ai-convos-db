@@ -1,4 +1,4 @@
-import json
+import json, os, signal, subprocess, sys, time
 from pathlib import Path
 import duckdb, pytest
 from typer.testing import CliRunner
@@ -17,14 +17,14 @@ def transcript(path, user="remember alpha", assistant=None):
     if assistant: rows.append({"type":"response_item","timestamp":"2026-01-01T00:00:02Z","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":assistant}]}})
     path.write_text("\n".join(json.dumps(x) for x in rows))
 
-def enqueue(path):
-    r = CliRunner().invoke(cli.app, ["hook", "codex"], input=json.dumps({"transcript_path":str(path), "cwd":"/private", "session_id":"secret"}))
+def enqueue(path,command="capture"):
+    r = CliRunner().invoke(cli.app, [command, "codex"], input=json.dumps({"transcript_path":str(path), "cwd":"/private", "session_id":"secret"}))
     assert r.exit_code == 0
 
 def test_hook_is_nonblocking_coalesced_and_private(hooks, monkeypatch):
     sessions, data = hooks; path = sessions/"s.jsonl"; transcript(path)
     monkeypatch.setattr(cli, "get_db", lambda *a, **k: (_ for _ in ()).throw(AssertionError("hook touched db")))
-    enqueue(path); enqueue(path)
+    enqueue(path); enqueue(path,"hook")
     queued = list((data/"hook_inbox").glob("*.json")); assert len(queued) == 1
     raw = queued[0].read_text(); assert "remember alpha" not in raw and "secret" not in raw and set(json.loads(raw)) == {"source", "path", "mtime", "size"}
 
@@ -69,15 +69,61 @@ def test_hook_defers_fts_until_fresh_search(hooks):
     hits = json.loads(CliRunner().invoke(cli.app, ["search", "remember alpha", "-f", "json"]).output)
     assert hits[0]["content"] == "remember alpha" and not (data/"hook_fts_dirty").exists()
 
+def test_sync_defers_fts_and_embeddings(hooks, tmp_path, monkeypatch):
+    _, data = hooks; src = tmp_path/"import.json"; src.write_text("[]"); monkeypatch.setenv("CONVOS_IMPORT_PATHS", str(src)); monkeypatch.setattr(cli, "STATE_PATH", data/"sync_state.json")
+    result = cli.ParseResult(convs=[dict(id="sync-c", source="chatgpt", title="T", created_at=None, updated_at=None, model=None, cwd=None, git_branch=None, project_id=None, metadata="{}")], msgs=[dict(id="sync-m", conversation_id="sync-c", role="user", content="alpha", thinking=None, created_at=None, model=None, metadata="{}", parent_id=None)])
+    monkeypatch.setattr(cli, "parse_source", lambda _: result); monkeypatch.setattr(cli, "chatgpt_profiles", lambda _: []); monkeypatch.setattr(cli, "get_cookies", lambda *_: {})
+    fail = lambda *_: (_ for _ in ()).throw(AssertionError("foreground consolidation")); monkeypatch.setattr(cli, "flush_fts", fail); monkeypatch.setattr(cli, "embed_hook_pending", fail); old = signal.getsignal(signal.SIGINT)
+    try: cli.sync(False, 300, False, False, False, False); assert signal.getsignal(signal.SIGINT) == old
+    finally: signal.signal(signal.SIGINT, old)
+    assert (data/"hook_fts_dirty").exists() and json.loads((data/"hook_embeddings_dirty").read_text()) == ["sync-m"]
+
+def test_sync_rechecks_chatgpt_head_without_timestamp(hooks, monkeypatch):
+    _, data = hooks; monkeypatch.setattr(cli, "STATE_PATH", data/"sync_state.json"); cli.atomic_json(cli.STATE_PATH, {"web":{"chatgpt":{"browser":"safari","head":"default:c1:None"}}}); called = []
+    monkeypatch.setattr(cli, "chatgpt_profiles", lambda _: [None]); monkeypatch.setattr(cli, "chatgpt_cookie_base", lambda *a: ({}, "https://chatgpt.com")); monkeypatch.setattr(cli, "chatgpt_headers", lambda *a, **k: {}); monkeypatch.setattr(cli, "fetch_json", lambda *a, **k: {"items":[{"id":"c1","update_time":None}]}); monkeypatch.setattr(cli, "fetch_chatgpt", lambda *a, **k: called.append(k) or cli.ParseResult()); monkeypatch.setattr(cli, "get_cookies", lambda *_: {})
+    cli.sync(False, 300, False, False, False, False)
+    assert called and called[0]["profiles"] == [None]
+
+def test_sync_sigint_exits_during_blocked_source(tmp_path):
+    src, blocked, ready, done = tmp_path/"import.json", tmp_path/"blocked.json", tmp_path/"ready", tmp_path/"done"; src.write_text("[]"); blocked.write_text("[]")
+    code = '''import hashlib,os,sys
+from pathlib import Path
+from ai_convos import cli
+class C:
+ def close(self): pass
+ def execute(self,*_): return self
+ def fetchone(self): return [0]
+ def fetchall(self): return []
+cli.get_db=lambda *a,**k:C(); cli.init_schema=lambda _:None; cli.drain_hooks=lambda *a,**k:cli.HOOK_DIR.mkdir(parents=True,exist_ok=True) or 0; cli.counts_by_source=lambda _:{}
+cli.chatgpt_profiles=lambda _:[]; cli.get_cookies=lambda *_:{}
+def parsed(path):
+ if path.name=="blocked.json" and os.environ.get("BLOCK")!="0": Path(os.environ["READY"]).touch(); hashlib.pbkdf2_hmac("sha256",b"x",b"y",500_000_000)
+ return cli.ParseResult()
+def upsert(*_): Path(os.environ["DONE"]).touch(); return 0,0,0,0,0,0,0,{"m"}
+cli.parse_source=parsed; cli.upsert=upsert; sys.argv[1:]=["sync"]; cli.sync(False,300,False,False,False,False)'''
+    root = tmp_path/"archive"; (root/"data").mkdir(parents=True); (root/"data/sync_state.json").write_text('{"sentinel":1}'); env = {**os.environ, "CONVOS_PROJECT_ROOT":str(root), "CONVOS_IMPORT_PATHS":f"{src},{blocked}", "READY":str(ready), "DONE":str(done)}; p = subprocess.Popen([sys.executable, "-c", code], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        deadline = time.monotonic() + 5
+        while not (ready.exists() and done.exists()) and p.poll() is None and time.monotonic() < deadline: time.sleep(.02)
+        assert ready.exists() and done.exists(), f"sync sources did not start (exit={p.poll()})"; time.sleep(.1); p.send_signal(signal.SIGINT)
+        try: p.wait(timeout=2)
+        except subprocess.TimeoutExpired: p.kill(); p.wait(); pytest.fail("sync ignored Ctrl-C for more than 2 seconds")
+        assert p.returncode == -signal.SIGINT and json.loads((root/"data/sync_state.json").read_text()) == {"sentinel":1}
+        assert subprocess.run([sys.executable, "-c", code], env={**env, "BLOCK":"0"}, capture_output=True).returncode == 0
+        state = json.loads((root/"data/sync_state.json").read_text()); assert len(state["imports"]) == 2 and (root/"data/hook_fts_dirty").exists() and json.loads((root/"data/hook_embeddings_dirty").read_text()) == ["m"]
+    finally:
+        if p.poll() is None: p.kill(); p.wait()
+
 def test_fts_claim_preserves_new_work(hooks, monkeypatch):
     _, data = hooks; (data/"hook_inbox").mkdir(parents=True); (data/"hook_fts_dirty").touch(); conn = duckdb.connect(str(data/"convos.db")); cli.init_schema(conn); conn.close()
     monkeypatch.setattr(cli, "rebuild_fts_index", lambda _: (data/"hook_fts_dirty").touch()); assert cli.flush_fts()
     assert (data/"hook_fts_dirty").exists() and not list(data.glob(".hook_fts_dirty.*"))
 
-def test_failed_fts_claim_is_restored(hooks, monkeypatch):
+@pytest.mark.parametrize("error", [RuntimeError("index failed"), KeyboardInterrupt()])
+def test_failed_fts_claim_is_restored(hooks, monkeypatch, error):
     _, data = hooks; (data/"hook_inbox").mkdir(parents=True); (data/"hook_fts_dirty").touch()
-    monkeypatch.setattr(cli, "rebuild_fts_index", lambda _: (_ for _ in ()).throw(RuntimeError("index failed")))
-    with pytest.raises(RuntimeError, match="index failed"): cli.flush_fts()
+    monkeypatch.setattr(cli, "rebuild_fts_index", lambda _: (_ for _ in ()).throw(error))
+    with pytest.raises(type(error)): cli.flush_fts()
     assert (data/"hook_fts_dirty").exists() and not list(data.glob(".hook_fts_dirty.*"))
 
 def test_orphaned_fts_claim_is_retried(hooks, monkeypatch):
@@ -91,10 +137,11 @@ def test_embedding_claim_is_scoped_and_preserves_new_work(hooks, monkeypatch):
     monkeypatch.setattr(cli, "embed_pending", embed); cli.embed_hook_pending()
     assert seen == {"batch":32, "ids":["old"]} and json.loads((data/"hook_embeddings_dirty").read_text()) == ["new"]
 
-def test_failed_embedding_restores_claimed_ids(hooks, monkeypatch):
+@pytest.mark.parametrize("error", [RuntimeError("model failed"), KeyboardInterrupt()])
+def test_failed_embedding_restores_claimed_ids(hooks, monkeypatch, error):
     _, data = hooks; (data/"hook_inbox").mkdir(parents=True); cli.atomic_json(data/"hook_embeddings_dirty", ["old"])
-    monkeypatch.setattr(cli, "embed_pending", lambda *_: (_ for _ in ()).throw(RuntimeError("model failed")))
-    with pytest.raises(RuntimeError, match="model failed"): cli.embed_hook_pending()
+    monkeypatch.setattr(cli, "embed_pending", lambda *_: (_ for _ in ()).throw(error))
+    with pytest.raises(type(error)): cli.embed_hook_pending()
     assert json.loads((data/"hook_embeddings_dirty").read_text()) == ["old"]
 
 def test_init_still_installs_skills(hooks, monkeypatch):
@@ -120,11 +167,11 @@ def test_hook_rejects_paths_outside_provider_root(hooks):
     with pytest.raises(ValueError, match="Invalid codex transcript path"): cli.enqueue_hook("codex", {"transcript_path":str(path)})
 
 def test_install_status_reinstall_and_remove_hooks(tmp_path, monkeypatch):
-    claude, codex = tmp_path/"claude", tmp_path/"codex"; claude.mkdir(); codex.mkdir(); monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(claude)); monkeypatch.setenv("CODEX_HOME", str(codex)); monkeypatch.setattr(cli.shutil, "which", lambda _: "/opt/convos")
-    (claude/"settings.json").write_text(json.dumps({"x":1,"hooks":{"Stop":[{"hooks":[{"type":"command","command":"keep me"},{"type":"command","command":"other hook claude-code"}]}]}})); runner = CliRunner()
+    claude, codex, archive = tmp_path/"claude", tmp_path/"codex", tmp_path/"archive root"; claude.mkdir(); codex.mkdir(); monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(claude)); monkeypatch.setenv("CODEX_HOME", str(codex)); monkeypatch.setenv("CONVOS_PROJECT_ROOT",str(archive)); monkeypatch.setattr(cli.shutil, "which", lambda _: "/opt/convos")
+    (claude/"settings.json").write_text(json.dumps({"x":1,"hooks":{"Stop":[{"hooks":[{"type":"command","command":"keep me"},{"type":"command","command":"other hook claude-code"},{"type":"command","command":"/old/convos hook claude-code","statusMessage":"Updating conversation archive"},{"type":"command","command":"touch /tmp/wake # ai-convos remote hook"}]}]}})); runner = CliRunner()
     first = runner.invoke(cli.app, ["install-hooks"]); second = runner.invoke(cli.app, ["install-hooks"]); assert first.exit_code == second.exit_code == 0 and "`/hooks`" in first.output
     c, x = json.loads((claude/"settings.json").read_text()), json.loads((codex/"hooks.json").read_text())
-    assert c["x"] == 1 and sum(len(g["hooks"]) for g in c["hooks"]["Stop"]) == 3 and len(c["hooks"]["SessionEnd"]) == 1 and len(x["hooks"]["Stop"]) == 1
+    handler=x["hooks"]["Stop"][0]["hooks"][0]; assert c["x"] == 1 and sum(len(g["hooks"]) for g in c["hooks"]["Stop"]) == 3 and len(c["hooks"]["SessionEnd"]) == 1 and len(x["hooks"]["Stop"]) == 1 and handler["command"]==f"CONVOS_PROJECT_ROOT='{archive}' /opt/convos capture codex" and handler["timeout"]==5 and handler["statusMessage"]=="Saving conversation to Convos"
     status = runner.invoke(cli.app, ["install-hooks", "--status"]).output; assert "claude-code: 2 hooks" in status and "`/hooks`" not in status
     assert runner.invoke(cli.app, ["install-hooks", "--remove"]).exit_code == 0
     c, x = json.loads((claude/"settings.json").read_text()), json.loads((codex/"hooks.json").read_text())

@@ -130,11 +130,54 @@ class TestChatGPTAPI:
         assert r.convs[0]["created_at"] == cli.ts_from_epoch(1709294400)
         assert r.convs[0]["updated_at"] == cli.ts_from_epoch(1709294500)
 
+    def test_fetch_chatgpt_rejects_partial_detail_failure(self, monkeypatch):
+        from ai_convos import cli
+        monkeypatch.setattr(cli, "chatgpt_profiles", lambda _: [None]); monkeypatch.setattr(cli, "chatgpt_cookie_base", lambda *a, **k: ({}, "https://chatgpt.com")); monkeypatch.setattr(cli, "chatgpt_headers", lambda *a, **k: {})
+        def fake(url, *a, **k):
+            if "/conversations?" in url: return {"items":[{"id":"ok"},{"id":"bad"}], "total":2}
+            if url.endswith("/bad"): raise TimeoutError("detail timeout")
+            return {"mapping":{}}
+        monkeypatch.setattr(cli, "fetch_json", fake)
+        with pytest.raises(ValueError, match="detail timeout"): cli.fetch_chatgpt("safari")
+
+    def test_fetch_chatgpt_skips_unrelated_chrome_profile(self, monkeypatch):
+        from ai_convos import cli
+        monkeypatch.setattr(cli, "chatgpt_profiles", lambda _: ["Good", "Unused"]); monkeypatch.setattr(cli, "chatgpt_cookie_base", lambda _, __, p: ({}, "https://chatgpt.com") if p == "Good" else (_ for _ in ()).throw(ValueError("no cookies"))); monkeypatch.setattr(cli, "chatgpt_headers", lambda *a, **k: {})
+        def fake(url, *a, **k):
+            if "offset=0" in url: return {"items":[{"id":"ok"}], "total":1}
+            if "/conversations?" in url: return {"items":[], "total":1}
+            return {"mapping":{}}
+        monkeypatch.setattr(cli, "fetch_json", fake)
+        assert [c["id"] for c in cli.fetch_chatgpt("chrome").convs] == [cli.gen_id("chatgpt", "ok")]
+
+    def test_fetch_chatgpt_details_only_new_or_updated_conversations(self, monkeypatch):
+        from ai_convos import cli
+        monkeypatch.setattr(cli, "chatgpt_profiles", lambda _: [None]); monkeypatch.setattr(cli, "chatgpt_cookie_base", lambda *a, **k: ({}, "https://chatgpt.com")); monkeypatch.setattr(cli, "chatgpt_headers", lambda *a, **k: {}); details = []
+        def fake(url, *a, **k):
+            if "offset=0" in url: return {"items":[{"id":"same","update_time":100},{"id":"older","update_time":100}], "total":6}
+            if "offset=2" in url: return {"items":[{"id":"changed","update_time":200},{"id":"missing-time","update_time":None},{"id":"null-stored","update_time":100},{"id":"new","update_time":None}], "total":6}
+            if "/conversations?" in url: return {"items":[], "total":6}
+            details.append(url.rsplit("/", 1)[-1]); return {"mapping":{}}
+        monkeypatch.setattr(cli, "fetch_json", fake); known = {cli.gen_id("chatgpt", x):(cli.ts_any(t).timestamp() if t else None) for x, t in (("same",100),("older",150),("changed",150),("missing-time",150),("null-stored",None))}
+        assert len(cli.fetch_chatgpt("safari", known=known).convs) == 4 and set(details) == {"changed", "missing-time", "null-stored", "new"}
+        details.clear(); assert len(cli.fetch_chatgpt("safari", known={}).convs) == 6 and set(details) == {"same", "older", "changed", "missing-time", "null-stored", "new"}
+
 
 # ---- Claude API Tests ----
 
 class TestClaudeAPI:
     """Tests for Claude.ai API structure."""
+
+    def test_fetch_claude_rejects_partial_detail_failure(self, monkeypatch):
+        from ai_convos import cli
+        monkeypatch.setattr(cli, "get_cookies", lambda *_: {"session":"x"})
+        def fake(url, *a, **k):
+            if url.endswith("/api/organizations"): return [{"uuid":"org"}]
+            if url.endswith("/chat_conversations"): return [{"uuid":"ok"}, {"uuid":"bad"}]
+            if url.endswith("/bad"): raise TimeoutError("detail timeout")
+            return {"chat_messages":[]}
+        monkeypatch.setattr(cli, "fetch_json", fake)
+        with pytest.raises(TimeoutError, match="detail timeout"): cli.fetch_claude("safari")
 
     @pytest.mark.integration
     def test_organizations_schema(self):
@@ -367,3 +410,11 @@ class TestHTTPErrors:
             with pytest.raises(urllib.error.HTTPError) as exc_info:
                 fetch_json("https://api.example.com", {"session": "test"})
             assert exc_info.value.code == 401
+
+    def test_429_uses_visible_long_backoff(self):
+        from ai_convos.cli import fetch_json
+        import urllib.error
+        error = urllib.error.HTTPError("https://api.example.com", 429, "Too Many Requests", {}, None)
+        with patch("urllib.request.urlopen", side_effect=error), patch("time.sleep") as sleep:
+            with pytest.raises(urllib.error.HTTPError): fetch_json("https://api.example.com", {}, retries=2)
+        assert [x.args[0] for x in sleep.call_args_list] == [30, 60]

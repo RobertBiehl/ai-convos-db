@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
-import json, time, zipfile, hashlib, struct, sqlite3, subprocess, ssl, urllib.request, re, os, sysconfig, site, csv, sys, shutil, shlex, fcntl
+import json, time, zipfile, hashlib, struct, sqlite3, subprocess, ssl, urllib.request, re, os, sysconfig, site, csv, sys, shutil, shlex, fcntl, signal
 from importlib.metadata import entry_points, version
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
-from pathlib import Path
-from typing import Optional
+from pathlib import Path; from typing import Optional
 from hashlib import pbkdf2_hmac
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 
@@ -169,7 +168,7 @@ def read_chrome_cookies(domain: str, profile: str | None = None) -> dict[str, st
     db_path = Path.home() / "Library/Application Support/Google/Chrome" / profile / "Cookies"
     if not db_path.exists(): db_path = Path.home() / "Library/Application Support/Google/Chrome" / profile / "Network/Cookies"
     if not db_path.exists(): return {}
-    result = subprocess.run(["security", "find-generic-password", "-w", "-a", "Chrome", "-s", "Chrome Safe Storage"], capture_output=True, text=True)
+    result = subprocess.run(["security", "find-generic-password", "-w", "-a", "Chrome", "-s", "Chrome Safe Storage"], capture_output=True, text=True, timeout=10)
     if result.returncode != 0: return {}
     key = pbkdf2_hmac('sha1', result.stdout.strip().encode(), b'saltysalt', 1003, 16)
     cookies = {}
@@ -240,7 +239,7 @@ def chatgpt_headers(cookies, base, ua, debug_profile: str | None = None):
                "Accept-Language": "en-US,en;q=0.9", "Sec-Fetch-Site": "same-origin", "Sec-Fetch-Mode": "cors",
                "Sec-Fetch-Dest": "empty"}
     try:
-        session = fetch_json(f"{base}/api/auth/session", cookies, headers)
+        session = fetch_json(f"{base}/api/auth/session", cookies, headers, timeout=10, retries=0)
         if token := session.get("accessToken"): headers["Authorization"] = f"Bearer {token}"
         if aid := session.get("account", {}).get("id"): headers["ChatGPT-Account-ID"] = aid
         if debug_profile: typer.echo(f"  chatgpt chrome profile={debug_profile} user={session.get('user', {}).get('email')}", flush=True)
@@ -251,7 +250,7 @@ def chatgpt_headers(cookies, base, ua, debug_profile: str | None = None):
 def merge_results(dst: "ParseResult", src: "ParseResult"):
     dst.convs += src.convs; dst.msgs += src.msgs; dst.tools += src.tools; dst.attachs += src.attachs
 
-def fetch_json(url: str, cookies: dict[str, str], headers: dict = None, timeout: int = 30, retries: int = 2) -> dict:
+def fetch_json(url: str, cookies: dict[str, str], headers: dict = None, timeout: int = 15, retries: int = 1) -> dict:
     parts = []
     for k, v in cookies.items():
         s = f"{k}={v}"
@@ -267,7 +266,9 @@ def fetch_json(url: str, cookies: dict[str, str], headers: dict = None, timeout:
                 return json.loads(resp.read())
         except Exception as e:
             if i == retries: raise
-            time.sleep(1 + i)
+            delay = 30*(i+1) if getattr(e, "code", None) == 429 else 1+i
+            if getattr(e, "code", None) == 429: typer.echo(f"  rate limited; retrying in {delay}s", err=True)
+            time.sleep(delay)
 
 # ---- result type ----
 class ParseResult:
@@ -315,13 +316,14 @@ def chatgpt_mapping(cid: str, mapping: dict) -> tuple[list, list, list]:
         attachs += att
     return msgs, tools, attachs
 
-def fetch_chatgpt(browser: str = "safari", limit: int = 0) -> ParseResult:
+def fetch_chatgpt(browser: str = "safari", limit: int = 0, profiles: list[str | None] | None = None, known: dict | None = None) -> ParseResult:
     hosts = [("https://chatgpt.com", ["chatgpt.com"]),
              ("https://chat.openai.com", ["chat.openai.com", "openai.com"])]
     debug = os.environ.get("CONVOS_CHATGPT_DEBUG")
     ua = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15"
           if browser == "safari" else
           "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+    known = known or {}
 
     def fetch_with_profile(profile: str | None) -> ParseResult:
         cookies, base = chatgpt_cookie_base(browser, hosts, profile)
@@ -330,38 +332,39 @@ def fetch_chatgpt(browser: str = "safari", limit: int = 0) -> ParseResult:
         def parse_item_raw(item):
             cid = gen_id("chatgpt", item["id"])
             gizmo = item.get("gizmo_id")
-            conv = fetch_json(f"{base}/backend-api/conversation/{item['id']}", cookies, headers, timeout=60)
+            conv = fetch_json(f"{base}/backend-api/conversation/{item['id']}", cookies, headers, timeout=20, retries=2)
             msgs, tools, attachs = chatgpt_mapping(cid, conv.get("mapping", {}))
             return dict(conv=dict(id=cid, source="chatgpt", title=item.get("title"), created_at=ts_any(conv.get("create_time") or item.get("create_time")),
                                   updated_at=ts_any(conv.get("update_time") or item.get("update_time")), model=item.get("model"), cwd=None, git_branch=None,
                                   project_id=gizmo, metadata=json.dumps({"gizmo_id": gizmo}) if gizmo else "{}"),
                         msgs=msgs, tools=tools, attachs=attachs)
-        def parse_item(item): return safe_parse(f"chatgpt web conv {item.get('id') if isinstance(item, dict) else 'unknown'}", parse_item_raw, item)
         offset, total, fetched, seen = 0, None, 0, set()
         while True:
-            data = fetch_json(f"{base}/backend-api/conversations?offset={offset}&limit=100", cookies, headers, timeout=60)
+            data = fetch_json(f"{base}/backend-api/conversations?offset={offset}&limit=100", cookies, headers, timeout=20, retries=1)
             total = total if total is not None else data.get("total")
             items, keys = data.get("items", []), ",".join(data.keys())
             if debug: print(f"  chatgpt page offset={offset} items={len(items)} total={total} keys={keys}", flush=True)
             if not items: break
-            page = [it for it in items if it["id"] not in seen][: (limit - fetched) if limit > 0 else len(items)]
-            for it in page: seen.add(it["id"])
-            with ThreadPoolExecutor(max_workers=min(4, len(page))) as ex:
-                results = [x for x in ex.map(parse_item, page) if x] if page else []
+            fresh = [it for it in items if it["id"] not in seen]; seen.update(it["id"] for it in fresh)
+            if not fresh: break
+            page = [it for it in fresh if (cid := gen_id("chatgpt", it["id"])) not in known or known[cid] is None or (updated := ts_any(it.get("update_time"))) is None or updated.timestamp() > known[cid]][: (limit - fetched) if limit > 0 else len(fresh)]
+            results = []
+            for i, item in enumerate(page, 1):
+                try: results.append(parse_item_raw(item))
+                except Exception as e: raise RuntimeError(f"detail fetch failed: {e}") from e
+                if i % 20 == 0 or i == len(page): typer.echo(f"  chatgpt details {fetched+i}")
+                if len(page) > 20: time.sleep(.5)
             r.convs += [x["conv"] for x in results]; r.msgs += [m for x in results for m in x["msgs"]]
             r.tools += [t for x in results for t in x["tools"]]; r.attachs += [a for x in results for a in x["attachs"]]
             fetched += len(results)
             offset += len(items)
-            if not page: break
             if limit > 0 and fetched >= limit: break
-            if total and fetched > total: total = None
-            typer.echo(f"  fetched {fetched}{'/' + str(total) if total else ''}")
         return r
     out, errs = ParseResult(), []
-    for profile in chatgpt_profiles(browser):
+    for profile in profiles if profiles is not None else chatgpt_profiles(browser):
         try: merge_results(out, fetch_with_profile(profile))
         except Exception as e: errs.append(f"{profile or 'default'}: {e}")
-    if errs and not out.convs: raise ValueError("ChatGPT fetch failed -- " + " | ".join(errs))
+    if errs and (profiles is not None or not out.convs or any("detail fetch failed" in e for e in errs)): raise ValueError("ChatGPT fetch failed -- " + " | ".join(errs))
     return out
 
 def fetch_claude(browser: str = "safari", limit: int = 0, since: datetime = None) -> ParseResult:
@@ -415,7 +418,7 @@ def fetch_claude(browser: str = "safari", limit: int = 0, since: datetime = None
         return True
     for idx, item in enumerate(items):
         cid = item.get("uuid") if isinstance(item, dict) else "unknown"
-        did_fetch = safe_parse(f"claude web conv {cid}", parse_item_raw, item)
+        did_fetch = parse_item_raw(item)
         if did_fetch is False:
             if idx == len(items)-1 or (idx+1) % step == 0: print(f"  claude fetched {fetched}/{len(items)}", flush=True)
             continue
@@ -692,7 +695,7 @@ def flush_fts():
             conn = get_db()
             try: rebuild_fts_index(conn)
             finally: conn.close()
-        except Exception: HOOK_FTS_DIRTY.touch(); raise
+        except BaseException: HOOK_FTS_DIRTY.touch(); raise
         finally: claim.unlink(missing_ok=True)
     return True
 
@@ -741,7 +744,7 @@ def embed_hook_pending(all_msgs=False, batch=32):
             elif not all_msgs: return
         ids = json.loads(claim.read_text()) if claim.exists() else []
         try: embed_pending(batch, None if all_msgs else ids)
-        except Exception:
+        except BaseException:
             with (HOOK_DIR/".lock").open("w") as lock: fcntl.flock(lock, fcntl.LOCK_EX); merge_embed_dirty(ids)
             raise
         finally: claim.unlink(missing_ok=True)
@@ -782,8 +785,9 @@ def emit(data, fmt):
     if fmt == "jsonl" and isinstance(data, list): [typer.echo(json.dumps(r, default=str)) for r in data]
     else: typer.echo(json.dumps(data, default=str))
 
-@app.command(hidden=True)
-def hook(source: str):
+@app.command("hook", hidden=True)
+@app.command("capture", hidden=True)
+def capture(source: str):
     try: enqueue_hook(source, json.loads(sys.stdin.read() or "{}"))
     except Exception as e: log_parse_error(f"{source} hook", e)
 
@@ -874,6 +878,9 @@ def doctor(verbose: bool = typer.Option(False, "-v")):
         except Exception as e: typer.echo(f"archive: unavailable ({e})")
     else: typer.echo(f"archive: missing ({DB_PATH})"); typer.echo("repair: convos init")
     install_hooks(status=True)
+    for ep in entry_points(group="convos.doctor"):
+        try: typer.echo(ep.load()())
+        except Exception as e: typer.echo(f"{ep.name}: unavailable ({e})")
     def has(domains, host): return any(host in d or d in host for d in domains)
     targets = ["chatgpt.com", "chat.openai.com", "openai.com", "claude.ai"]
     for name, getter in [("safari", safari_cookie_domains), ("chrome", chrome_cookie_domains)]:
@@ -904,15 +911,15 @@ def install_skills():
         typer.echo(f"Installed {dest}")
 
 def edit_hook_config(path, events, source, remove=False):
-    data = json.loads(path.read_text()) if path.exists() else {}; hooks = data.setdefault("hooks", {}); suffix = f" hook {source}"
+    data = json.loads(path.read_text()) if path.exists() else {}; hooks = data.setdefault("hooks", {}); suffixes, messages = (f" hook {source}", f" capture {source}"), ("Updating conversation archive", "Saving conversation to Convos")
     for event in list(hooks):
-        for group in hooks[event]: group["hooks"] = [h for h in group.get("hooks", []) if not (h.get("command", "").endswith(suffix) and h.get("statusMessage") == "Updating conversation archive")]
+        for group in hooks[event]: group["hooks"] = [h for h in group.get("hooks", []) if not (h.get("command", "").endswith("convos remote hook") or h.get("command", "").endswith(suffixes) and h.get("statusMessage") in messages)]
         hooks[event] = [g for g in hooks[event] if g.get("hooks")]
         if not hooks[event]: del hooks[event]
     if not remove:
-        cmd = f"{shlex.quote(shutil.which('convos') or 'convos')} hook {source}"
-        for event in events: hooks.setdefault(event, []).append(dict(hooks=[dict(type="command", command=cmd, timeout=5, statusMessage="Updating conversation archive")]))
-    atomic_json(path, data); return sum(h.get("command", "").endswith(suffix) and h.get("statusMessage") == "Updating conversation archive" for gs in hooks.values() for g in gs for h in g.get("hooks", []))
+        root=Path(os.environ.get("CONVOS_PROJECT_ROOT",PROJECT_ROOT)).expanduser().resolve(); cmd = f"{f'CONVOS_PROJECT_ROOT={shlex.quote(str(root))} ' if root!=Path.home()/'.convos' else ''}{shlex.quote(shutil.which('convos') or 'convos')} capture {source}"
+        for event in events: hooks.setdefault(event, []).append(dict(hooks=[dict(type="command", command=cmd, timeout=5, statusMessage="Saving conversation to Convos")]))
+    atomic_json(path, data); return sum(h.get("command", "").endswith(suffixes) and h.get("statusMessage") in messages for gs in hooks.values() for g in gs for h in g.get("hooks", []))
 
 @app.command("install-hooks")
 def install_hooks(remove: bool = typer.Option(False, "--remove"), status: bool = typer.Option(False, "--status")):
@@ -920,7 +927,7 @@ def install_hooks(remove: bool = typer.Option(False, "--remove"), status: bool =
             (Path(os.environ.get("CODEX_HOME", Path.home()/".codex"))/"hooks.json", ("Stop",), "codex")]
     for path, events, source in cfgs:
         if status:
-            data = json.loads(path.read_text()) if path.exists() else {}; n = sum(h.get("command", "").endswith(f" hook {source}") and h.get("statusMessage") == "Updating conversation archive" for gs in data.get("hooks", {}).values() for g in gs for h in g.get("hooks", []))
+            data = json.loads(path.read_text()) if path.exists() else {}; n = sum(h.get("command", "").endswith((f" hook {source}", f" capture {source}")) and h.get("statusMessage") in ("Updating conversation archive", "Saving conversation to Convos") for gs in data.get("hooks", {}).values() for g in gs for h in g.get("hooks", []))
         else: n = edit_hook_config(path, events, source, remove)
         typer.echo(f"{source}: {n} hook{'s' if n != 1 else ''}{' installed' if not status and not remove else ''} ({path})")
     if not status and not remove: typer.echo("Start a new agent session; in Codex, review the user hook with `/hooks`.")
@@ -949,10 +956,11 @@ def export(output: Path, fmt: str = typer.Option("json", "-f"), source: Optional
 
 @app.command()
 def sync(watch: bool = typer.Option(False, "-w"), interval: int = typer.Option(300, "-i"), claude_code: bool = True, codex: bool = True, full: bool = typer.Option(False, "--full", help="Re-parse/re-fetch everything, ignoring incremental state"), verbose: bool = typer.Option(False, "-v", "--verbose")):
+    if sys.argv[1:2] == ["sync"]: signal.signal(signal.SIGINT, signal.SIG_DFL)
     conn = get_db(); init_schema(conn); conn.close()
     drain_hooks()
     state, dirty = load_state(), False
-    local, web, imports = state.setdefault("local", {}), state.setdefault("web", {}), state.setdefault("imports", {})
+    local, web, imports, chatgpt_ok = state.setdefault("local", {}), state.setdefault("web", {}), state.setdefault("imports", {}), {}
     def set_state(section, key, val):
         nonlocal dirty
         if state.setdefault(section, {}).get(key) != val: state[section][key] = val; dirty = True
@@ -970,8 +978,7 @@ def sync(watch: bool = typer.Option(False, "-w"), interval: int = typer.Option(3
         hosts = [("https://chatgpt.com", ["chatgpt.com"]),
                  ("https://chat.openai.com", ["chat.openai.com", "openai.com"])]
         profiles = chatgpt_profiles(browser)
-        errors = []
-        heads = []
+        errors, heads, ok = [], [], []
         ua = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15"
               if browser == "safari" else
               "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
@@ -980,10 +987,10 @@ def sync(watch: bool = typer.Option(False, "-w"), interval: int = typer.Option(3
                 cookies, base = chatgpt_cookie_base(browser, hosts, profile)
                 headers = chatgpt_headers(cookies, base, ua)
                 items = fetch_json(f"{base}/backend-api/conversations?offset=0&limit=1", cookies, headers)["items"]
-                if items: heads.append(f"{profile or 'default'}:{items[0]['id']}:{items[0].get('update_time')}")
+                if items: heads.append(f"{profile or 'default'}:{items[0]['id']}:{items[0].get('update_time')}"); ok.append(profile)
             except Exception as e:
                 errors.append(f"chatgpt.com{f'/{profile}' if profile else ''}: {e}")
-        if heads: return "|".join(heads)
+        if heads: chatgpt_ok[browser] = ok; return "|".join(heads)
         raise ValueError(f"ChatGPT request failed in {browser}: " + " | ".join(errors)) if errors else ValueError("ChatGPT request failed")
     def probe_claude(browser):
         cookies = get_cookies("claude.ai", browser)
@@ -999,7 +1006,7 @@ def sync(watch: bool = typer.Option(False, "-w"), interval: int = typer.Option(3
         if not items: return None
         item = items[0]
         return f"{item['uuid']}:{item.get('updated_at') or item.get('created_at')}"
-    def plan_web(name, fetcher, probe):
+    def plan_web(name, fetcher, probe, known=None):
         pref = web.get(name, {})
         forced = os.environ.get(f"CONVOS_{name.upper()}_BROWSER")
         order = [forced] if forced else [pref.get("browser")] + [b for b in ("safari", "chrome") if b != pref.get("browser")]
@@ -1007,12 +1014,12 @@ def sync(watch: bool = typer.Option(False, "-w"), interval: int = typer.Option(3
         for b in [x for x in order if x]:
             try:
                 head = probe(b); lu = head.split(":", 1)[1] if (name == "claude" and head and ":" in head) else None
-                if head is not None and head == pref.get("head") and not full:
+                if head is not None and head == pref.get("head") and not full and (name != "chatgpt" or ":None" not in head):
                     set_state("web", name, {"browser": b, "head": head, **({"last_updated": lu} if lu else {})}); return None
                 last = pref.get("last_updated")
                 since = ts_from_iso(last) if (name == "claude" and last and not full) else None
                 st = {"browser": b, "head": head, **({"last_updated": lu} if lu else {})}
-                func = (lambda b=b, since=since: fetcher(b, since=since)) if name == "claude" else (lambda b=b: fetcher(b))
+                func = (lambda b=b, since=since: fetcher(b, since=since)) if name == "claude" else (lambda b=b: fetcher(b, profiles=chatgpt_ok[b], known=known))
                 return dict(name=name, label=name.title(), source=name, func=func, state=("web", name, st))
             except Exception as e:
                 errors.append(f"{b}: {e}")
@@ -1025,8 +1032,8 @@ def sync(watch: bool = typer.Option(False, "-w"), interval: int = typer.Option(3
         return dict(name=f"import:{path}", label=f"import:{path}", func=lambda p=path: parse_source(p), state=("imports", str(path), {"mtime": mtime}))
     def do_sync():
         nonlocal dirty
-        t0 = time.perf_counter(); dirty, total, changed, jobs, newc, updc = False, [0]*5, False, [], 0, 0
-        conn = get_db(read_only=True); cur = counts_by_source(conn); conn.close(); fmt = lambda v: f"{v[0]} convs, {v[1]} msgs, {v[2]} tools, {v[3]} attachs, {v[4]} edits"
+        t0 = time.perf_counter(); dirty, total, changed, jobs, newc, updc = False, [0]*5, set(), [], 0, 0
+        conn = get_db(read_only=True); cur = counts_by_source(conn); known = {cid: ts.timestamp() if ts else None for cid, ts in conn.execute("SELECT id,updated_at FROM conversations WHERE source='chatgpt'").fetchall()}; conn.close(); fmt = lambda v: f"{v[0]} convs, {v[1]} msgs, {v[2]} tools, {v[3]} attachs, {v[4]} edits"
         start = lambda label, src=None: typer.echo(f"Syncing {label}" if not src else f"Syncing {label} ({fmt(cur.setdefault(src, [0]*5))})")
         if paths := [Path(p).expanduser() for p in os.environ.get("CONVOS_IMPORT_PATHS", "").split(",") if p.strip()]:
             start("imports")
@@ -1035,7 +1042,7 @@ def sync(watch: bool = typer.Option(False, "-w"), interval: int = typer.Option(3
             start("Claude Code", "claude-code"); jobs += [j for j in [plan_local("claude-code", p, parse_claude_code)] if j]
         if codex and (p := Path.home() / ".codex").exists():
             start("Codex", "codex"); jobs += [j for j in [plan_local("codex", p, parse_codex)] if j]
-        start("ChatGPT", "chatgpt"); jobs += [j for j in [plan_web("chatgpt", fetch_chatgpt, probe_chatgpt)] if j]
+        start("ChatGPT", "chatgpt"); jobs += [j for j in [plan_web("chatgpt", fetch_chatgpt, probe_chatgpt, {} if full else known)] if j]
         start("Claude", "claude"); jobs += [j for j in [plan_web("claude", fetch_claude, probe_claude)] if j]
         verbose and typer.echo(f"Planning took {time.perf_counter()-t0:.2f}s")
         if jobs:
@@ -1050,14 +1057,11 @@ def sync(watch: bool = typer.Option(False, "-w"), interval: int = typer.Option(3
                     except Exception as e: typer.echo(f"{j['name']} failed: {e}"); continue
                     total = [total[i]+v for i, v in enumerate([c, m, t, a, e])]
                     newc, updc = newc+n, updc+u
-                    changed |= bool(changed_ids)
+                    changed |= changed_ids
                     if st := j.get("state"): set_state(*st)
-                    if dirty: save_state(state); dirty = False
                     if src := j.get("source"): typer.echo(f"Updated {j['label']} ({n} new, {u} updated convs; {fmt([c, m, t, a, e])} processed){' in %.2fs' % (time.perf_counter()-j['t']) if verbose else ''}")
-        if changed: HOOK_FTS_DIRTY.touch()
-        flush_fts()
-        try: embed_hook_pending(True)
-        except ImportError: pass
+        if changed:
+            with (HOOK_DIR/".lock").open("w") as lock: fcntl.flock(lock, fcntl.LOCK_EX); HOOK_FTS_DIRTY.touch(); merge_embed_dirty(changed)
         if dirty: save_state(state)
         verbose and typer.echo(f"Total sync time {time.perf_counter()-t0:.2f}s")
         return total, newc, updc

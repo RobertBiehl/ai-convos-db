@@ -11,6 +11,16 @@ read_when:
 
 DuckDB database at `<root>/data/convos.db`. Default root is `~/.convos` (override with `CONVOS_PROJECT_ROOT`).
 
+The optional encrypted remote keeps its immutable event ledger and typed
+provenance projection in `<root>/remote/state.db`. This is separate from the
+core schema and rebuildable from signed events. Stable application views are
+`file_history`, `changeset_files`, `conversation_changes`,
+`commit_conversations`, `repository_activity`,
+`workspace_repository_activity`, `identity_assertions`, `capture_gaps`,
+`device_activity`, `checkpoint_states`, `sharing_boundaries`, and
+`repository_lineages`. Use `convos remote graph VIEW [ARG]`; applications do
+not parse encrypted envelopes.
+
 ## Tables
 
 ### conversations
@@ -135,11 +145,12 @@ Embeddings are produced by embeddinggemma-300M (768d) with the
 time. Truncation only — no chunking — at 1600 chars.
 
 Use `convos embed` to backfill missing embeddings without fetching from web
-APIs. `convos sync` also embeds new or changed messages after upsert. Embedding
-inference runs without a database lock; only each result batch update is locked.
+APIs. Hooks and `convos sync` queue new or changed messages for just-in-time
+embedding by `convos query`. Inference runs without a database lock; only each
+result batch update is locked.
 
 The `embedding` column is preserved across upserts when message `content`
-is unchanged, so sync only re-embeds new or edited messages.
+is unchanged, so only new or edited messages are queued again.
 
 ## ID Generation
 
