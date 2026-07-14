@@ -56,6 +56,14 @@ sync, legacy state without a frontier, and `convos sync --full` cover the
 complete list. The backend API is unofficial; `--full` remains the
 reconciliation path if its ordering behavior changes.
 
+Live list and detail responses expose no rate-limit metadata. During migration,
+the first HTTP 429 responses followed roughly 192-200 completed detail
+requests. Because the backend publishes neither its quota nor reset window,
+bulk fetches use a conservative policy: a 20-request burst, then bulk-list,
+detail, and retry attempts are paced at 160 requests per five minutes. This
+leaves headroom for auth and probe calls. A retried ChatGPT 429 waits at least
+five minutes and honors a larger numeric `Retry-After` value.
+
 **Get conversation detail:**
 ```
 GET https://chat.openai.com/backend-api/conversation/{id}

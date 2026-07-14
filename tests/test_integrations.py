@@ -152,15 +152,26 @@ class TestChatGPTAPI:
         with pytest.raises(ValueError, match="detail timeout"): cli.fetch_chatgpt("safari", sink=lambda r: saved.append([c["id"] for c in r.convs]))
         assert saved == [[cli.gen_id("chatgpt", f"ok{i}") for i in range(20)]]
 
-    def test_fetch_chatgpt_cools_down_after_rate_limit(self, monkeypatch):
+    def test_fetch_chatgpt_paces_before_observed_limit(self, monkeypatch):
         from ai_convos import cli
-        monkeypatch.setattr(cli,"chatgpt_profiles",lambda _:[None]); monkeypatch.setattr(cli,"chatgpt_cookie_base",lambda *a,**k:({},"https://chatgpt.com")); monkeypatch.setattr(cli,"chatgpt_headers",lambda *a,**k:{}); sleeps, first = [], {"done":False}
+        monkeypatch.setattr(cli,"chatgpt_profiles",lambda _:[None]); monkeypatch.setattr(cli,"chatgpt_cookie_base",lambda *a,**k:({},"https://chatgpt.com")); monkeypatch.setattr(cli,"chatgpt_headers",lambda *a,**k:{"ChatGPT-Account-ID":"acct"}); sleeps, clock, details = [], [0], []; items = [{"id":str(i),"update_time":i} for i in range(21)]
         def fake(url,*a,**k):
-            if "/conversations?" in url: return {"items":[{"id":"a","update_time":2},{"id":"b","update_time":1}],"total":2}
-            if not first["done"]: first["done"] = True; k["on_rate_limit"](30)
+            k["before_request"]()
+            if "/conversations?" in url: return {"items":items,"total":len(items)}
+            details.append(url.rsplit("/",1)[-1])
             return {"mapping":{}}
-        monkeypatch.setattr(cli,"fetch_json",fake); monkeypatch.setattr(cli.time,"sleep",lambda n:sleeps.append(n)); cli.fetch_chatgpt("safari")
-        assert len(sleeps)==1 and sleeps[0]>299
+        monkeypatch.setattr(cli,"fetch_json",fake); monkeypatch.setattr(cli.time,"monotonic",lambda:clock[0]); monkeypatch.setattr(cli.time,"sleep",lambda n:(sleeps.append(n),clock.__setitem__(0,clock[0]+n))); cli.fetch_chatgpt("safari")
+        assert details==[str(i) for i in range(21)] and sleeps==pytest.approx([1.875,1.875])
+
+    @pytest.mark.parametrize("shared,expected", [(True,2),(False,0)])
+    def test_fetch_chatgpt_rate_budget_is_account_scoped(self, monkeypatch, shared, expected):
+        from ai_convos import cli
+        sleeps, clock = [], [0]; monkeypatch.setattr(cli,"chatgpt_cookie_base",lambda _b,_h,p:({},f"https://chatgpt.com/{p}")); monkeypatch.setattr(cli,"chatgpt_headers",lambda _c,b,*a,**k:{"ChatGPT-Account-ID":"same" if shared else b})
+        def fake(url,*a,**k):
+            k["before_request"](); profile = url.split("chatgpt.com/",1)[1].split("/",1)[0]
+            return {"items":[{"id":f"{profile}-{i}","update_time":i} for i in range(10)],"total":10} if "/conversations?" in url else {"mapping":{}}
+        monkeypatch.setattr(cli,"fetch_json",fake); monkeypatch.setattr(cli.time,"monotonic",lambda:clock[0]); monkeypatch.setattr(cli.time,"sleep",lambda n:(sleeps.append(n),clock.__setitem__(0,clock[0]+n))); cli.fetch_chatgpt("safari",profiles=["A","B"])
+        assert len(sleeps)==expected
 
     def test_fetch_chatgpt_skips_unrelated_chrome_profile(self, monkeypatch):
         from ai_convos import cli
@@ -513,13 +524,11 @@ class TestHTTPErrors:
                 fetch_json("https://api.example.com", {"session": "test"})
             assert exc_info.value.code == 401
 
-    def test_429_uses_visible_long_backoff(self):
+    @pytest.mark.parametrize("headers,delay", [({},300),({"Retry-After":"420"},420)])
+    def test_429_uses_visible_long_backoff(self, headers, delay):
         from ai_convos.cli import fetch_json
         import urllib.error
-        error = urllib.error.HTTPError("https://api.example.com", 429, "Too Many Requests", {}, None)
-        limited = []
-        def cooldown(delay): limited.append(delay); return 300
+        error = urllib.error.HTTPError("https://api.example.com", 429, "Too Many Requests", headers, None); before = MagicMock()
         with patch("urllib.request.urlopen", side_effect=error), patch("time.sleep") as sleep:
-            with pytest.raises(urllib.error.HTTPError): fetch_json("https://api.example.com", {}, retries=2, on_rate_limit=cooldown)
-        assert [x.args[0] for x in sleep.call_args_list] == [300, 300]
-        assert limited == [30, 60]
+            with pytest.raises(urllib.error.HTTPError): fetch_json("https://api.example.com", {}, retries=2, before_request=before, rate_limit_backoff=300)
+        assert [x.args[0] for x in sleep.call_args_list] == [delay,delay] and before.call_count == 3

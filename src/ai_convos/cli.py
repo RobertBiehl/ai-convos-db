@@ -15,6 +15,7 @@ PROJECT_ROOT = find_root()
 DATA_DIR, DB_PATH = PROJECT_ROOT / "data", PROJECT_ROOT / "data" / "convos.db"
 STATE_PATH = DATA_DIR / "sync_state.json"
 HOOK_DIR, HOOK_STATE, HOOK_EMBED_DIRTY, HOOK_FTS_DIRTY = DATA_DIR/"hook_inbox", DATA_DIR/"hook_state.json", DATA_DIR/"hook_embeddings_dirty", DATA_DIR/"hook_fts_dirty"
+CHATGPT_BURST, CHATGPT_RATE = 20, 8/15  # conservative policy below the observed ~200-detail failure point
 
 # ---- db helpers ----
 def get_db(read_only: bool = False):
@@ -217,7 +218,7 @@ def chatgpt_headers(cookies, base, ua, debug_profile: str | None = None):
                "Accept-Language": "en-US,en;q=0.9", "Sec-Fetch-Site": "same-origin", "Sec-Fetch-Mode": "cors",
                "Sec-Fetch-Dest": "empty"}
     try:
-        session = fetch_json(f"{base}/api/auth/session", cookies, headers, timeout=10, retries=0)
+        session = fetch_json(f"{base}/api/auth/session", cookies, headers, timeout=10, retries=0, rate_limit_backoff=300)
         if token := session.get("accessToken"): headers["Authorization"] = f"Bearer {token}"
         if aid := session.get("account", {}).get("id"): headers["ChatGPT-Account-ID"] = aid
         if debug_profile: typer.echo(f"  chatgpt chrome profile={debug_profile} user={session.get('user', {}).get('email')}", flush=True)
@@ -227,7 +228,7 @@ def chatgpt_headers(cookies, base, ua, debug_profile: str | None = None):
 
 def merge_results(dst: "ParseResult", src: "ParseResult"): dst.convs += src.convs; dst.msgs += src.msgs; dst.tools += src.tools; dst.attachs += src.attachs
 
-def fetch_json(url: str, cookies: dict[str, str], headers: dict = None, timeout: int = 15, retries: int = 1, on_rate_limit=None) -> dict:
+def fetch_json(url: str, cookies: dict[str, str], headers: dict = None, timeout: int = 15, retries: int = 1, before_request=None, rate_limit_backoff=None) -> dict:
     parts = []
     for k, v in cookies.items():
         s = f"{k}={v}"
@@ -238,13 +239,15 @@ def fetch_json(url: str, cookies: dict[str, str], headers: dict = None, timeout:
     hdrs = {"Cookie": cookie_str, "User-Agent": "Mozilla/5.0", "Accept": "application/json", **(headers or {})}
     req = urllib.request.Request(url, headers=hdrs)
     for i in range(retries+1):
+        before_request and before_request()
         try:
             with urllib.request.urlopen(req, context=ssl.create_default_context(), timeout=timeout) as resp:
                 return json.loads(resp.read())
         except Exception as e:
             if i == retries: raise
-            delay = 30*(i+1) if getattr(e, "code", None) == 429 else 1+i
-            if getattr(e, "code", None) == 429: delay = (on_rate_limit(delay) if on_rate_limit else None) or delay; typer.echo(f"  rate limited; retrying in {delay}s", err=True)
+            code, retry = getattr(e, "code", None), (getattr(e, "headers", None) or {}).get("Retry-After", "")
+            delay = max(rate_limit_backoff or 30*(i+1), int(retry)) if code == 429 and str(retry).isdigit() else rate_limit_backoff or 30*(i+1) if code == 429 else 1+i
+            if code == 429: typer.echo(f"  rate limited; retrying in {delay}s", err=True)
             time.sleep(delay)
 
 # ---- result type ----
@@ -292,21 +295,24 @@ def fetch_chatgpt(browser: str = "safari", limit: int = 0, profiles: list[str | 
     hosts = [("https://chatgpt.com", ["chatgpt.com"]), ("https://chat.openai.com", ["chat.openai.com", "openai.com"])]
     debug = os.environ.get("CONVOS_CHATGPT_DEBUG")
     ua = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15" if browser == "safari" else "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-    known, legacy, frontiers = known or {}, legacy or set(), frontiers or {}
+    known, legacy, frontiers, limiters = known or {}, legacy or set(), frontiers or {}, {}
 
     def fetch_with_profile(profile: str | None) -> ParseResult:
         cookies, base = chatgpt_cookie_base(browser, hosts, profile)
         headers = chatgpt_headers(cookies, base, ua, debug_profile=profile if debug else None)
-        key, account, r, cooldown = profile or "default", headers.get("ChatGPT-Account-ID"), ParseResult(), [0]; saved = frontiers.get(key, {}); matched = account and isinstance(saved, dict) and saved.get("account") == account; frontier, boundary = (ts_any(saved.get("updated")), saved.get("id")) if matched else (None, None)
-        def limited(_): cooldown[0] = time.monotonic()+300; return 300
+        key, account, r = profile or "default", headers.get("ChatGPT-Account-ID"), ParseResult(); saved = frontiers.get(key, {}); matched = account and isinstance(saved, dict) and saved.get("account") == account; frontier, boundary = (ts_any(saved.get("updated")), saved.get("id")) if matched else (None, None); bucket = limiters.setdefault(("account",account) if account else ("profile",browser,key), [CHATGPT_BURST,time.monotonic()])
+        def pace():
+            now = time.monotonic(); bucket[0] = min(CHATGPT_BURST, bucket[0]+(now-bucket[1])*CHATGPT_RATE); bucket[1] = now
+            if bucket[0] < 1: time.sleep((1-bucket[0])/CHATGPT_RATE); bucket[:] = [0,time.monotonic()]
+            else: bucket[0] -= 1
         def parse_item_raw(item):
-            cid, gizmo = gen_id("chatgpt", item["id"]), item.get("gizmo_id"); conv = fetch_json(f"{base}/backend-api/conversation/{item['id']}", cookies, headers, timeout=20, retries=2, on_rate_limit=limited)
+            cid, gizmo = gen_id("chatgpt", item["id"]), item.get("gizmo_id"); conv = fetch_json(f"{base}/backend-api/conversation/{item['id']}", cookies, headers, timeout=20, retries=2, before_request=pace, rate_limit_backoff=300)
             msgs, tools, attachs = chatgpt_mapping(cid, conv.get("mapping", {})); times = [m["created_at"] for m in msgs if m["created_at"]]
             return dict(conv=dict(id=cid, source="chatgpt", title=item.get("title"), created_at=ts_any(conv.get("create_time") or item.get("create_time")) or min(times, key=datetime.timestamp, default=None), updated_at=ts_any(conv.get("update_time") or item.get("update_time")) or max(times, key=datetime.timestamp, default=None), model=item.get("model"), cwd=None, git_branch=None,
                                   project_id=gizmo, metadata=json.dumps({"remote_update_time":conv.get("update_time") or item.get("update_time"), **({"gizmo_id":gizmo} if gizmo else {})})), msgs=msgs, tools=tools, attachs=attachs)
         listed, seen, tail, offset, fetched, total = [], set(), set(), 0, 0, None
         while True:
-            data = fetch_json(f"{base}/backend-api/conversations?offset={offset}&limit=100&order=updated", cookies, headers, timeout=20, retries=1)
+            data = fetch_json(f"{base}/backend-api/conversations?offset={offset}&limit=100&order=updated", cookies, headers, timeout=20, retries=1, before_request=pace, rate_limit_backoff=300)
             raw, reported, keys = data.get("items", []), data.get("total"), ",".join(data.keys())
             if debug: print(f"  chatgpt page offset={offset} items={len(raw)} total={reported} keys={keys}", flush=True)
             if total is not None and reported is not None and reported < total: raise RuntimeError(f"unstable list total {total}->{reported}")
@@ -322,13 +328,12 @@ def fetch_chatgpt(browser: str = "safari", limit: int = 0, profiles: list[str | 
             if stop or reported is not None and offset+len(raw) >= reported: break
             offset += max(1, len(raw)-20)
         page = [it for it in listed if (cid := gen_id("chatgpt", it["id"])) not in known or known[cid] is None or (updated := ts_any(it.get("update_time"))) is None or updated.timestamp() > known[cid]+(5 if cid in legacy else 0)][:limit or len(listed)]
+        if len(page) > CHATGPT_BURST: typer.echo(f"  chatgpt pacing bulk fetch ({CHATGPT_BURST} burst, then {int(CHATGPT_RATE*300)} requests/5m)")
         for at in range(0, len(page), 20):
             results = []
             for item in page[at:at+20]:
-                if (wait := cooldown[0]-time.monotonic()) > 0: typer.echo(f"  chatgpt cooldown {int(wait)+1}s", err=True); time.sleep(wait)
                 try: results.append(parse_item_raw(item))
                 except Exception as e: raise RuntimeError(f"detail fetch failed: {e}") from e
-                if len(page) > 20: time.sleep(.5)
             chunk = ParseResult([x["conv"] for x in results], [m for x in results for m in x["msgs"]], [t for x in results for t in x["tools"]], [a for x in results for a in x["attachs"]]); sink(chunk) if sink else merge_results(r, chunk)
             fetched += len(results); typer.echo(f"  chatgpt details {fetched}")
         return r
@@ -958,7 +963,7 @@ def sync(watch: bool = typer.Option(False, "-w"), interval: int = typer.Option(3
             try:
                 cookies, base = chatgpt_cookie_base(browser, hosts, profile)
                 headers = chatgpt_headers(cookies, base, ua)
-                items = fetch_json(f"{base}/backend-api/conversations?offset=0&limit=1&order=updated", cookies, headers)["items"]
+                items = fetch_json(f"{base}/backend-api/conversations?offset=0&limit=1&order=updated", cookies, headers, rate_limit_backoff=300)["items"]
                 account = headers.get("ChatGPT-Account-ID")
                 if items and (not account or account not in accounts): item = items[0]; heads.append(f"{profile or 'default'}:{item['id']}:{item.get('update_time')}"); ok.append(profile); frontiers[profile or "default"] = {"account":account,"updated":item.get("update_time"),"id":item["id"]}; account and accounts.add(account)
             except Exception as e:
