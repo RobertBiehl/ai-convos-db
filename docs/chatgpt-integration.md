@@ -19,7 +19,7 @@ Uses browser cookies to authenticate with ChatGPT's backend API.
 
 **List conversations:**
 ```
-GET https://chat.openai.com/backend-api/conversations?offset=0&limit=100
+GET https://chat.openai.com/backend-api/conversations?offset=0&limit=100&order=updated
 ```
 
 Response:
@@ -39,6 +39,22 @@ Response:
   "offset": 0
 }
 ```
+
+Incremental sync uses this newest-interaction-first list as a frontier. After a
+complete sync, later runs snapshot entries through the previous newest
+`update_time` (including timestamp ties) before requesting any details, then
+only fetch details for new or updated IDs. Summary pages overlap by 20 entries
+so concurrent list movement cannot silently shift an ID past an offset;
+repeated IDs are deduplicated. Frontiers are scoped to the browser profile and
+ChatGPT account and only reused while every ID covered by the prior sync remains
+in the archive. During the one-time migration, rows without an exact remote
+marker tolerate up to five seconds of list/message timestamp skew; once a detail
+has been fetched, comparisons are exact. Detail batches are committed as they
+finish, but the frontier only advances after the full changed prefix succeeds,
+so an interruption resumes without discarding completed downloads. A first
+sync, legacy state without a frontier, and `convos sync --full` cover the
+complete list. The backend API is unofficial; `--full` remains the
+reconciliation path if its ordering behavior changes.
 
 **Get conversation detail:**
 ```
