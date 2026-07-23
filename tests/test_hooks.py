@@ -78,11 +78,62 @@ def test_sync_defers_fts_and_embeddings(hooks, tmp_path, monkeypatch):
     finally: signal.signal(signal.SIGINT, old)
     assert (data/"hook_fts_dirty").exists() and json.loads((data/"hook_embeddings_dirty").read_text()) == ["sync-m"]
 
-def test_sync_rechecks_chatgpt_head_without_timestamp(hooks, monkeypatch):
-    _, data = hooks; monkeypatch.setattr(cli, "STATE_PATH", data/"sync_state.json"); cli.atomic_json(cli.STATE_PATH, {"web":{"chatgpt":{"browser":"safari","head":"default:c1:None"}}}); called = []
-    monkeypatch.setattr(cli, "chatgpt_profiles", lambda _: [None]); monkeypatch.setattr(cli, "chatgpt_cookie_base", lambda *a: ({}, "https://chatgpt.com")); monkeypatch.setattr(cli, "chatgpt_headers", lambda *a, **k: {}); monkeypatch.setattr(cli, "fetch_json", lambda *a, **k: {"items":[{"id":"c1","update_time":None}]}); monkeypatch.setattr(cli, "fetch_chatgpt", lambda *a, **k: called.append(k) or cli.ParseResult()); monkeypatch.setattr(cli, "get_cookies", lambda *_: {})
+@pytest.mark.parametrize("stamp", [None, 100])
+def test_sync_rechecks_chatgpt_unchanged_head(hooks, monkeypatch, stamp):
+    _, data = hooks; monkeypatch.setattr(cli, "STATE_PATH", data/"sync_state.json"); cli.atomic_json(cli.STATE_PATH, {"web":{"chatgpt":{"browser":"safari","head":f"default:c1:{stamp}"}}}); called = []
+    monkeypatch.setattr(cli, "chatgpt_profiles", lambda _: [None]); monkeypatch.setattr(cli, "chatgpt_cookie_base", lambda *a: ({}, "https://chatgpt.com")); monkeypatch.setattr(cli, "chatgpt_headers", lambda *a, **k: {"ChatGPT-Account-ID":"acct"}); monkeypatch.setattr(cli, "fetch_json", lambda *a, **k: {"items":[{"id":"c1","update_time":stamp}]}); monkeypatch.setattr(cli, "fetch_chatgpt", lambda *a, **k: called.append(k) or cli.ParseResult()); monkeypatch.setattr(cli, "get_cookies", lambda *_: {})
     cli.sync(False, 300, False, False, False, False)
     assert called and called[0]["profiles"] == [None]
+
+def test_sync_repairs_legacy_chatgpt_timestamps_before_comparison(hooks, monkeypatch):
+    _, data = hooks; data.mkdir(); monkeypatch.setattr(cli, "STATE_PATH", data/"sync_state.json"); cid = cli.gen_id("chatgpt","legacy"); when = cli.ts_from_epoch(200)
+    conn = duckdb.connect(str(data/"convos.db")); cli.init_schema(conn); cli.upsert(conn, cli.ParseResult([dict(id=cid,source="chatgpt",title="T",created_at=None,updated_at=None,model=None,cwd=None,git_branch=None,project_id=None,metadata="{}")],[dict(id="legacy-m",conversation_id=cid,role="user",content="old",thinking=None,created_at=when,model=None,metadata="{}",parent_id=None)])); conn.close()
+    cli.atomic_json(cli.STATE_PATH,{"web":{"chatgpt":{"browser":"safari","head":"default:old:100"}}}); captured = []
+    monkeypatch.setattr(cli,"chatgpt_profiles",lambda _:[None]); monkeypatch.setattr(cli,"chatgpt_cookie_base",lambda *a,**k:({},"https://chatgpt.com")); monkeypatch.setattr(cli,"chatgpt_headers",lambda *a,**k:{}); monkeypatch.setattr(cli,"fetch_json",lambda *a,**k:{"items":[{"id":"new","update_time":300}]}); monkeypatch.setattr(cli,"fetch_chatgpt",lambda *a,**k:captured.append(k) or cli.ParseResult()); monkeypatch.setattr(cli,"get_cookies",lambda *_:{})
+    cli.sync(False,300,False,False,False,False); conn = duckdb.connect(str(data/"convos.db"),read_only=True); times = conn.execute("SELECT created_at,updated_at FROM conversations WHERE id=?",[cid]).fetchone(); conn.close()
+    assert times == (when,when) and captured[0]["known"][cid] == when.timestamp() and cid in captured[0]["legacy"]
+
+def test_sync_disables_frontier_when_saved_ids_are_missing(hooks, monkeypatch):
+    _, data = hooks; data.mkdir(); monkeypatch.setattr(cli,"STATE_PATH",data/"sync_state.json"); cid = cli.gen_id("chatgpt","present"); missing = cli.gen_id("chatgpt","missing"); conn = duckdb.connect(str(data/"convos.db")); cli.init_schema(conn); cli.upsert(conn,cli.ParseResult([dict(id=cid,source="chatgpt",title="T",created_at=None,updated_at=cli.ts_any(100),model=None,cwd=None,git_branch=None,project_id=None,metadata="{}")],[])); conn.close(); cli.atomic_json(cli.STATE_PATH,{"web":{"chatgpt":{"browser":"safari","head":"default:old:100","frontiers":{"default":{"account":"acct","updated":100}},"coverage":[missing]}}}); captured = []
+    monkeypatch.setattr(cli,"chatgpt_profiles",lambda _:[None]); monkeypatch.setattr(cli,"chatgpt_cookie_base",lambda *a,**k:({},"https://chatgpt.com")); monkeypatch.setattr(cli,"chatgpt_headers",lambda *a,**k:{"ChatGPT-Account-ID":"acct"}); monkeypatch.setattr(cli,"fetch_json",lambda *a,**k:{"items":[{"id":"new","update_time":200}]}); monkeypatch.setattr(cli,"fetch_chatgpt",lambda *a,**k:captured.append(k) or cli.ParseResult()); monkeypatch.setattr(cli,"get_cookies",lambda *_:{})
+    cli.sync(False,300,False,False,False,False); assert captured[0]["frontiers"] is None
+
+def test_sync_deduplicates_profiles_for_same_chatgpt_account(hooks, monkeypatch):
+    _, data = hooks; monkeypatch.setattr(cli,"STATE_PATH",data/"sync_state.json"); captured = []
+    monkeypatch.setattr(cli,"chatgpt_profiles",lambda _:["A","B"]); monkeypatch.setattr(cli,"chatgpt_cookie_base",lambda *a,**k:({},"https://chatgpt.com")); monkeypatch.setattr(cli,"chatgpt_headers",lambda *a,**k:{"ChatGPT-Account-ID":"acct"}); monkeypatch.setattr(cli,"fetch_json",lambda *a,**k:{"items":[{"id":"c1","update_time":100}]}); monkeypatch.setattr(cli,"fetch_chatgpt",lambda *a,**k:captured.append(k) or cli.ParseResult()); monkeypatch.setattr(cli,"get_cookies",lambda *_:{})
+    cli.sync(False,300,False,False,False,False); assert captured[0]["profiles"]==["A"]
+
+def test_sync_checkpoints_chatgpt_pages_and_retries_only_unfinished(hooks, monkeypatch):
+    _, data = hooks; monkeypatch.setattr(cli,"STATE_PATH",data/"sync_state.json"); cid0 = cli.gen_id("chatgpt","ok0"); mid0 = cli.gen_id("chatgpt",f"{cid0}:m"); old = {"browser":"safari","head":"default:old:100","frontiers":{"default":{"account":"acct","updated":100}},"coverage":[cid0]}; cli.atomic_json(cli.STATE_PATH,{"web":{"chatgpt":old}}); fail, details = {"bad":True}, []
+    conn = duckdb.connect(str(data/"convos.db")); cli.init_schema(conn); cli.upsert(conn,cli.ParseResult([dict(id=cid0,source="chatgpt",title="T",created_at=cli.ts_any(100),updated_at=cli.ts_any(100),model=None,cwd=None,git_branch=None,project_id=None,metadata=json.dumps({"remote_update_time":100}))],[dict(id=mid0,conversation_id=cid0,role="user",content="ok0",thinking=None,created_at=cli.ts_any(100),model=None,metadata="{}",parent_id=None)])); conn.close()
+    items = [{"id":f"ok{i}","create_time":300-i,"update_time":300-i} for i in range(20)]+[{"id":"bad","create_time":200,"update_time":200}]
+    monkeypatch.setattr(cli,"chatgpt_profiles",lambda _:[None]); monkeypatch.setattr(cli,"chatgpt_cookie_base",lambda *a,**k:({},"https://chatgpt.com")); monkeypatch.setattr(cli,"chatgpt_headers",lambda *a,**k:{"ChatGPT-Account-ID":"acct"}); monkeypatch.setattr(cli,"get_cookies",lambda *_:{}); monkeypatch.setattr(cli.time,"sleep",lambda _:None)
+    def fetch(url,*a,**k):
+        if "limit=1&order=updated" in url: return {"items":[items[0]]}
+        if "/conversations?" in url:
+            offset = int(url.split("offset=")[1].split("&")[0])
+            return {"items":items if offset==0 else [],"total":len(items)}
+        name = url.rsplit("/",1)[-1]; details.append(name)
+        if name=="bad" and fail["bad"]: raise TimeoutError("detail timeout")
+        when = next(x["update_time"] for x in items if x["id"]==name)
+        return {"mapping":{"m":{"parent":None,"message":{"author":{"role":"user"},"content":{"parts":[name]},"create_time":when}}}}
+    monkeypatch.setattr(cli,"fetch_json",fetch); cli.sync(False,300,False,False,False,False)
+    conn = duckdb.connect(str(data/"convos.db"),read_only=True); assert {r[0] for r in conn.execute("SELECT content FROM messages").fetchall()}=={f"ok{i}" for i in range(20)}; conn.close(); assert json.loads(cli.STATE_PATH.read_text())["web"]["chatgpt"]==old and (data/"hook_fts_dirty").exists() and len(json.loads((data/"hook_embeddings_dirty").read_text()))==20
+    fail["bad"] = False; cli.sync(False,300,False,False,False,False); conn = duckdb.connect(str(data/"convos.db"),read_only=True); assert {r[0] for r in conn.execute("SELECT content FROM messages").fetchall()}=={*(f"ok{i}" for i in range(20)),"bad"}; conn.close()
+    saved = json.loads(cli.STATE_PATH.read_text())["web"]["chatgpt"]
+    assert details==[*(f"ok{i}" for i in range(20)),"bad","bad"] and saved["frontiers"]=={"default":{"account":"acct","updated":300,"id":"ok0"}} and len(saved["coverage"])==21 and cid0 in saved["coverage"]
+
+def test_sync_rolls_back_interrupted_chatgpt_checkpoint(hooks, monkeypatch):
+    _, data = hooks; monkeypatch.setattr(cli,"STATE_PATH",data/"sync_state.json"); old = {"browser":"safari","head":"default:old:100","frontiers":{"default":{"account":"acct","updated":100}},"coverage":[]}; cli.atomic_json(cli.STATE_PATH,{"web":{"chatgpt":old}}); cid = cli.gen_id("chatgpt","c1"); mid = cli.gen_id("chatgpt","m1")
+    result = cli.ParseResult([dict(id=cid,source="chatgpt",title="T",created_at=cli.ts_any(300),updated_at=cli.ts_any(300),model=None,cwd=None,git_branch=None,project_id=None,metadata=json.dumps({"remote_update_time":300}))],[dict(id=mid,conversation_id=cid,role="user",content="atomic",thinking=None,created_at=cli.ts_any(300),model=None,metadata="{}",parent_id=None)])
+    monkeypatch.setattr(cli,"chatgpt_profiles",lambda _:[None]); monkeypatch.setattr(cli,"chatgpt_cookie_base",lambda *a,**k:({},"https://chatgpt.com")); monkeypatch.setattr(cli,"chatgpt_headers",lambda *a,**k:{"ChatGPT-Account-ID":"acct"}); monkeypatch.setattr(cli,"fetch_json",lambda *a,**k:{"items":[{"id":"c1","update_time":300}]}); monkeypatch.setattr(cli,"get_cookies",lambda *_:{})
+    def fetched(*a,**k): k["sink"](result); return cli.ParseResult()
+    monkeypatch.setattr(cli,"fetch_chatgpt",fetched); real = cli.upsert
+    def interrupted(conn,r): real(conn,r); raise RuntimeError("mid-upsert")
+    monkeypatch.setattr(cli,"upsert",interrupted)
+    cli.sync(False,300,False,False,False,False)
+    conn = duckdb.connect(str(data/"convos.db"),read_only=True); assert conn.execute("SELECT COUNT(*) FROM conversations").fetchone()[0]==0 and conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0]==0; conn.close(); assert json.loads(cli.STATE_PATH.read_text())["web"]["chatgpt"]==old and (data/"hook_fts_dirty").exists() and json.loads((data/"hook_embeddings_dirty").read_text())==[mid]
+    monkeypatch.setattr(cli,"upsert",real); cli.sync(False,300,False,False,False,False); conn = duckdb.connect(str(data/"convos.db"),read_only=True); assert conn.execute("SELECT content FROM messages").fetchall()==[("atomic",)]; conn.close()
 
 def test_sync_sigint_exits_during_blocked_source(tmp_path):
     src, blocked, ready, done = tmp_path/"import.json", tmp_path/"blocked.json", tmp_path/"ready", tmp_path/"done"; src.write_text("[]"); blocked.write_text("[]")

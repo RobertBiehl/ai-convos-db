@@ -19,7 +19,7 @@ Uses browser cookies to authenticate with ChatGPT's backend API.
 
 **List conversations:**
 ```
-GET https://chat.openai.com/backend-api/conversations?offset=0&limit=100
+GET https://chat.openai.com/backend-api/conversations?offset=0&limit=100&order=updated
 ```
 
 Response:
@@ -39,6 +39,30 @@ Response:
   "offset": 0
 }
 ```
+
+Incremental sync uses this newest-interaction-first list as a frontier. After a
+complete sync, later runs snapshot entries through the previous newest
+`update_time` (including timestamp ties) before requesting any details, then
+only fetch details for new or updated IDs. Summary pages overlap by 20 entries
+so concurrent list movement cannot silently shift an ID past an offset;
+repeated IDs are deduplicated. Frontiers are scoped to the browser profile and
+ChatGPT account and only reused while every ID covered by the prior sync remains
+in the archive. During the one-time migration, rows without an exact remote
+marker tolerate up to five seconds of list/message timestamp skew; once a detail
+has been fetched, comparisons are exact. Detail batches are committed as they
+finish, but the frontier only advances after the full changed prefix succeeds,
+so an interruption resumes without discarding completed downloads. A first
+sync, legacy state without a frontier, and `convos sync --full` cover the
+complete list. The backend API is unofficial; `--full` remains the
+reconciliation path if its ordering behavior changes.
+
+Live list and detail responses expose no rate-limit metadata. During migration,
+the first HTTP 429 responses followed roughly 192-200 completed detail
+requests. Because the backend publishes neither its quota nor reset window,
+bulk fetches use a conservative policy: a 20-request burst, then bulk-list,
+detail, and retry attempts are paced at 160 requests per five minutes. This
+leaves headroom for auth and probe calls. A retried ChatGPT 429 waits at least
+five minutes and honors a larger numeric `Retry-After` value.
 
 **Get conversation detail:**
 ```

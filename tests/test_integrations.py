@@ -130,15 +130,48 @@ class TestChatGPTAPI:
         assert r.convs[0]["created_at"] == cli.ts_from_epoch(1709294400)
         assert r.convs[0]["updated_at"] == cli.ts_from_epoch(1709294500)
 
-    def test_fetch_chatgpt_rejects_partial_detail_failure(self, monkeypatch):
+    def test_fetch_chatgpt_dates_fall_back_to_messages(self, monkeypatch):
         from ai_convos import cli
         monkeypatch.setattr(cli, "chatgpt_profiles", lambda _: [None]); monkeypatch.setattr(cli, "chatgpt_cookie_base", lambda *a, **k: ({}, "https://chatgpt.com")); monkeypatch.setattr(cli, "chatgpt_headers", lambda *a, **k: {})
         def fake(url, *a, **k):
-            if "/conversations?" in url: return {"items":[{"id":"ok"},{"id":"bad"}], "total":2}
+            if "offset=0" in url: return {"items":[{"id":"c1","create_time":None,"update_time":None}], "total":1}
+            if "/conversations?" in url: return {"items":[], "total":1}
+            return {"mapping":{"a":{"parent":None,"message":{"author":{"role":"user"},"content":{"parts":["a"]},"create_time":100}},"b":{"parent":"a","message":{"author":{"role":"assistant"},"content":{"parts":["b"]},"create_time":"1970-01-01T00:03:20Z"}}}}
+        monkeypatch.setattr(cli, "fetch_json", fake); conv = cli.fetch_chatgpt("safari").convs[0]
+        assert conv["created_at"] == cli.ts_from_epoch(100) and conv["updated_at"] == cli.ts_from_iso("1970-01-01T00:03:20Z")
+
+    def test_fetch_chatgpt_rejects_partial_detail_failure(self, monkeypatch):
+        from ai_convos import cli
+        monkeypatch.setattr(cli, "chatgpt_profiles", lambda _: [None]); monkeypatch.setattr(cli, "chatgpt_cookie_base", lambda *a, **k: ({}, "https://chatgpt.com")); monkeypatch.setattr(cli, "chatgpt_headers", lambda *a, **k: {}); monkeypatch.setattr(cli.time,"sleep",lambda _:None); saved = []; items = [{"id":f"ok{i}","update_time":300-i} for i in range(20)]+[{"id":"bad","update_time":200}]
+        def fake(url, *a, **k):
+            if "offset=0" in url: return {"items":items, "total":21}
+            if "/conversations?" in url: return {"items":[], "total":21}
             if url.endswith("/bad"): raise TimeoutError("detail timeout")
             return {"mapping":{}}
         monkeypatch.setattr(cli, "fetch_json", fake)
-        with pytest.raises(ValueError, match="detail timeout"): cli.fetch_chatgpt("safari")
+        with pytest.raises(ValueError, match="detail timeout"): cli.fetch_chatgpt("safari", sink=lambda r: saved.append([c["id"] for c in r.convs]))
+        assert saved == [[cli.gen_id("chatgpt", f"ok{i}") for i in range(20)]]
+
+    def test_fetch_chatgpt_paces_before_observed_limit(self, monkeypatch):
+        from ai_convos import cli
+        monkeypatch.setattr(cli,"chatgpt_profiles",lambda _:[None]); monkeypatch.setattr(cli,"chatgpt_cookie_base",lambda *a,**k:({},"https://chatgpt.com")); monkeypatch.setattr(cli,"chatgpt_headers",lambda *a,**k:{"ChatGPT-Account-ID":"acct"}); sleeps, clock, details = [], [0], []; items = [{"id":str(i),"update_time":i} for i in range(21)]
+        def fake(url,*a,**k):
+            k["before_request"]()
+            if "/conversations?" in url: return {"items":items,"total":len(items)}
+            details.append(url.rsplit("/",1)[-1])
+            return {"mapping":{}}
+        monkeypatch.setattr(cli,"fetch_json",fake); monkeypatch.setattr(cli.time,"monotonic",lambda:clock[0]); monkeypatch.setattr(cli.time,"sleep",lambda n:(sleeps.append(n),clock.__setitem__(0,clock[0]+n))); cli.fetch_chatgpt("safari")
+        assert details==[str(i) for i in range(21)] and sleeps==pytest.approx([1.875,1.875])
+
+    @pytest.mark.parametrize("shared,expected", [(True,2),(False,0)])
+    def test_fetch_chatgpt_rate_budget_is_account_scoped(self, monkeypatch, shared, expected):
+        from ai_convos import cli
+        sleeps, clock = [], [0]; monkeypatch.setattr(cli,"chatgpt_cookie_base",lambda _b,_h,p:({},f"https://chatgpt.com/{p}")); monkeypatch.setattr(cli,"chatgpt_headers",lambda _c,b,*a,**k:{"ChatGPT-Account-ID":"same" if shared else b})
+        def fake(url,*a,**k):
+            k["before_request"](); profile = url.split("chatgpt.com/",1)[1].split("/",1)[0]
+            return {"items":[{"id":f"{profile}-{i}","update_time":i} for i in range(10)],"total":10} if "/conversations?" in url else {"mapping":{}}
+        monkeypatch.setattr(cli,"fetch_json",fake); monkeypatch.setattr(cli.time,"monotonic",lambda:clock[0]); monkeypatch.setattr(cli.time,"sleep",lambda n:(sleeps.append(n),clock.__setitem__(0,clock[0]+n))); cli.fetch_chatgpt("safari",profiles=["A","B"])
+        assert len(sleeps)==expected
 
     def test_fetch_chatgpt_skips_unrelated_chrome_profile(self, monkeypatch):
         from ai_convos import cli
@@ -154,13 +187,93 @@ class TestChatGPTAPI:
         from ai_convos import cli
         monkeypatch.setattr(cli, "chatgpt_profiles", lambda _: [None]); monkeypatch.setattr(cli, "chatgpt_cookie_base", lambda *a, **k: ({}, "https://chatgpt.com")); monkeypatch.setattr(cli, "chatgpt_headers", lambda *a, **k: {}); details = []
         def fake(url, *a, **k):
-            if "offset=0" in url: return {"items":[{"id":"same","update_time":100},{"id":"older","update_time":100}], "total":6}
-            if "offset=2" in url: return {"items":[{"id":"changed","update_time":200},{"id":"missing-time","update_time":None},{"id":"null-stored","update_time":100},{"id":"new","update_time":None}], "total":6}
+            if "offset=0" in url: return {"items":[{"id":"changed","update_time":200},{"id":"same","update_time":100}], "total":6}
+            if "offset=1" in url: return {"items":[{"id":"same","update_time":100},{"id":"older","update_time":100},{"id":"missing-time","update_time":None},{"id":"null-stored","update_time":100},{"id":"new","update_time":None}], "total":6}
             if "/conversations?" in url: return {"items":[], "total":6}
             details.append(url.rsplit("/", 1)[-1]); return {"mapping":{}}
         monkeypatch.setattr(cli, "fetch_json", fake); known = {cli.gen_id("chatgpt", x):(cli.ts_any(t).timestamp() if t else None) for x, t in (("same",100),("older",150),("changed",150),("missing-time",150),("null-stored",None))}
         assert len(cli.fetch_chatgpt("safari", known=known).convs) == 4 and set(details) == {"changed", "missing-time", "null-stored", "new"}
         details.clear(); assert len(cli.fetch_chatgpt("safari", known={}).convs) == 6 and set(details) == {"same", "older", "changed", "missing-time", "null-stored", "new"}
+
+    def test_fetch_chatgpt_tolerates_timestamp_skew_only_for_legacy_rows(self, monkeypatch):
+        from ai_convos import cli
+        monkeypatch.setattr(cli,"chatgpt_profiles",lambda _:[None]); monkeypatch.setattr(cli,"chatgpt_cookie_base",lambda *a,**k:({},"https://chatgpt.com")); monkeypatch.setattr(cli,"chatgpt_headers",lambda *a,**k:{}); details = []
+        def fake(url,*a,**k):
+            if "/conversations?" in url: return {"items":[{"id":"legacy","update_time":103},{"id":"exact","update_time":103}],"total":2}
+            details.append(url.rsplit("/",1)[-1]); return {"mapping":{}}
+        monkeypatch.setattr(cli,"fetch_json",fake); known = {cli.gen_id("chatgpt",x):100 for x in ("legacy","exact")}; cli.fetch_chatgpt("safari",known=known,legacy={cli.gen_id("chatgpt","legacy")})
+        assert details==["exact"]
+
+    def test_fetch_chatgpt_stops_below_completed_update_frontier(self, monkeypatch):
+        from ai_convos import cli
+        monkeypatch.setattr(cli, "chatgpt_profiles", lambda _: [None]); monkeypatch.setattr(cli, "chatgpt_cookie_base", lambda *a, **k: ({}, "https://chatgpt.com")); monkeypatch.setattr(cli, "chatgpt_headers", lambda *a, **k: {"ChatGPT-Account-ID":"acct"}); lists, details = [], []
+        def fake(url, *a, **k):
+            if "/conversations?" in url:
+                assert "order=updated" in url; offset = int(url.split("offset=")[1].split("&")[0]); lists.append(offset)
+                if offset == 0: return {"items":[{"id":"new","update_time":400},{"id":"changed","update_time":350}], "total":4}
+                if offset == 1: return {"items":[{"id":"changed","update_time":350},{"id":"tie","update_time":300},{"id":"old","update_time":299}], "total":4}
+                raise AssertionError(f"fetched past frontier: {offset}")
+            details.append(url.rsplit("/",1)[-1]); return {"mapping":{}}
+        known = {cli.gen_id("chatgpt",x):cli.ts_any(t).timestamp() for x,t in (("changed",300),("old",299))}; monkeypatch.setattr(cli, "fetch_json", fake)
+        r = cli.fetch_chatgpt("safari", known=known, frontiers={"default":{"account":"acct","updated":300}})
+        assert lists == [0,1] and set(details) == {"new","changed","tie"} and len(r.convs) == 3
+
+    def test_fetch_chatgpt_scans_full_frontier_page_for_outliers(self, monkeypatch):
+        from ai_convos import cli
+        monkeypatch.setattr(cli,"chatgpt_profiles",lambda _:[None]); monkeypatch.setattr(cli,"chatgpt_cookie_base",lambda *a,**k:({},"https://chatgpt.com")); monkeypatch.setattr(cli,"chatgpt_headers",lambda *a,**k:{"ChatGPT-Account-ID":"acct"}); calls, mode = [], {"inverted":False}
+        def fake(url,*a,**k):
+            if "/conversations?" in url:
+                offset = int(url.split("offset=")[1].split("&")[0]); calls.append(("list",offset))
+                if offset==0: return {"items":[{"id":"new","update_time":400},{"id":"old","update_time":299},{"id":"missing","update_time":None}]+([{"id":"misplaced","update_time":350}] if mode["inverted"] else []),"total":4 if mode["inverted"] else 3}
+                return {"items":[],"total":offset}
+            calls.append(("detail",url.rsplit("/",1)[-1])); return {"mapping":{}}
+        monkeypatch.setattr(cli,"fetch_json",fake); frontier = {"default":{"account":"acct","updated":300}}; known = {cli.gen_id("chatgpt","old"):cli.ts_any(299).timestamp()}
+        cli.fetch_chatgpt("safari",known=known,frontiers=frontier); assert calls==[("list",0),("detail","new"),("detail","missing")]
+        calls.clear(); mode["inverted"] = True; cli.fetch_chatgpt("safari",known=known,frontiers=frontier)
+        assert calls==[("list",0),("detail","new"),("detail","missing"),("detail","misplaced")]
+
+    def test_fetch_chatgpt_rejects_incomplete_list_and_account_mismatch_resets_frontier(self, monkeypatch):
+        from ai_convos import cli
+        monkeypatch.setattr(cli,"chatgpt_profiles",lambda _:[None]); monkeypatch.setattr(cli,"chatgpt_cookie_base",lambda *a,**k:({},"https://chatgpt.com")); monkeypatch.setattr(cli,"chatgpt_headers",lambda *a,**k:{"ChatGPT-Account-ID":"new"})
+        monkeypatch.setattr(cli,"fetch_json",lambda url,*a,**k:{"items":[],"total":1})
+        with pytest.raises(ValueError,match="incomplete list"): cli.fetch_chatgpt("safari")
+        calls = []
+        def complete(url,*a,**k):
+            if "offset=0" in url: return {"items":[{"id":"old","update_time":100}],"total":1}
+            if "/conversations?" in url: return {"items":[],"total":1}
+            calls.append(url.rsplit("/",1)[-1]); return {"mapping":{}}
+        monkeypatch.setattr(cli,"fetch_json",complete); cli.fetch_chatgpt("safari",frontiers={"default":{"account":"previous","updated":500}})
+        assert calls==["old"]
+
+    @pytest.mark.parametrize("shifted,total", [([{"id":"b","update_time":300},{"id":"d","update_time":100}],3),([{"id":"c","update_time":200},{"id":"d","update_time":100}],4)])
+    def test_fetch_chatgpt_rejects_pagination_shifts(self, monkeypatch, shifted, total):
+        from ai_convos import cli
+        monkeypatch.setattr(cli,"chatgpt_profiles",lambda _:[None]); monkeypatch.setattr(cli,"chatgpt_cookie_base",lambda *a,**k:({},"https://chatgpt.com")); monkeypatch.setattr(cli,"chatgpt_headers",lambda *a,**k:{}); details = []
+        def fake(url,*a,**k):
+            if "offset=0" in url: return {"items":[{"id":"a","update_time":400},{"id":"b","update_time":300}],"total":4}
+            if "/conversations?" in url: return {"items":shifted,"total":total}
+            details.append(url); return {"mapping":{}}
+        monkeypatch.setattr(cli,"fetch_json",fake)
+        with pytest.raises(ValueError,match="unstable list"): cli.fetch_chatgpt("safari")
+        assert details==[]
+
+    def test_fetch_chatgpt_null_frontier_scans_boundary_page_for_unknowns(self, monkeypatch):
+        from ai_convos import cli
+        monkeypatch.setattr(cli,"chatgpt_profiles",lambda _:[None]); monkeypatch.setattr(cli,"chatgpt_cookie_base",lambda *a,**k:({},"https://chatgpt.com")); monkeypatch.setattr(cli,"chatgpt_headers",lambda *a,**k:{"ChatGPT-Account-ID":"acct"}); calls = []
+        def fake(url,*a,**k):
+            if "/conversations?" in url: calls.append("list"); return {"items":[{"id":"new","update_time":None},{"id":"head","update_time":None},{"id":"older","update_time":None},{"id":"late","update_time":None}],"total":4}
+            calls.append(url.rsplit("/",1)[-1]); return {"mapping":{}}
+        monkeypatch.setattr(cli,"fetch_json",fake); known = {cli.gen_id("chatgpt",x):1 for x in ("head","older")}; cli.fetch_chatgpt("safari",known=known,frontiers={"default":{"account":"acct","updated":None,"id":"head"}})
+        assert calls==["list","new","head","late"]
+
+    def test_fetch_chatgpt_deduplicates_repeated_list_slots(self, monkeypatch):
+        from ai_convos import cli
+        monkeypatch.setattr(cli,"chatgpt_profiles",lambda _:[None]); monkeypatch.setattr(cli,"chatgpt_cookie_base",lambda *a,**k:({},"https://chatgpt.com")); monkeypatch.setattr(cli,"chatgpt_headers",lambda *a,**k:{}); details = []
+        def fake(url,*a,**k):
+            if "offset=0" in url: return {"items":[{"id":"a","update_time":300},{"id":"b","update_time":200}],"total":4}
+            if "/conversations?" in url: return {"items":[{"id":"b","update_time":200},{"id":"a","update_time":100},{"id":"c","update_time":50}],"total":4}
+            details.append(url.rsplit("/",1)[-1]); return {"mapping":{}}
+        monkeypatch.setattr(cli,"fetch_json",fake); cli.fetch_chatgpt("safari"); assert details==["a","b","c"]
 
 
 # ---- Claude API Tests ----
@@ -411,10 +524,11 @@ class TestHTTPErrors:
                 fetch_json("https://api.example.com", {"session": "test"})
             assert exc_info.value.code == 401
 
-    def test_429_uses_visible_long_backoff(self):
+    @pytest.mark.parametrize("headers,delay", [({},300),({"Retry-After":"420"},420)])
+    def test_429_uses_visible_long_backoff(self, headers, delay):
         from ai_convos.cli import fetch_json
         import urllib.error
-        error = urllib.error.HTTPError("https://api.example.com", 429, "Too Many Requests", {}, None)
+        error = urllib.error.HTTPError("https://api.example.com", 429, "Too Many Requests", headers, None); before = MagicMock()
         with patch("urllib.request.urlopen", side_effect=error), patch("time.sleep") as sleep:
-            with pytest.raises(urllib.error.HTTPError): fetch_json("https://api.example.com", {}, retries=2)
-        assert [x.args[0] for x in sleep.call_args_list] == [30, 60]
+            with pytest.raises(urllib.error.HTTPError): fetch_json("https://api.example.com", {}, retries=2, before_request=before, rate_limit_backoff=300)
+        assert [x.args[0] for x in sleep.call_args_list] == [delay,delay] and before.call_count == 3
