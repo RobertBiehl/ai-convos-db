@@ -7,6 +7,7 @@ from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 
 V=1
+APPROVAL_DELAY=int(os.environ.get("CONVOS_REMOTE_APPROVAL_DELAY","3600")); CLOCK_SKEW=30
 def canon(v): return json.dumps(v,sort_keys=True,separators=(",",":"),ensure_ascii=True,allow_nan=False).encode()
 def unb64(v): return base64.urlsafe_b64decode(v+"="*(-len(v)%4))
 def digest(v): return hashlib.sha256(v if isinstance(v,bytes) else canon(v)).hexdigest()
@@ -27,7 +28,7 @@ CREATE TABLE IF NOT EXISTS workspace_device_exclusions(workspace TEXT,device TEX
 CREATE TABLE IF NOT EXISTS events(cursor INTEGER PRIMARY KEY AUTOINCREMENT,workspace TEXT,event TEXT,author TEXT,epoch INT,seq INT,envelope TEXT,wire_hash TEXT,created REAL,UNIQUE(workspace,event));
 CREATE UNIQUE INDEX IF NOT EXISTS event_author_sequence ON events(workspace,author,seq);
 CREATE TABLE IF NOT EXISTS workspace_controls(workspace TEXT,revision INT,state_hash TEXT UNIQUE,state TEXT,PRIMARY KEY(workspace,revision));
-CREATE TABLE IF NOT EXISTS device_proposals(id TEXT PRIMARY KEY,workspace TEXT,base TEXT,target_user TEXT,target_device TEXT,proposal TEXT,expires REAL,active INT);
+CREATE TABLE IF NOT EXISTS device_proposals(id TEXT PRIMARY KEY,workspace TEXT,base TEXT,target_user TEXT,target_device TEXT,proposal TEXT,not_before REAL,expires REAL,active INT);
 CREATE TABLE IF NOT EXISTS device_votes(proposal TEXT,voter_user TEXT,voter_device TEXT,approve INT,vote TEXT,PRIMARY KEY(proposal,voter_user));
 """
 
@@ -66,7 +67,8 @@ def current_control(db,ws):
 def electorate(state,target): return sorted({d["user"] for d in state["devices"].values() if d["user"]!=target})
 def verify_proposal(previous,request,now=None,kind="device.proposal"):
     target=verify_record(request["target"]); verify_signed(request,target["device"]["sign_public"])
-    if request["kind"]!=kind or request["base"]!=control_hash(previous) or request["workspace"]!=previous["workspace"] or request["epoch"]!=previous["epoch"] or request["certificate_hash"]!=digest(target["certificate"]) or not request["not_before"]<=float(now or time.time())<request["expires"]: raise ValueError("proposal state mismatch")
+    moment=time.time() if now is None else float(now)
+    if request["v"]!=V or request["kind"]!=kind or request["base"]!=control_hash(previous) or request["workspace"]!=previous["workspace"] or request["epoch"]!=previous["epoch"] or request["certificate_hash"]!=digest(target["certificate"]) or not request["not_before"]<=moment<request["expires"]: raise ValueError("proposal state mismatch")
     return target
 def verify_approval(previous,approval,now=None,kind="device.proposal"):
     request,votes=approval["proposal"],approval.get("votes",[]); target=verify_proposal(previous,request,now,kind)
@@ -74,13 +76,16 @@ def verify_approval(previous,approval,now=None,kind="device.proposal"):
     eligible=set(electorate(previous,target["user"])); by_user={}
     for value in votes:
         record=previous["devices"].get(value["author"])
-        if not record or record["user"]!=value["voter"] or value["voter"] not in eligible: raise ValueError("ineligible vote")
+        if value["v"]!=V or value["kind"]!="device.vote" or type(value["approve"]) is not bool or not record or record["user"]!=value["voter"] or value["voter"] not in eligible: raise ValueError("ineligible vote")
         verify_signed(value,record["device"]["sign_public"])
         if (value["proposal"],value["workspace"],value["base"])!=(control_hash(request),request["workspace"],request["base"]): raise ValueError("vote proposal mismatch")
         if value["voter"] in by_user and by_user[value["voter"]]!=value["approve"]: raise ValueError("conflicting user votes")
         by_user[value["voter"]]=value["approve"]
     needed=len(eligible)//2+1
     if not eligible or sum(v is True for v in by_user.values())<needed: raise ValueError(f"approval requires {needed} of {len(eligible)} votes")
+def verify_window(db,request,now):
+    row=db.execute("SELECT not_before,expires,active FROM device_proposals WHERE id=?",(control_hash(request),)).fetchone()
+    if not row or not row["active"] or not row["not_before"]<=now<row["expires"]: raise ValueError("proposal is not active by relay clock")
 def verify_control(db,actor,value,previous=None):
     if value["v"]!=V or value["kind"]!="workspace.state": raise ValueError("unsupported workspace state")
     if value["scope"] not in ("personal","team") or len(value["key_commitment"])!=64 or any(m["role"] not in ("admin","member") for m in value["members"].values()) or any(d["user"] not in value["members"] for d in value["devices"].values()) or set(value["devices"])&set(value["removed"]): raise ValueError("invalid workspace state")
@@ -89,34 +94,40 @@ def verify_control(db,actor,value,previous=None):
     if not author or actor["id"]!=value["author"]: raise PermissionError("state author is not authorized")
     verify_signed(value,verify_record(author)["device"]["sign_public"]); [verify_record(d) for d in value["devices"].values()]
     if previous is None:
-        if value["revision"]!=1 or value["prev"] is not None or value["epoch"]!=1 or value["author"] not in value["devices"] or value["action"]!="create" or value["members"][author["user"]]["role"]!="admin": raise ValueError("invalid genesis state")
+        if value["revision"]!=1 or value["prev"] is not None or value["epoch"]!=1 or value["author"] not in value["devices"] or value["action"]!="create" or value["members"][author["user"]]["role"]!="admin" or set(value["members"])!={author["user"]} or set(value["devices"])!={value["author"]} or value["removed"]: raise ValueError("invalid genesis state")
         return value
     if (value["workspace"],value["scope"])!=(previous["workspace"],previous["scope"]) or value["revision"]!=previous["revision"]+1 or value["prev"]!=control_hash(previous): raise ValueError("workspace state chain mismatch")
     action=value["action"]; previous_author=previous["devices"].get(value["author"]); admin=bool(previous_author and previous["members"][previous_author["user"]]["role"]=="admin")
     if action in ("membership","remove","history") and not admin: raise PermissionError("admin control required")
     if action in ("self_approve","quorum_approve","personal_recover"):
+        now=time.time()
+        if abs(float(value["approved_at"])-now)>CLOCK_SKEW: raise ValueError("approval clock mismatch")
         if value["members"]!=previous["members"] or value["removed"]!=previous["removed"] or value["epoch"]!=previous["epoch"]+1: raise ValueError("approval changed workspace policy")
         added=set(value["devices"])-set(previous["devices"])
         if len(added)!=1 or set(previous["devices"])-set(value["devices"]): raise ValueError("approval must add exactly one device")
         target=value["approval"]["proposal"]["target"]; device=next(iter(added))
         if device!=target["device"]["id"] or {k:v for k,v in value["devices"][device].items() if k!="history"}!={k:v for k,v in target.items() if k!="history"} or device in previous["removed"]: raise ValueError("approval target mismatch")
         if action=="self_approve" and (previous_author["user"]!=target["user"] or value["devices"][device]["history"]!=previous_author["history"]): raise PermissionError("self approval permission mismatch")
-        if action in ("self_approve","personal_recover"): verify_proposal(previous,value["approval"]["proposal"],value["approved_at"])
+        if action in ("self_approve","personal_recover"): verify_proposal(previous,value["approval"]["proposal"],now)
+        if action!="personal_recover": verify_window(db,value["approval"]["proposal"],now)
         if action=="quorum_approve" and value["devices"][device]["history"] is not False: raise ValueError("quorum approval must be future-only")
-        if action=="quorum_approve": verify_approval(previous,value["approval"],value["approved_at"])
+        if action=="quorum_approve": verify_approval(previous,value["approval"],now)
         if action=="personal_recover" and (previous.get("scope")!="personal" or target["user"] not in previous["members"]): raise PermissionError("personal recovery mismatch")
     elif action=="history":
         if set(value["devices"])!=set(previous["devices"]) or any({k:v for k,v in d.items() if k!="history"}!={k:v for k,v in previous["devices"][i].items() if k!="history"} or previous["devices"][i]["history"] and not d["history"] for i,d in value["devices"].items()) or value["removed"]!=previous["removed"] or value["epoch"]!=previous["epoch"] or value["key_commitment"]!=previous["key_commitment"] or set(value["members"])!=set(previous["members"]) or any((m["role"],m["joined"])!=(previous["members"][u]["role"],previous["members"][u]["joined"]) for u,m in value["members"].items()): raise ValueError("invalid history transition")
     elif action=="history_activate":
+        now=time.time()
+        if abs(float(value["approved_at"])-now)>CLOCK_SKEW: raise ValueError("approval clock mismatch")
         target=value["approval"]["proposal"]["target"]; device=target["device"]["id"]; expected={**previous["devices"],device:{**previous["devices"][device],"history":True}}
         if target["history"] is not True or previous["devices"].get(device,{}).get("history") is not False or value["members"]!=previous["members"] or value["devices"]!=expected or value["removed"]!=previous["removed"] or value["epoch"]!=previous["epoch"] or value["key_commitment"]!=previous["key_commitment"]: raise ValueError("invalid history activation")
-        verify_approval(previous,value["approval"],value["approved_at"],"history.proposal")
+        verify_approval(previous,value["approval"],now,"history.proposal")
+        verify_window(db,value["approval"]["proposal"],now)
     elif action=="remove":
         removed=set(previous["devices"])-set(value["devices"])
         if value["members"]!=previous["members"] or value["epoch"]!=previous["epoch"]+1 or not removed or not removed<=set(value["removed"]) or not set(previous["removed"])<=set(value["removed"]) or any(value["devices"].get(d)!=r for d,r in previous["devices"].items() if d not in removed): raise ValueError("invalid device removal")
     elif action=="membership":
         added_users=set(value["members"])-set(previous["members"]); removed_users=set(previous["members"])-set(value["members"]); added=set(value["devices"])-set(previous["devices"]); removed=set(previous["devices"])-set(value["devices"])
-        if value["epoch"]!=previous["epoch"]+1 or set(value["devices"])&set(value["removed"]) or any(r["user"] not in added_users for d,r in value["devices"].items() if d in added) or any(r["user"] not in removed_users for d,r in previous["devices"].items() if d in removed) or any(value["devices"].get(d)!=r for d,r in previous["devices"].items() if r["user"] not in removed_users) or any((m["joined"],m["history_from"],m["selected"])!=(previous["members"][u]["joined"],previous["members"][u]["history_from"],previous["members"][u]["selected"]) for u,m in value["members"].items() if u not in added_users) or any((m["joined"],m["history_from"],m["selected"])!=(value["epoch"],value["epoch"],[]) for u,m in value["members"].items() if u in added_users) or not set(previous["removed"])<=set(value["removed"]) or not removed<=set(value["removed"]): raise ValueError("invalid membership transition")
+        if value["epoch"]!=previous["epoch"]+1 or value["scope"]=="personal" and value["members"]!=previous["members"] or set(value["devices"])&set(value["removed"]) or any(r["user"] not in added_users for d,r in value["devices"].items() if d in added) or any(r["user"] not in removed_users for d,r in previous["devices"].items() if d in removed) or any(value["devices"].get(d)!=r for d,r in previous["devices"].items() if r["user"] not in removed_users) or any((m["joined"],m["history_from"],m["selected"])!=(previous["members"][u]["joined"],previous["members"][u]["history_from"],previous["members"][u]["selected"]) for u,m in value["members"].items() if u not in added_users) or any((m["joined"],m["history_from"],m["selected"])!=(value["epoch"],value["epoch"],[]) for u,m in value["members"].items() if u in added_users) or not set(previous["removed"])<=set(value["removed"]) or not removed<=set(value["removed"]): raise ValueError("invalid membership transition")
     else: raise ValueError("unknown workspace action")
     return value
 def apply_control(db,value,envelopes):
@@ -145,11 +156,14 @@ def rotate(db, actor, req):
     if not previous: raise ValueError("workspace control state is not initialized")
     if actor["id"] not in previous["devices"] and req.get("control",{}).get("action")!="personal_recover": raise PermissionError("device is not authorized for current workspace epoch")
     verify_control(db,actor,req["control"],previous)
-    for device,epochs in req.get("history_envelopes",{}).items():
-        if device not in req["control"]["devices"] or not req["control"]["devices"][device]["history"] or any(not 1<=int(epoch)<req["control"]["epoch"] for epoch in epochs): raise ValueError("history target is not entitled")
+    history=req.get("history_envelopes",{}); added=set(req["control"]["devices"])-set(previous["devices"])
+    if set(history)-added: raise ValueError("history envelopes may target only a newly approved device")
+    for device,epochs in history.items():
+        record=req["control"]["devices"][device]; start=req["control"]["members"][record["user"]]["history_from"]
+        if not record["history"] or any(not start<=int(epoch)<req["control"]["epoch"] for epoch in epochs): raise ValueError("history target is not entitled")
+    if req["control"]["action"]=="self_approve" and (device:=next(iter(added))) and req["control"]["devices"][device]["history"] and {int(e) for e in history.get(device,{})}!=set(range(req["control"]["members"][req["control"]["devices"][device]["user"]]["history_from"],previous["epoch"]+1)): raise ValueError("inherited history does not cover the signed entitlement")
     result=apply_control(db,req["control"],req["envelopes"])
-    for device,epochs in req.get("history_envelopes",{}).items():
-        if device not in req["control"]["devices"] or not req["control"]["devices"][device]["history"]: raise ValueError("history target is not entitled")
+    for device,epochs in history.items():
         [db.execute("INSERT OR REPLACE INTO key_envelopes VALUES (?,?,?,?)",(req["workspace"],int(epoch),device,json.dumps(env))) for epoch,env in epochs.items()]
     if approval:=req["control"].get("approval"): db.execute("UPDATE device_proposals SET active=0 WHERE id=?",(control_hash(approval["proposal"]),))
     db.commit(); return result
@@ -171,7 +185,7 @@ def action(db, req, token=None):
         return {"bundle":json.loads(row[0])}
     actor = auth(db, token)
     if op == "certify": return certify(db,actor,req)
-    if op in ("create","rotate","grant_all","grant_selected","history_activate","recovery"): verify_request(actor,req)
+    if op in ("create","rotate","grant_all","grant_selected","history_activate","reject","recovery"): verify_request(actor,req)
     if op == "create":
         ws,control=req["workspace"],req["control"]; verify_control(db,actor,control)
         if (control["workspace"],control["scope"])!=(ws,req["kind"]): raise ValueError("workspace create scope mismatch")
@@ -181,13 +195,18 @@ def action(db, req, token=None):
         request=req["proposal"]; previous=current_control(db,request["workspace"]); target=verify_record(request["target"]); verify_signed(request,target["device"]["sign_public"])
         pending=request["kind"]=="device.proposal" and target["history"] is False and actor["id"] not in previous["devices"] and actor["id"] not in previous["removed"]
         history=request["kind"]=="history.proposal" and actor["id"] in previous["devices"] and previous["devices"][actor["id"]]["history"] is False and target=={**previous["devices"][actor["id"]],"history":True}
-        if actor["id"]!=request["author"] or target["device"]["id"]!=actor["id"] or target["user"]!=actor["user_id"] or request["base"]!=control_hash(previous) or request["epoch"]!=previous["epoch"] or actor["user_id"] not in previous["members"] or not (pending or history): raise PermissionError("invalid device proposal")
-        pid=control_hash(request); db.execute("INSERT OR REPLACE INTO device_proposals VALUES (?,?,?,?,?,?,?,1)",(pid,request["workspace"],request["base"],actor["user_id"],actor["id"],json.dumps(request),request["expires"])); db.commit(); return {"proposal":pid}
+        now=time.time(); delay=APPROVAL_DELAY if len(electorate(previous,target["user"]))==1 and (history or not any(d["user"]==target["user"] for d in previous["devices"].values())) else 0; active=max(request["not_before"],now+delay)
+        if request["v"]!=V or request["certificate_hash"]!=digest(target["certificate"]) or actor["id"]!=request["author"] or target["device"]["id"]!=actor["id"] or target["user"]!=actor["user_id"] or request["base"]!=control_hash(previous) or request["epoch"]!=previous["epoch"] or actor["user_id"] not in previous["members"] or not (pending or history) or not active<request["expires"]<=now+86400+CLOCK_SKEW: raise PermissionError("invalid device proposal")
+        pid=control_hash(request); db.execute("INSERT INTO device_proposals VALUES (?,?,?,?,?,?,?,?,1)",(pid,request["workspace"],request["base"],actor["user_id"],actor["id"],json.dumps(request),active,request["expires"])); db.commit(); return {"proposal":pid}
+    if op == "reject":
+        row=db.execute("SELECT proposal,active FROM device_proposals WHERE id=? AND workspace=?",(req["proposal"],req["workspace"])).fetchone(); previous=current_control(db,req["workspace"]); record=previous["devices"].get(actor["id"]); proposal=json.loads(row["proposal"]) if row else None
+        if not row or not row["active"] or not record or record["user"]!=actor["user_id"] or proposal["target"]["user"]!=actor["user_id"] or proposal["base"]!=control_hash(previous): raise PermissionError("proposal rejection denied")
+        db.execute("UPDATE device_proposals SET active=0 WHERE id=?",(req["proposal"],)); db.commit(); return {"rejected":True}
     if op == "vote":
         value=req["vote"]; proposal_row=db.execute("SELECT proposal,workspace,base,expires,active FROM device_proposals WHERE id=?",(value["proposal"],)).fetchone()
         if not proposal_row or not proposal_row["active"] or proposal_row["expires"]<=time.time(): raise ValueError("proposal is not active")
         previous=current_control(db,proposal_row["workspace"]); record=previous["devices"].get(actor["id"])
-        if not record or record["user"]!=actor["user_id"] or actor["user_id"]==json.loads(proposal_row["proposal"])["target"]["user"] or value["base"]!=control_hash(previous): raise PermissionError("ineligible vote")
+        if value["v"]!=V or value["kind"]!="device.vote" or value["workspace"]!=proposal_row["workspace"] or value["voter"]!=actor["user_id"] or value["author"]!=actor["id"] or type(value["approve"]) is not bool or not record or record["user"]!=actor["user_id"] or actor["user_id"]==json.loads(proposal_row["proposal"])["target"]["user"] or value["base"]!=control_hash(previous): raise PermissionError("ineligible vote")
         verify_signed(value,record["device"]["sign_public"]); old=db.execute("SELECT approve FROM device_votes WHERE proposal=? AND voter_user=?",(value["proposal"],actor["user_id"])).fetchone()
         if old and bool(old[0])!=value["approve"]: raise ValueError("conflicting user vote")
         db.execute("INSERT OR REPLACE INTO device_votes VALUES (?,?,?,?,?)",(value["proposal"],actor["user_id"],actor["id"],value["approve"],json.dumps(value))); db.commit(); return {"recorded":True}

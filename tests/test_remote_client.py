@@ -6,14 +6,17 @@ from cryptography.exceptions import InvalidSignature
 from ai_convos.cli import init_schema
 from ai_convos_remote import (_upload_batches, add_member, approve_device, approve_history, connect, control_body, create, fetch_lazy, grant_all, grant_selected, key, load, pull, publish, refresh, remove_device,
                               request_device, request_history, setup_client, upload, workspace)
+from ai_convos_remote.control import sign as control_sign, vote as device_vote
 from ai_convos_remote.projection import rebuild, scan
-from ai_convos_remote.protocol import event, identity, seal_history, sign_control
+from ai_convos_remote.protocol import certificate, event, identity, seal_history, seal_key, sign_control, unb64
 from ai_convos_remote_server import action, connect as server_connect
 
 
 def transport(db):
     def call(cfg,body,auth=True): return action(db,body,cfg.get("token") if auth else None)
     return call
+@pytest.fixture(autouse=True)
+def no_approval_delay(monkeypatch): monkeypatch.setattr("ai_convos_remote_server.APPROVAL_DELAY",0)
 def conversation(title="shared",id="c"):
     cols=["id","source","title","created_at","updated_at","model","cwd","git_branch","project_id","metadata"]
     return {"kind":"conversation.record","entity":f"conversations:{id}","payload":{"table":"conversations","columns":cols,"row":[id,"codex",title,"2026-01-01","2026-01-01",None,None,None,None,"{}"]}}
@@ -32,8 +35,8 @@ def test_personal_recovery_multidevice_delivery_and_replay(tmp_path,monkeypatch)
     assert os.stat(a/"remote").st_mode&0o777==0o700 and os.stat(a/"remote/config.json").st_mode&0o777==0o600 and os.stat(a/"remote/state.db").st_mode&0o777==0o600
 
 
-def test_device_certificates_reject_relay_key_substitution_and_upgrade_legacy(tmp_path,monkeypatch):
-    server=server_connect(tmp_path/"server.db"); direct=transport(server); monkeypatch.setattr("ai_convos_remote.request",direct); a,b,c=tmp_path/"a",tmp_path/"b",tmp_path/"c"; alice,recovery=setup_client("http://server","alice",root=a); bob,_=setup_client("http://server","bob",root=b); team=create(alice,"Team","team",a); server.execute("DELETE FROM device_certificates WHERE device=?",(alice["device"]["id"],)); server.commit(); desktop,_=setup_client("http://server","alice","desktop",recovery,root=c); state=refresh(desktop,c); assert server.execute("SELECT COUNT(*) FROM device_certificates WHERE device IN (?,?)",(alice["device"]["id"],desktop["device"]["id"])).fetchone()[0]==2 and next(w for w in state["workspaces"] if w["kind"]=="personal")["device_authorized"]; attacker=identity("attacker")
+def test_device_certificates_reject_relay_key_substitution_without_auto_certifying(tmp_path,monkeypatch):
+    server=server_connect(tmp_path/"server.db"); direct=transport(server); monkeypatch.setattr("ai_convos_remote.request",direct); a,b,c=tmp_path/"a",tmp_path/"b",tmp_path/"c"; alice,recovery=setup_client("http://server","alice",root=a); bob,_=setup_client("http://server","bob",root=b); team=create(alice,"Team","team",a); server.execute("DELETE FROM device_certificates WHERE device=?",(alice["device"]["id"],)); server.commit(); desktop,_=setup_client("http://server","alice","desktop",recovery,root=c); state=refresh(desktop,c); assert server.execute("SELECT COUNT(*) FROM device_certificates WHERE device IN (?,?)",(alice["device"]["id"],desktop["device"]["id"])).fetchone()[0]==1 and next(w for w in state["workspaces"] if w["kind"]=="personal")["device_authorized"]; attacker=identity("attacker")
     def tamper(op,device):
         def call(cfg,body,auth=True):
             result=copy.deepcopy(direct(cfg,body,auth))
@@ -49,13 +52,47 @@ def test_device_certificates_reject_relay_key_substitution_and_upgrade_legacy(tm
     monkeypatch.setattr("ai_convos_remote.request",direct); request_device(desktop,team,c,0); monkeypatch.setattr("ai_convos_remote.request",tamper("state",alice["device"]["id"]))
     assert approve_device(alice,team,desktop["device"]["id"],root=a)["approved"]
     monkeypatch.setattr("ai_convos_remote.request",direct); add_member(alice,team,bob["user"],root=a); server.execute("DELETE FROM device_certificates WHERE device=?",(bob["device"]["id"],)); server.commit(); add_member(alice,team,bob["user"],True,root=a); assert server.execute("SELECT active FROM members WHERE workspace=? AND user_id=?",(team,bob["user"])).fetchone()[0]==0
-    mallory,_=setup_client("http://server","mallory",root=tmp_path/"m"); refresh(bob,b); server.execute("UPDATE users SET name=? WHERE id=?",(bob["user"],mallory["user"])); server.commit(); add_member(alice,team,bob["user"],root=a); assert server.execute("SELECT active FROM members WHERE workspace=? AND user_id=?",(team,bob["user"])).fetchone()[0]==1 and not server.execute("SELECT 1 FROM members WHERE workspace=? AND user_id=?",(team,mallory["user"])).fetchone()
+    mallory,_=setup_client("http://server","mallory",root=tmp_path/"m"); action(server,{"op":"certify","certificate":certificate(bob["root"],bob["user"],bob["device"])},bob["token"]); server.execute("UPDATE users SET name=? WHERE id=?",(bob["user"],mallory["user"])); server.commit(); add_member(alice,team,bob["user"],root=a); assert server.execute("SELECT active FROM members WHERE workspace=? AND user_id=?",(team,bob["user"])).fetchone()[0]==1 and not server.execute("SELECT 1 FROM members WHERE workspace=? AND user_id=?",(team,mallory["user"])).fetchone()
     def substitute(cfg,body,auth=True):
         result=copy.deepcopy(direct(cfg,{**body,"user":mallory["user"]},auth)) if body["op"]=="directory" else direct(cfg,body,auth)
         if body["op"]=="directory": result["users"][0]["name"]=bob["user"]
         return result
     monkeypatch.setattr("ai_convos_remote.request",substitute)
     with pytest.raises(ValueError,match="directory user"): add_member(alice,team,bob["user"],root=a)
+
+
+@pytest.mark.parametrize("field,value",(("id","wrong"),("kind","personal"),("epoch",1)))
+def test_refresh_rejects_relay_workspace_metadata(tmp_path,monkeypatch,field,value):
+    server=server_connect(tmp_path/"server.db"); direct=transport(server); monkeypatch.setattr("ai_convos_remote.request",direct); a,b=tmp_path/"a",tmp_path/"b"; alice,_=setup_client("http://server","alice",root=a); bob,_=setup_client("http://server","bob",root=b); team=create(alice,"Team","team",a); add_member(alice,team,"bob",root=a)
+    def tamper(cfg,body,auth=True):
+        result=copy.deepcopy(direct(cfg,body,auth))
+        if body["op"]=="state":
+            found=next(w for w in result["workspaces"] if w["id"]==team); found[field]=value
+        return result
+    monkeypatch.setattr("ai_convos_remote.request",tamper)
+    with pytest.raises(ValueError,match="metadata"): refresh(bob,b)
+    assert team not in load(b)["workspaces"]
+
+
+def test_refresh_rejects_relay_key_beyond_signed_history(tmp_path,monkeypatch):
+    server=server_connect(tmp_path/"server.db"); direct=transport(server); monkeypatch.setattr("ai_convos_remote.request",direct); a,b=tmp_path/"a",tmp_path/"b"; alice,_=setup_client("http://server","alice",root=a); bob,_=setup_client("http://server","bob",root=b); team=create(alice,"Team","team",a); old=alice["keys"][f"{team}:1"]; add_member(alice,team,"bob",root=a)
+    def tamper(cfg,body,auth=True):
+        result=copy.deepcopy(direct(cfg,body,auth))
+        if body["op"]=="state":
+            next(w for w in result["workspaces"] if w["id"]==team)["keys"].append({"epoch":1,"envelope":json.dumps(seal_key(unb64(old),bob["device"]["box_public"],f"workspace:{team}:epoch:1"))})
+        return result
+    monkeypatch.setattr("ai_convos_remote.request",tamper)
+    with pytest.raises(ValueError,match="entitlement"): refresh(bob,b)
+
+
+def test_relay_workspace_omission_stops_stale_upload(tmp_path,monkeypatch):
+    server=server_connect(tmp_path/"server.db"); direct=transport(server); monkeypatch.setattr("ai_convos_remote.request",direct); a=tmp_path/"a"; alice,_=setup_client("http://server","alice",root=a); team=create(alice,"Team","team",a); state=connect(a/"remote/state.db"); baseline=server.execute("SELECT COUNT(*) FROM events WHERE workspace=?",(team,)).fetchone()[0]; publish(alice,state,team,conversation("must stay local"),a)
+    def omit(cfg,body,auth=True):
+        result=copy.deepcopy(direct(cfg,body,auth))
+        if body["op"]=="state": result["workspaces"]=[w for w in result["workspaces"] if w["id"]!=team]
+        return result
+    monkeypatch.setattr("ai_convos_remote.request",omit); upload(alice,state,a)
+    assert team in load(a)["workspaces"] and server.execute("SELECT COUNT(*) FROM events WHERE workspace=?",(team,)).fetchone()[0]==baseline and state.execute("SELECT cursor FROM event_log WHERE event_json LIKE '%must stay local%'").fetchone()[0]==0
 
 
 def test_team_default_selected_complete_history_and_removal(tmp_path,monkeypatch):
@@ -116,6 +153,9 @@ def test_pending_or_removed_admin_device_cannot_authorize_itself(tmp_path,monkey
     with pytest.raises(PermissionError,match="authorized"): action(server,sign_control(desktop["device"],req),desktop["token"])
     request_device(desktop,team,b,0)
     with pytest.raises(PermissionError,match="vote"): approve_device(desktop,team,desktop["device"]["id"],root=b)
+    assert approve_device(load(a),team,desktop["device"]["id"],False,root=a)=={"approved":False,"rejected":True}
+    with pytest.raises(ValueError,match="not found"): approve_device(load(a),team,desktop["device"]["id"],root=a)
+    request_device(desktop,team,b,0)
     laptop=load(a); approve_device(laptop,team,desktop["device"]["id"],root=a); laptop=load(a); remove_device(laptop,team,desktop["device"]["id"],a); req|={"epoch":4,"activate_devices":[desktop["device"]["id"]]}
     with pytest.raises(PermissionError,match="authorized"): action(server,sign_control(desktop["device"],grant),desktop["token"])
     with pytest.raises(PermissionError,match="authorized"): action(server,sign_control(desktop["device"],req),desktop["token"])
@@ -130,7 +170,11 @@ def test_pending_or_removed_admin_device_cannot_authorize_itself(tmp_path,monkey
 
 
 def test_orphan_device_requires_user_majority_and_inherits_role_not_history(tmp_path,monkeypatch):
-    server=server_connect(tmp_path/"server.db"); monkeypatch.setattr("ai_convos_remote.request",transport(server)); a,b,c,d=tmp_path/"a",tmp_path/"b",tmp_path/"c",tmp_path/"d"; alice,recovery=setup_client("http://server","alice","laptop",root=a); bob,_=setup_client("http://server","bob",root=b); carol,_=setup_client("http://server","carol",root=c); team=create(alice,"Team","team",a); add_member(alice,team,"bob",root=a); alice=load(a); add_member(alice,team,"carol",root=a); recovered,_=setup_client("http://server","alice","recovered",recovery,root=d); alice=load(a); remove_device(alice,team,alice["device"]["id"],a); request_device(recovered,team,d,0)
+    server=server_connect(tmp_path/"server.db"); monkeypatch.setattr("ai_convos_remote.request",transport(server)); a,b,c,d=tmp_path/"a",tmp_path/"b",tmp_path/"c",tmp_path/"d"; alice,recovery=setup_client("http://server","alice","laptop",root=a); bob,_=setup_client("http://server","bob",root=b); carol,_=setup_client("http://server","carol",root=c); team=create(alice,"Team","team",a); add_member(alice,team,"bob",root=a); alice=load(a); add_member(alice,team,"carol",root=a); recovered,_=setup_client("http://server","alice","recovered",recovery,root=d); alice=load(a); remove_device(alice,team,alice["device"]["id"],a); proposal=request_device(recovered,team,d,0); bad=control_sign(bob["device"],{**{k:v for k,v in device_vote(bob["device"],bob["user"],proposal).items() if k not in ("author","signature")},"voter":recovered["user"]})
+    with pytest.raises(PermissionError,match="vote"): action(server,{"op":"vote","vote":bad},bob["token"])
+    forged=control_sign(recovered["device"],{**{k:v for k,v in proposal.items() if k not in ("author","signature")},"certificate_hash":"0"*64})
+    with pytest.raises(PermissionError,match="proposal"): action(server,{"op":"propose","proposal":forged},recovered["token"])
+    assert server.execute("SELECT COUNT(*) FROM device_votes").fetchone()[0]==0 and server.execute("SELECT COUNT(*) FROM device_proposals").fetchone()[0]==1
     first=approve_device(load(b),team,recovered["device"]["id"],root=b); assert first=={"approved":False,"votes":1,"needed":2}
     final=approve_device(load(c),team,recovered["device"]["id"],root=c); assert final["approved"] and final["history"]==0
     state=refresh(load(d),d); control=next(w for w in state["workspaces"] if w["id"]==team)["controls"][-1]; assert control["members"][recovered["user"]]["role"]=="admin" and not control["devices"][recovered["device"]["id"]]["history"]
@@ -141,6 +185,16 @@ def test_history_can_be_approved_later_and_sync_rewinds(tmp_path,monkeypatch):
     bob=load(b); publish(bob,connect(b/"remote/state.db"),team,conversation("new","new"),b); upload(bob,connect(b/"remote/state.db"),b); recovered=load(c); sc=connect(c/"remote/state.db"); pull(recovered,sc,c); assert duckdb.connect(str(c/"data/convos.db"),read_only=True).execute("SELECT title FROM conversations").fetchall()==[("new",)]
     request_history(recovered,team,c,0); result=approve_history(load(b),team,recovered["device"]["id"],root=b); assert result["approved"] and result["history"]>=4
     recovered=load(c); pull(recovered,sc,c); assert {r[0] for r in duckdb.connect(str(c/"data/convos.db"),read_only=True).execute("SELECT title FROM conversations").fetchall()}=={"old","new"}
+
+
+def test_same_user_approval_rewraps_selected_history(tmp_path,monkeypatch):
+    server=server_connect(tmp_path/"server.db"); monkeypatch.setattr("ai_convos_remote.request",transport(server)); a,b,c=tmp_path/"a",tmp_path/"b",tmp_path/"c"; alice,_=setup_client("http://server","alice",root=a); bob,recovery=setup_client("http://server","bob","laptop",root=b); team=create(alice,"Team","team",a); sa,sb=connect(a/"remote/state.db"),connect(b/"remote/state.db"); old=publish(alice,sa,team,conversation("selected"),a); upload(alice,sa,a); add_member(alice,team,"bob",root=a); grant_selected(alice,sa,team,"bob",[old],a); pull(load(b),sb,b); desktop,_=setup_client("http://server","bob","desktop",recovery,root=c); request_device(desktop,team,c,0); assert approve_device(load(b),team,desktop["device"]["id"],root=b)["approved"]
+    pull(load(c),connect(c/"remote/state.db"),c); assert duckdb.connect(str(c/"data/convos.db"),read_only=True).execute("SELECT title FROM conversations").fetchone()[0]=="selected"
+
+
+def test_relay_clock_enforces_proposal_delay(tmp_path,monkeypatch):
+    server=server_connect(tmp_path/"server.db"); monkeypatch.setattr("ai_convos_remote.request",transport(server)); monkeypatch.setattr("ai_convos_remote_server.APPROVAL_DELAY",3600); a,b,c=tmp_path/"a",tmp_path/"b",tmp_path/"c"; alice,recovery=setup_client("http://server","alice",root=a); setup_client("http://server","bob",root=b); team=create(alice,"Team","team",a); add_member(alice,team,"bob",root=a); recovered,_=setup_client("http://server","alice","recovered",recovery,root=c); remove_device(alice,team,alice["device"]["id"],a); request_device(recovered,team,c,0)
+    with pytest.raises(ValueError,match="active"): approve_device(load(b),team,recovered["device"]["id"],root=b)
 
 
 def test_republished_history_verifies_embedded_author(tmp_path,monkeypatch):

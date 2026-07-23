@@ -164,7 +164,9 @@ New members receive only the new epoch by default. Complete-history grant seals
 selected old epoch keys to their devices. Selected-history grant republishes
 chosen immutable events under the current epoch, with the event content key
 sealed only to the target member's authorized devices, so unrelated old content
-and keys are not disclosed to the server or other workspace members.
+and keys are not disclosed to the server or other workspace members. Same-user
+device approval rewraps those selected events to the new device through a
+durable local outbox.
 
 The recovery bundle contains the user root private material and personal
 workspace keyring, encrypted by the recovery key and stored as an opaque server

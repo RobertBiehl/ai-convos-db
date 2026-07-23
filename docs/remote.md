@@ -20,7 +20,9 @@ Payloads and keys remain opaque to a passive relay or database compromise.
 Membership, roles, device certificates, removals, history entitlements, epoch
 key commitments, and approvals are carried in a client-signed hash chain.
 Clients pin the chain they have observed and reject rollback, forks, invalid
-transitions, and keys that do not match the signed commitment. Version 1 does
+transitions, relay metadata that disagrees with the signed head, and keys
+outside the signed device entitlement or commitment. A workspace omitted by
+the relay is excluded from upload rather than used with stale state. Version 1 does
 not provide cross-client gossip or an external transparency log, so a malicious
 relay can still withhold updates or partition clients that have not compared
 their pinned heads.
@@ -186,7 +188,10 @@ convos remote approve-device backend DEVICE_ID
 
 The new device inherits that device's workspace access, the user's existing
 role, and the same history-inheritance flag. No administrator action is needed.
-An explicitly removed device ID cannot use this path or be reauthorized.
+Selected-history evidence is rewrapped to the new device; a durable local
+outbox retries that publication after a crash. An explicit rejection
+invalidates the proposal, and an explicitly removed device ID cannot use this
+path or be reauthorized.
 
 If the user has no authorized device in the workspace, authorization requires a
 strict majority of the other users represented by authorized devices in the
@@ -194,8 +199,10 @@ signed roster. Each user gets one vote even if they have several devices; the
 requesting user is excluded. Every voter runs the same `approve-device`
 command. The final vote atomically advances the signed state and rotates the
 workspace epoch. In a two-user team this is one vote from the other user, with
-a one-hour activation delay. A one-user team with no authorized device has no
-electorate and cannot use team voting.
+a one-hour activation delay enforced against the relay's clock and stored
+proposal window; a client-supplied approval timestamp cannot bypass or revive
+it. A one-user team with no authorized device has no electorate and cannot use
+team voting.
 
 Majority recovery is future-only. It restores the user's existing membership
 and role but does not silently release older keys. History grants remain
@@ -213,7 +220,8 @@ convos remote approve-history backend DEVICE_ID
 
 History activation is a separate signed majority decision and does not change
 membership or role. It can only install epoch keys held by the device that
-finalizes the vote; voting cannot recreate keys that no remaining device has.
+finalizes the vote and selected evidence available to that device; voting
+cannot recreate material that no remaining device has.
 On the recovered device, the next ordinary sync detects that its earliest
 available epoch moved backward, rewinds the delivery cursor, and idempotently
 imports all newly decryptable events. `convos remote approvals backend` shows

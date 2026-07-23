@@ -6,7 +6,7 @@ import typer
 _pending=[]
 def register(app): _pending.append(app) if "remote" not in globals() else app.add_typer(remote,name="remote")
 from ai_convos.cli import DB_PATH, PROJECT_ROOT, drain_hooks, get_db, install_hooks
-from .control import approved, electorate, proposal as device_proposal, record as control_record, sign as control_sign, state_hash, verify_state, vote as device_vote
+from .control import approved, electorate, proposal as device_proposal, record as control_record, sign as control_sign, state_hash, verify_proposal, verify_state, vote as device_vote
 from .provenance import repository
 from .projection import connect, project, project_many, query as graph_query, rebuild as rebuild_projection, scan, sequence
 from .protocol import (b64, certificate, digest, event, identity, material_event, open_event, open_key, public, public_id, recover,
@@ -44,23 +44,32 @@ def server_record(d,history=True): return control_record(d["user_id"],d["root_pu
 def own_record(cfg,history=True): return control_record(cfg["user"],cfg["root"]["sign_public"],cfg["device"],certificate(cfg["root"],cfg["user"],cfg["device"]),history)
 def control_body(cfg,previous,key_,action,members=None,devices=None,removed=None,approval=None):
     return control_sign(cfg["device"],{"v":1,"kind":"workspace.state","workspace":previous["workspace"],"scope":previous["scope"],"revision":previous["revision"]+1,"prev":state_hash(previous),"epoch":previous["epoch"]+(action not in ("history","history_activate")),"key_commitment":digest(key_),"members":members or previous["members"],"devices":devices or previous["devices"],"removed":removed if removed is not None else previous["removed"],"action":action,"approval":approval,"approved_at":time.time()})
+def access_from(cfg,ws):
+    head=cfg["controls"][ws]; device=cfg["device"]["id"]; first=min(value["epoch"] for remote in cfg["server_state"]["workspaces"] if remote["id"]==ws for value in remote["controls"] if device in value["devices"]); return head["members"][cfg["user"]]["history_from"] if head["devices"][device]["history"] else first
 def directory_user(found,user): field="id" if len(user)==32 and all(c in "0123456789abcdef" for c in user) else "name"; values=[v for v in found["users"] if v[field]==user]; return values[0] if len(values)==1 and public_id(values[0]["root_public"])==values[0]["id"] else (_ for _ in ()).throw(ValueError("directory user mismatch"))
 def update_recovery(cfg,root=None):
     personal={ws for ws,v in cfg["workspaces"].items() if v["kind"]=="personal"}; keys={name:value for name,value in cfg["keys"].items() if name.rsplit(":",1)[0] in personal}; _,bundle=recovery_bundle({"root":cfg["root"],"keys":keys,"workspaces":cfg["workspaces"],"controls":{ws:v for ws,v in cfg["controls"].items() if ws in personal}},unb64(cfg["recovery"])); request(cfg,sign_control(cfg["device"],{"op":"recovery","bundle":bundle})); save(cfg,root)
 def refresh(cfg,root=None):
-    state=request(cfg,{"op":"state"}); missing={d["id"]:d for w in state["workspaces"] for d in w["devices"] if d["user_id"]==cfg["user"] and not d["certificate"]}; [request(cfg,{"op":"certify","certificate":certificate(cfg["root"],cfg["user"],d)}) for d in missing.values()]; state=request(cfg,{"op":"state"}) if missing else state; cfg["server_state"]=state; changed=False
+    state=request(cfg,{"op":"state"}); cfg["server_state"]=state; changed=False; seen=set()
+    if (state["user"],state["device"])!=(cfg["user"],cfg["device"]["id"]): raise ValueError("relay identity metadata mismatch")
     for ws in state["workspaces"]:
+        if ws["id"] in seen: raise ValueError("duplicate relay workspace")
+        seen.add(ws["id"])
         previous=None
         for value in ws["controls"]: verify_state(value,previous); previous=value
+        if not previous or (ws["id"],ws["kind"],ws["epoch"])!=(previous["workspace"],previous["scope"],previous["epoch"]): raise ValueError("relay workspace metadata does not match signed state")
+        member=previous["members"].get(cfg["user"]); authorized=cfg["device"]["id"] in previous["devices"] and cfg["device"]["id"] not in previous["removed"]
+        if not member or (ws["role"],ws["history_from"],bool(ws["device_authorized"]))!=(member["role"],member["history_from"],authorized): raise ValueError("relay access metadata does not match signed state")
         pinned=cfg["controls"].get(ws["id"])
         if pinned and (not previous or pinned["revision"]>previous["revision"] or state_hash(pinned) not in {state_hash(v) for v in ws["controls"]}): raise ValueError("workspace control rollback or fork")
-        if previous: cfg["controls"][ws["id"]]=previous
-        cfg["workspaces"].setdefault(ws["id"],{"name":ws["id"][:8],"kind":ws["kind"],"epoch":ws["epoch"]}); cfg["workspaces"][ws["id"]]["epoch"]=ws["epoch"]
-        for wrapped in ws["keys"]:
+        cfg["controls"][ws["id"]]=previous; cfg["workspaces"].setdefault(ws["id"],{"name":ws["id"][:8]}); cfg["workspaces"][ws["id"]].update(kind=previous["scope"],epoch=previous["epoch"]); ws.update(kind=previous["scope"],epoch=previous["epoch"],role=member["role"],history_from=member["history_from"],device_authorized=authorized)
+        first=min((v["epoch"] for v in ws["controls"] if cfg["device"]["id"] in v["devices"]),default=previous["epoch"]); start=member["history_from"] if authorized and previous["devices"][cfg["device"]["id"]]["history"] else first; epochs=[int(v["epoch"]) for v in ws["keys"]]
+        if authorized and (len(epochs)!=len(set(epochs)) or any(not start<=epoch<=previous["epoch"] for epoch in epochs)): raise ValueError("relay key envelope exceeds signed entitlement")
+        for wrapped in ws["keys"] if authorized else []:
             name=f"{ws['id']}:{wrapped['epoch']}"
             if name not in cfg["keys"]:
                 opened=open_key(json.loads(wrapped["envelope"]),cfg["device"]["box_private"],f"workspace:{ws['id']}:epoch:{wrapped['epoch']}"); controls=[v for v in ws["controls"] if v["epoch"]==wrapped["epoch"]]
-                if controls and digest(opened)!=controls[-1]["key_commitment"]: raise ValueError("workspace epoch key commitment mismatch")
+                if not controls or digest(opened)!=controls[-1]["key_commitment"]: raise ValueError("workspace epoch key commitment mismatch")
                 cfg["keys"][name]=b64(opened); changed=True
     save(cfg,root)
     if changed: update_recovery(cfg,root)
@@ -78,9 +87,8 @@ def setup_client(url,user,device="computer",recovery=None,root=None):
     if not workspaces: create(cfg,"Personal","personal",root)
     else:
         state=refresh(cfg,root)
-        for ws in [w for w in state["workspaces"] if w["role"]=="admin" and w["kind"]=="personal"]:
-            rotate(cfg,ws["id"],{m["user_id"]:m["role"] for m in ws["members"] if m["active"]},[d for d in ws["devices"] if d["active"] and d.get("allowed",1)],root=root)
-            if ws["kind"]=="personal": grant_all(cfg,ws["id"],uid,root)
+        for ws in [w for w in state["workspaces"] if cfg["controls"][w["id"]]["members"][uid]["role"]=="admin" and cfg["controls"][w["id"]]["scope"]=="personal"]:
+            rotate(cfg,ws["id"],{u:m["role"] for u,m in cfg["controls"][ws["id"]]["members"].items()},[],root=root); grant_all(cfg,ws["id"],uid,root)
     return cfg,recovery
 def rotate(cfg,ws,members,devices,deactivate=(),root=None):
     state=refresh(cfg,root); previous=cfg["controls"][ws]; epoch=previous["epoch"]+1; new=os.urandom(32); devices=trusted(devices); old=previous["members"]; meta={u:old.get(u,{"joined":epoch,"history_from":epoch,"selected":[]})|{"role":role} for u,role in members.items()}; removed=sorted(set(previous["removed"])|set(deactivate)|{d for d,r in previous["devices"].items() if r["user"] not in members}); records={d:r for d,r in previous["devices"].items() if r["user"] in members and d not in deactivate}
@@ -109,8 +117,8 @@ def _upload_batches(rows,limit=8*1024*1024):
         batch.append(row); size+=len(row[3])
     if batch: yield batch
 def upload(cfg,state,root=None):
-    refresh(cfg,root)
-    rows=state.execute("SELECT workspace,event,event_json,envelope FROM event_log WHERE direction='out' AND cursor=0 ORDER BY rowid").fetchall()
+    active={w["id"] for w in refresh(cfg,root)["workspaces"]}
+    rows=[r for r in state.execute("SELECT workspace,event,event_json,envelope FROM event_log WHERE direction='out' AND cursor=0 ORDER BY rowid").fetchall() if r[0] in active]
     for batch in _upload_batches(rows):
         envs=[]
         for ws,eid,raw,wrapped in batch:
@@ -119,60 +127,66 @@ def upload(cfg,state,root=None):
             envs.append(env)
         result=request(cfg,{"op":"upload_many","envelopes":envs})["events"]; [state.execute("UPDATE event_log SET cursor=?,envelope=NULL WHERE event=?",(r["cursor"],batch[i][1])) for i,r in enumerate(result)]; state.commit()
 def pull(cfg,state,root=None):
-    server=refresh(cfg,root); devices={r["device"]["id"]:r["device"] for ws in server["workspaces"] for control in ws["controls"] for r in control["devices"].values()}
+    server=refresh(cfg,root)
     for ws in server["workspaces"]:
         if not ws["device_authorized"]: continue
+        devices={r["device"]["id"]:r["device"] for control in ws["controls"] for r in control["devices"].values()}
         after=(state.execute("SELECT cursor FROM cursors WHERE workspace=?",(ws["id"],)).fetchone() or [0])[0]; seen=(state.execute("SELECT value FROM meta WHERE key=?",(f"history_from:{ws['id']}",)).fetchone() or [str(ws["history_from"])])[0]; earliest=min([k["epoch"] for k in ws["keys"]],default=ws["epoch"]); old_key=int((state.execute("SELECT value FROM meta WHERE key=?",(f"key_from:{ws['id']}",)).fetchone() or [earliest])[0])
         if ws["history_from"]<int(seen) or earliest<old_key: after=0
         result=request(cfg,{"op":"pull","workspace":ws["id"],"after":after,"limit":500}); incoming=[]
         for item in result["events"]:
             if item.get("lazy"):
                 state.execute("INSERT OR IGNORE INTO lazy_events VALUES (?,?,?,?)",(ws["id"],item["event"],item["cursor"],item["size"])); after=max(after,item["cursor"]); continue
-            env=item["envelope"]; value=open_event(env,key(cfg,ws["id"],env["epoch"]),signer(devices,env["author"])); material=material_event(value,devices,cfg["device"]); sequence(state,ws["id"],value); state.execute("INSERT OR IGNORE INTO event_log VALUES (?,?,?,?,?,NULL)",(ws["id"],value["id"],item["cursor"],"in",json.dumps(value)))
+            env=item["envelope"]
+            if env["workspace"]!=ws["id"] or not access_from(cfg,ws["id"])<=env["epoch"]<=cfg["controls"][ws["id"]]["epoch"]: raise ValueError("event envelope exceeds signed workspace access")
+            value=open_event(env,key(cfg,ws["id"],env["epoch"]),signer(devices,env["author"])); material=material_event(value,devices,cfg["device"]); sequence(state,ws["id"],value); state.execute("INSERT OR IGNORE INTO event_log VALUES (?,?,?,?,?,NULL)",(ws["id"],value["id"],item["cursor"],"in",json.dumps(value)))
+            if material and material["id"]!=value["id"]: state.execute("INSERT OR REPLACE INTO history_material VALUES (?,?,?)",(ws["id"],material["id"],json.dumps(material)))
             if material: incoming.append((ws["id"],material))
             after=max(after,item["cursor"])
         project_many(core_path(root),state,incoming,cfg["device"]["id"])
         state.execute("INSERT OR REPLACE INTO cursors VALUES (?,?)",(ws["id"],after)); state.execute("INSERT OR REPLACE INTO meta VALUES (?,?),(?,?)",(f"history_from:{ws['id']}",str(ws["history_from"]),f"key_from:{ws['id']}",str(earliest))); state.commit()
 def fetch_lazy(cfg,state,event_id=None,root=None):
-    server=refresh(cfg,root); devices={r["device"]["id"]:r["device"] for ws in server["workspaces"] for control in ws["controls"] for r in control["devices"].values()}; sql="SELECT workspace,event,cursor FROM lazy_events"+(" WHERE event=?" if event_id else ""); rows=state.execute(sql,(event_id,) if event_id else ()).fetchall()
+    server=refresh(cfg,root); controls={ws["id"]:ws["controls"] for ws in server["workspaces"]}; sql="SELECT workspace,event,cursor FROM lazy_events"+(" WHERE event=?" if event_id else ""); rows=[r for r in state.execute(sql,(event_id,) if event_id else ()).fetchall() if r[0] in controls]
     for ws,eid,cursor in rows:
+        devices={r["device"]["id"]:r["device"] for control in controls[ws] for r in control["devices"].values()}
         env=request(cfg,{"op":"fetch","workspace":ws,"event":eid})["envelope"]
-        if (env["workspace"],env["event"])!=(ws,eid): raise ValueError("lazy event response mismatch")
-        value=open_event(env,key(cfg,ws,env["epoch"]),signer(devices,env["author"])); material=material_event(value,devices,cfg["device"]); sequence(state,ws,value); state.execute("INSERT OR IGNORE INTO event_log VALUES (?,?,?,?,?,NULL)",(ws,eid,cursor,"in",json.dumps(value))); material and project(core_path(root),state,material,ws,cfg["device"]["id"]); state.execute("DELETE FROM lazy_events WHERE event=?",(eid,))
+        if (env["workspace"],env["event"])!=(ws,eid) or not access_from(cfg,ws)<=env["epoch"]<=cfg["controls"][ws]["epoch"]: raise ValueError("lazy event response mismatch")
+        value=open_event(env,key(cfg,ws,env["epoch"]),signer(devices,env["author"])); material=material_event(value,devices,cfg["device"]); sequence(state,ws,value); state.execute("INSERT OR IGNORE INTO event_log VALUES (?,?,?,?,?,NULL)",(ws,eid,cursor,"in",json.dumps(value))); material and material["id"]!=value["id"] and state.execute("INSERT OR REPLACE INTO history_material VALUES (?,?,?)",(ws,material["id"],json.dumps(material))); material and project(core_path(root),state,material,ws,cfg["device"]["id"]); state.execute("DELETE FROM lazy_events WHERE event=?",(eid,))
     state.commit(); return len(rows)
 def sync_once(root=None,force=False):
-    cfg=load(root); _,_,state_path=paths(root); state=connect(state_path); drain_hooks(); upload(cfg,state,root); core=get_db(read_only=True)
+    cfg=load(root); _,_,state_path=paths(root); state=connect(state_path); drain_hooks(); upload(cfg,state,root); flush_selected(cfg,state,root); core=get_db(read_only=True)
     stamp=core_path(root).stat().st_mtime_ns if core_path(root).exists() else 0; previous=int((state.execute("SELECT value FROM meta WHERE key='core_mtime'").fetchone() or ["0"])[0])
     if core and (force or stamp!=previous):
+        active={w["id"] for w in cfg["server_state"]["workspaces"]}
         for ws,meta in cfg["workspaces"].items():
-            if f"{ws}:{meta['epoch']}" not in cfg["keys"]: continue
+            if ws not in active or f"{ws}:{meta['epoch']}" not in cfg["keys"]: continue
             pol=state.execute("SELECT kind,value,local_root FROM policies WHERE workspace=?",(ws,)).fetchall(); repos=[p[1] for p in pol if p[0]=="repository"]; roots=[p[2] for p in pol if p[0]=="path" and p[2]]
             known={(r[0],r[1]) for r in state.execute("SELECT entity,revision FROM published WHERE workspace=?",(ws,)).fetchall()}; [publish(cfg,state,ws,r,root,True,known) for r in scan(core,state,cfg["device"]["id"],meta["kind"],repos,roots)]
         state.execute("INSERT OR REPLACE INTO meta VALUES ('core_mtime',?)",(str(stamp),)); state.commit()
     if core: core.close()
     upload(cfg,state,root); pull(cfg,state,root); state.execute("INSERT OR REPLACE INTO meta VALUES ('last_sync',?)",(str(time.time()),)); state.commit(); state.close()
 def add_member(cfg,ws,user,remove=False,root=None):
-    state=refresh(cfg,root); w=next(x for x in state["workspaces"] if x["id"]==ws); members={m["user_id"]:m["role"] for m in w["members"] if m["active"]}; devices=[d for d in w["devices"] if d["active"] and d.get("allowed",1)]
+    refresh(cfg,root); members={u:m["role"] for u,m in cfg["controls"][ws]["members"].items()}; devices=[]
     if remove:
         found=request(cfg,{"op":"directory","user":user}); target=directory_user(found,user) if found["users"] else {"id":user}; members.pop(target["id"],None)
     else:
         found=request(cfg,{"op":"directory","user":user}); trusted(found["devices"]); target=directory_user(found,user); members[target["id"]]="member"; devices+=found["devices"]
     return rotate(cfg,ws,members,[d for d in {d["id"]:d for d in devices}.values() if d["user_id"] in members],root=root)
 def grant_all(cfg,ws,user,root=None):
-    found=request(cfg,{"op":"directory","user":user}); target=directory_user(found,user); refresh(cfg,root); previous=cfg["controls"][ws]; allowed={d for d,r in previous["devices"].items() if r["user"]==target["id"]}; devices=trusted([d for w in cfg["server_state"]["workspaces"] if w["id"]==ws for d in w["devices"] if d["id"] in allowed]); envelopes={}
+    found=request(cfg,{"op":"directory","user":user}); target=directory_user(found,user); refresh(cfg,root); previous=cfg["controls"][ws]; devices=[r["device"] for r in previous["devices"].values() if r["user"]==target["id"]]; envelopes={}
     for name,value in cfg["keys"].items():
         if name.startswith(ws+":"):
             epoch=int(name.rsplit(":",1)[1]); envelopes[str(epoch)]={d["id"]:seal_key(unb64(value),d["box_public"],f"workspace:{ws}:epoch:{epoch}") for d in devices}
     members={**previous["members"],target["id"]:{**previous["members"][target["id"]],"history_from":1}}; records={d:{**r,"history":True} if r["user"]==target["id"] else r for d,r in previous["devices"].items()}; control=control_body(cfg,previous,key(cfg,ws,previous["epoch"]),"history",members,records); request(cfg,sign_control(cfg["device"],{"op":"grant_all","workspace":ws,"user":target["id"],"control":control,"envelopes":envelopes})); cfg["controls"][ws]=control; save(cfg,root); return len(envelopes)
 def grant_selected(cfg,state,ws,user,event_ids,root=None):
     if not event_ids: return 0
-    found=request(cfg,{"op":"directory","user":user}); target=directory_user(found,user); refresh(cfg,root); previous=cfg["controls"][ws]; devices=trusted([d for w in cfg["server_state"]["workspaces"] if w["id"]==ws for d in w["devices"] if d["user_id"]==target["id"] and d["active"] and d["allowed"] and d["authorized"]]); rows=state.execute(f"SELECT event,event_json FROM event_log WHERE workspace=? AND event IN ({','.join('?'*len(event_ids))})",(ws,*event_ids)).fetchall()
+    found=request(cfg,{"op":"directory","user":user}); target=directory_user(found,user); refresh(cfg,root); previous=cfg["controls"][ws]; devices=[r["device"] for r in previous["devices"].values() if r["user"]==target["id"]]; rows=state.execute(f"SELECT event,event_json FROM event_log WHERE workspace=? AND event IN ({','.join('?'*len(event_ids))})",(ws,*event_ids)).fetchall()
     if not rows: return 0
     if not devices: raise ValueError("target has no authorized workspace devices")
     members={**previous["members"],target["id"]:{**previous["members"][target["id"]],"selected":sorted(set(previous["members"][target["id"]]["selected"])|{e for e,_ in rows})}}; records={d:{**r,"history":True} if r["user"]==target["id"] else r for d,r in previous["devices"].items()}; control=control_body(cfg,previous,key(cfg,ws,previous["epoch"]),"history",members,records); request(cfg,sign_control(cfg["device"],{"op":"grant_selected","workspace":ws,"control":control})); cfg["controls"][ws]=control; save(cfg,root)
     [publish(cfg,state,ws,{"kind":"history.republish","entity":(entity:=f"history:{target['id']}:{eid}"),"payload":{"target":target["id"],"sealed":seal_history(json.loads(raw),devices,entity)}} ,root) for eid,raw in rows]; upload(cfg,state,root); return len(rows)
 def remove_device(cfg,ws,device_id,root=None):
-    state=refresh(cfg,root); w=next(x for x in state["workspaces"] if x["id"]==ws); members={m["user_id"]:m["role"] for m in w["members"] if m["active"]}; devices=[d for d in w["devices"] if d["active"] and d.get("allowed",1) and d["id"]!=device_id]; return rotate(cfg,ws,members,devices,[device_id],root)
+    refresh(cfg,root); members={u:m["role"] for u,m in cfg["controls"][ws]["members"].items()}; return rotate(cfg,ws,members,[],[device_id],root)
 def request_device(cfg,ws,root=None,delay=3600):
     refresh(cfg,root); base=cfg["controls"][ws]
     if cfg["user"] not in base["members"] or cfg["device"]["id"] in base["devices"] or cfg["device"]["id"] in base["removed"]: raise ValueError("device is not pending for this workspace")
@@ -182,16 +196,34 @@ def pending(cfg,ws,device_id,kind):
     base=cfg["controls"][ws]; found=[p for p in proposals(cfg,ws) if p["proposal"]["kind"]==kind and p["proposal"]["target"]["device"]["id"]==device_id and p["proposal"]["base"]==state_hash(base)]
     if len(found)!=1: raise ValueError("pending device proposal not found")
     return base,found[0]
+def selected_material(root,ws,event_ids):
+    if not event_ids: return []
+    state=connect(paths(root)[2]); marks=",".join("?"*len(event_ids)); values=dict(state.execute(f"SELECT event,event_json FROM history_material WHERE workspace=? AND event IN ({marks})",(ws,*event_ids)).fetchall()); values.update(state.execute(f"SELECT event,event_json FROM event_log WHERE workspace=? AND event IN ({marks})",(ws,*event_ids)).fetchall()); state.close()
+    if set(values)!=set(event_ids): raise ValueError("approver lacks selected history material")
+    return [(event,json.loads(values[event])) for event in event_ids]
+def queue_selected(root,ws,target,values):
+    if not values: return
+    state=connect(paths(root)[2]); [state.execute("INSERT OR REPLACE INTO history_outbox VALUES (?,?,?,?)",(ws,target,eid,json.dumps(value))) for eid,value in values]; state.commit(); state.close()
+def flush_selected(cfg,state,root=None):
+    for ws,target,eid,raw in state.execute("SELECT workspace,target,event,event_json FROM history_outbox").fetchall():
+        head=cfg["controls"].get(ws); record=head and head["devices"].get(target)
+        if record and eid not in head["members"][record["user"]]["selected"]: state.execute("DELETE FROM history_outbox WHERE workspace=? AND target=? AND event=?",(ws,target,eid)); continue
+        if not record or not record["history"] or cfg["device"]["id"] not in head["devices"]: continue
+        entity=f"history:{record['user']}:{eid}:{target}"; publish(cfg,state,ws,{"kind":"history.republish","entity":entity,"payload":{"target":record["user"],"sealed":seal_history(json.loads(raw),[record["device"]],entity)}},root,True); state.execute("DELETE FROM history_outbox WHERE workspace=? AND target=? AND event=?",(ws,target,eid))
+    state.commit()
 def approve_device(cfg,ws,device_id,approve=True,root=None):
     refresh(cfg,root); base,item=pending(cfg,ws,device_id,"device.proposal"); target=item["proposal"]["target"]; same=cfg["user"]==target["user"] and cfg["device"]["id"] in base["devices"]
+    if same and not approve:
+        request(cfg,sign_control(cfg["device"],{"op":"reject","workspace":ws,"proposal":state_hash(item["proposal"])})); return {"approved":False,"rejected":True}
+    if same: verify_proposal(base,item["proposal"])
     if not same:
         request(cfg,{"op":"vote","vote":device_vote(cfg["device"],cfg["user"],item["proposal"],approve)}); item=next(p for p in proposals(cfg,ws) if state_hash(p["proposal"])==state_hash(item["proposal"]))
         yes=len({v["voter"] for v in item["votes"] if v["approve"]}); needed=len(electorate(base,target["user"]))//2+1
         if not approve or yes<needed: return {"approved":False,"votes":yes,"needed":needed}
         approved(base,item["proposal"],item["votes"])
-    new=os.urandom(32); epoch=base["epoch"]+1; inherit=base["devices"][cfg["device"]["id"]]["history"] if same else False; entry={**target,"history":inherit}; records={**base["devices"],device_id:entry}; action="self_approve" if same else "quorum_approve"; proof={"proposal":item["proposal"],"votes":item["votes"]}; control=control_body(cfg,base,new,action,devices=records,approval=proof); envs={d:seal_key(new,r["device"]["box_public"],f"workspace:{ws}:epoch:{epoch}") for d,r in records.items()}; history={name.rsplit(":",1)[1]:seal_key(unb64(value),entry["device"]["box_public"],f"workspace:{ws}:epoch:{name.rsplit(':',1)[1]}") for name,value in cfg["keys"].items() if inherit and name.startswith(ws+":")}
+    new=os.urandom(32); epoch=base["epoch"]+1; inherit=base["devices"][cfg["device"]["id"]]["history"] if same else False; selected=selected_material(root,ws,base["members"][target["user"]]["selected"]) if inherit else []; queue_selected(root,ws,device_id,selected); entry={**target,"history":inherit}; records={**base["devices"],device_id:entry}; action="self_approve" if same else "quorum_approve"; proof={"proposal":item["proposal"],"votes":item["votes"]}; control=control_body(cfg,base,new,action,devices=records,approval=proof); envs={d:seal_key(new,r["device"]["box_public"],f"workspace:{ws}:epoch:{epoch}") for d,r in records.items()}; start=base["members"][target["user"]]["history_from"]; history={name.rsplit(":",1)[1]:seal_key(unb64(value),entry["device"]["box_public"],f"workspace:{ws}:epoch:{name.rsplit(':',1)[1]}") for name,value in cfg["keys"].items() if inherit and name.startswith(ws+":") and int(name.rsplit(":",1)[1])>=start}
     body={"op":"rotate","workspace":ws,"control":control,"envelopes":envs}; history and body.update(history_envelopes={device_id:history})
-    request(cfg,sign_control(cfg["device"],body)); cfg["keys"][f"{ws}:{epoch}"]=b64(new); cfg["workspaces"][ws]["epoch"]=epoch; cfg["controls"][ws]=control; update_recovery(cfg,root); control_event(cfg,ws,action,device_id,root); return {"approved":True,"epoch":epoch,"history":len(history)}
+    request(cfg,sign_control(cfg["device"],body)); cfg["keys"][f"{ws}:{epoch}"]=b64(new); cfg["workspaces"][ws]["epoch"]=epoch; cfg["controls"][ws]=control; update_recovery(cfg,root); state=connect(paths(root)[2]); flush_selected(cfg,state,root); state.close(); control_event(cfg,ws,action,device_id,root); return {"approved":True,"epoch":epoch,"history":len(history),"selected":len(selected)}
 def request_history(cfg,ws,root=None,delay=3600):
     refresh(cfg,root); base=cfg["controls"][ws]; current=base["devices"].get(cfg["device"]["id"])
     if not current or current["history"]: raise ValueError("device does not need history approval")
@@ -199,8 +231,8 @@ def request_history(cfg,ws,root=None,delay=3600):
 def approve_history(cfg,ws,device_id,approve=True,root=None):
     refresh(cfg,root); base,item=pending(cfg,ws,device_id,"history.proposal"); target=item["proposal"]["target"]; request(cfg,{"op":"vote","vote":device_vote(cfg["device"],cfg["user"],item["proposal"],approve)}); item=next(p for p in proposals(cfg,ws) if state_hash(p["proposal"])==state_hash(item["proposal"])); yes=len({v["voter"] for v in item["votes"] if v["approve"]}); needed=len(electorate(base,target["user"]))//2+1
     if not approve or yes<needed: return {"approved":False,"votes":yes,"needed":needed}
-    approved(base,item["proposal"],item["votes"],kind="history.proposal"); device=target["device"]["id"]; records={**base["devices"],device:{**base["devices"][device],"history":True}}; proof={"proposal":item["proposal"],"votes":item["votes"]}; control=control_body(cfg,base,key(cfg,ws,base["epoch"]),"history_activate",devices=records,approval=proof); start=base["members"][target["user"]]["history_from"]; envs={str(epoch):seal_key(key(cfg,ws,epoch),target["device"]["box_public"],f"workspace:{ws}:epoch:{epoch}") for epoch in range(start,base["epoch"]+1)}
-    request(cfg,sign_control(cfg["device"],{"op":"history_activate","workspace":ws,"control":control,"envelopes":envs})); cfg["controls"][ws]=control; save(cfg,root); control_event(cfg,ws,"history_activate",device,root); return {"approved":True,"history":len(envs)}
+    approved(base,item["proposal"],item["votes"],kind="history.proposal"); selected=selected_material(root,ws,base["members"][target["user"]]["selected"]); device=target["device"]["id"]; queue_selected(root,ws,device,selected); records={**base["devices"],device:{**base["devices"][device],"history":True}}; proof={"proposal":item["proposal"],"votes":item["votes"]}; control=control_body(cfg,base,key(cfg,ws,base["epoch"]),"history_activate",devices=records,approval=proof); start=base["members"][target["user"]]["history_from"]; envs={str(epoch):seal_key(key(cfg,ws,epoch),target["device"]["box_public"],f"workspace:{ws}:epoch:{epoch}") for epoch in range(start,base["epoch"]+1)}
+    request(cfg,sign_control(cfg["device"],{"op":"history_activate","workspace":ws,"control":control,"envelopes":envs})); cfg["controls"][ws]=control; save(cfg,root); state=connect(paths(root)[2]); flush_selected(cfg,state,root); state.close(); control_event(cfg,ws,"history_activate",device,root); return {"approved":True,"history":len(envs),"selected":len(selected)}
 
 @remote.command("setup")
 def setup_cmd(url:str,user:str,device:str=typer.Option("computer","--device")): cfg,recovery=setup_client(url,user,device); typer.echo(f"Personal workspace ready. User ID: {cfg['user']}. Recovery key (store offline): {recovery}")

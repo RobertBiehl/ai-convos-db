@@ -22,7 +22,7 @@ def vote(device,user,request,approve=True): return sign(device,{"v":V,"kind":"de
 def electorate(base,target): return sorted({d["user"] for d in base["devices"].values() if d["user"]!=target})
 def verify_proposal(base,request,now=None,kind="device.proposal"):
     verify(request,request["target"]["device"]["sign_public"]); verify_record(request["target"])
-    if request["kind"]!=kind or request["base"]!=state_hash(base) or request["workspace"]!=base["workspace"] or request["epoch"]!=base["epoch"] or request["certificate_hash"]!=digest(request["target"]["certificate"]): raise ValueError("proposal state mismatch")
+    if request["v"]!=V or request["kind"]!=kind or request["base"]!=state_hash(base) or request["workspace"]!=base["workspace"] or request["epoch"]!=base["epoch"] or request["certificate_hash"]!=digest(request["target"]["certificate"]): raise ValueError("proposal state mismatch")
     if not request["not_before"]<=float(now if now is not None else time.time())<request["expires"]: raise ValueError("proposal is not active")
     return request["target"]
 def approved(base,request,votes,now=None,kind="device.proposal"):
@@ -30,7 +30,7 @@ def approved(base,request,votes,now=None,kind="device.proposal"):
     eligible=set(electorate(base,request["target"]["user"])); by_user={}
     for item in votes:
         voter=item["voter"]; device=base["devices"].get(item["author"])
-        if not device or device["user"]!=voter or voter not in eligible: raise ValueError("ineligible vote")
+        if item["v"]!=V or item["kind"]!="device.vote" or type(item["approve"]) is not bool or not device or device["user"]!=voter or voter not in eligible: raise ValueError("ineligible vote")
         verify(item,device["device"]["sign_public"])
         if (item["proposal"],item["workspace"],item["base"])!=(state_hash(request),request["workspace"],request["base"]): raise ValueError("vote proposal mismatch")
         if voter in by_user and by_user[voter]!=item["approve"]: raise ValueError("conflicting user votes")
@@ -47,7 +47,7 @@ def verify_state(value,previous=None):
     if not author: raise ValueError("state author is not authorized")
     verify(value,verify_record(author)["device"]["sign_public"]); [verify_record(d) for d in value["devices"].values()]
     if previous is None:
-        if value["revision"]!=1 or value["prev"] is not None or value["epoch"]!=1 or value["author"] not in value["devices"] or value["action"]!="create" or value["members"][author["user"]]["role"]!="admin": raise ValueError("invalid genesis state")
+        if value["revision"]!=1 or value["prev"] is not None or value["epoch"]!=1 or value["author"] not in value["devices"] or value["action"]!="create" or value["members"][author["user"]]["role"]!="admin" or set(value["members"])!={author["user"]} or set(value["devices"])!={value["author"]} or value["removed"]: raise ValueError("invalid genesis state")
         return value
     if not _same(value,previous,"workspace","scope") or value["revision"]!=previous["revision"]+1 or value["prev"]!=state_hash(previous): raise ValueError("workspace state chain mismatch")
     action=value["action"]; admin=previous["members"][author["user"]]["role"]=="admin"
@@ -75,6 +75,6 @@ def verify_state(value,previous=None):
         if not removed or not removed<=set(value["removed"]) or not set(previous["removed"])<=set(value["removed"]) or any(value["devices"].get(d)!=r for d,r in previous["devices"].items() if d not in removed): raise ValueError("removed device tombstone missing")
     elif action=="membership":
         added_users=set(value["members"])-set(previous["members"]); removed_users=set(previous["members"])-set(value["members"]); added=set(value["devices"])-set(previous["devices"]); removed=set(previous["devices"])-set(value["devices"])
-        if value["epoch"]!=previous["epoch"]+1 or set(value["devices"])&set(value["removed"]) or any(r["user"] not in added_users for d,r in value["devices"].items() if d in added) or any(r["user"] not in removed_users for d,r in previous["devices"].items() if d in removed) or any(value["devices"].get(d)!=r for d,r in previous["devices"].items() if r["user"] not in removed_users) or any(not _same(m,previous["members"][u],"joined","history_from","selected") for u,m in value["members"].items() if u not in added_users) or any((m["joined"],m["history_from"],m["selected"])!=(value["epoch"],value["epoch"],[]) for u,m in value["members"].items() if u in added_users) or not set(previous["removed"])<=set(value["removed"]) or not removed<=set(value["removed"]): raise ValueError("invalid membership transition")
+        if value["epoch"]!=previous["epoch"]+1 or value["scope"]=="personal" and value["members"]!=previous["members"] or set(value["devices"])&set(value["removed"]) or any(r["user"] not in added_users for d,r in value["devices"].items() if d in added) or any(r["user"] not in removed_users for d,r in previous["devices"].items() if d in removed) or any(value["devices"].get(d)!=r for d,r in previous["devices"].items() if r["user"] not in removed_users) or any(not _same(m,previous["members"][u],"joined","history_from","selected") for u,m in value["members"].items() if u not in added_users) or any((m["joined"],m["history_from"],m["selected"])!=(value["epoch"],value["epoch"],[]) for u,m in value["members"].items() if u in added_users) or not set(previous["removed"])<=set(value["removed"]) or not removed<=set(value["removed"]): raise ValueError("invalid membership transition")
     else: raise ValueError("unknown workspace action")
     return value

@@ -11,7 +11,7 @@ def person(name):
 def genesis(root,device,entry):
     body={"v":1,"kind":"workspace.state","workspace":"w","scope":"team","revision":1,"prev":None,"epoch":1,"key_commitment":digest(b"k1"),"members":{root["id"]:{"role":"admin","joined":1,"history_from":1,"selected":[]}},"devices":{device["id"]:entry},"removed":[],"action":"create","approval":None}; return sign(device,body)
 def successor(device,base,action,devices=None,members=None,removed=None,approval=None,epoch=None):
-    return sign(device,{"v":1,"kind":"workspace.state","workspace":"w","scope":"team","revision":base["revision"]+1,"prev":state_hash(base),"epoch":epoch if epoch is not None else base["epoch"]+1,"key_commitment":digest(f"k{base['epoch']+1}".encode()),"members":members or copy.deepcopy(base["members"]),"devices":devices or copy.deepcopy(base["devices"]),"removed":removed if removed is not None else list(base["removed"]),"action":action,"approval":approval,"approved_at":time.time()})
+    return sign(device,{"v":1,"kind":"workspace.state","workspace":"w","scope":base["scope"],"revision":base["revision"]+1,"prev":state_hash(base),"epoch":epoch if epoch is not None else base["epoch"]+1,"key_commitment":digest(f"k{base['epoch']+1}".encode()),"members":members or copy.deepcopy(base["members"]),"devices":devices or copy.deepcopy(base["devices"]),"removed":removed if removed is not None else list(base["removed"]),"action":action,"approval":approval,"approved_at":time.time()})
 
 
 def test_self_approval_inherits_user_state_and_rejects_cross_user_or_removed():
@@ -30,6 +30,8 @@ def test_majority_is_one_vote_per_user_and_bound_to_signed_base():
     state=successor(bd,base,"quorum_approve",{**base["devices"],target["id"]:entry},approval={"proposal":req,"votes":votes}); assert verify_state(state,base)
     with pytest.raises(ValueError,match="requires"): approved(base,req,[votes[0]])
     with pytest.raises(ValueError,match="conflicting"): approved(base,req,[votes[0],vote(bd,br["id"],req,False),votes[1]])
+    malformed=sign(bd,{**{k:v for k,v in votes[0].items() if k not in ("author","signature")},"kind":"history.vote"})
+    with pytest.raises(ValueError,match="ineligible"): approved(base,req,[malformed,votes[1]])
 
 
 def test_state_chain_rejects_role_change_split_transition_and_bad_commitment_shape():
@@ -39,3 +41,10 @@ def test_state_chain_rejects_role_change_split_transition_and_bad_commitment_sha
     stale=successor(ad,base,"self_approve",{**base["devices"],target["id"]:entry},approval={"proposal":req,"votes":[]}); stale["prev"]="wrong"; stale=sign(ad,{k:v for k,v in stale.items() if k not in ("author","signature")})
     with pytest.raises(ValueError,match="chain"): verify_state(stale,base)
     with pytest.raises(ValueError,match="membership"): verify_state(successor(ad,base,"membership",{**base["devices"],target["id"]:entry}),base)
+
+
+def test_personal_workspace_cannot_add_or_start_with_other_users():
+    ar,ad,a=person("alice"); br,bd,b=person("bob"); base=genesis(ar,ad,a); injected={**base,"scope":"personal","members":{**base["members"],br["id"]:{"role":"member","joined":1,"history_from":1,"selected":[]}},"devices":{**base["devices"],bd["id"]:b}}; injected=sign(ad,{k:v for k,v in injected.items() if k not in ("author","signature")})
+    with pytest.raises(ValueError,match="genesis"): verify_state(injected)
+    personal=sign(ad,{**{k:v for k,v in base.items() if k not in ("author","signature")},"scope":"personal"}); members={**personal["members"],br["id"]:{"role":"member","joined":2,"history_from":2,"selected":[]}}
+    with pytest.raises(ValueError,match="membership"): verify_state(successor(ad,personal,"membership",{**personal["devices"],bd["id"]:b},members),personal)
