@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.6.0
+
+- Add signed workspace-state chains for client-verifiable membership, roles, devices, removals, history entitlements, and epoch keys.
+- Let an authorized device approve another device for the same user with matching access, including selected-history inheritance.
+- Add strict-majority team recovery and separate history activation with one vote per represented user.
+- Enforce proposal timing with the server clock and harden relay metadata, proposal, vote, rejection, and history-envelope validation.
+
 ## 0.5.0
 
 - Add optional self-hosted end-to-end encrypted personal and team synchronization.

@@ -29,7 +29,7 @@ requires-dist = [
 
 [[package]]
 name = "ai-convos-db"
-version = "0.5.0"
+version = "0.6.0"
 source = { editable = "." }
 dependencies = [
     { name = "cryptography" },
@@ -65,7 +65,7 @@ provides-extras = ["dev"]
 
 [[package]]
 name = "ai-convos-remote"
-version = "0.1.0"
+version = "0.6.0"
 source = { editable = "apps/remote" }
 dependencies = [
     { name = "ai-convos-db" },
@@ -82,7 +82,7 @@ requires-dist = [
 
 [[package]]
 name = "ai-convos-remote-server"
-version = "0.1.0"
+version = "0.6.0"
 source = { editable = "apps/remote_server" }
 dependencies = [
     { name = "cryptography" },
