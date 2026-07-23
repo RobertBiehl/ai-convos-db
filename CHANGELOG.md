@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.5.0
 
 - Add optional self-hosted end-to-end encrypted personal and team synchronization.
 - Add immutable signed events, device enrollment, recovery, epoch rotation, history grants, and opaque server storage.
