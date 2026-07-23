@@ -1,6 +1,6 @@
 [project]
 name = "ai-convos-db"
-version = "0.5.0"
+version = "0.6.0"
 description = "Local-first searchable memory for ChatGPT, Claude, Claude Code, and Codex agents"
 readme = "README.md"
 license = "MIT"

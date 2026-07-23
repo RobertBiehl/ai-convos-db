@@ -1,6 +1,6 @@
 [project]
 name = "ai-convos-remote-server"
-version = "0.1.0"
+version = "0.6.0"
 description = "Self-hosted opaque event relay for ai-convos-db"
 license = "MIT"
 requires-python = ">=3.12"
