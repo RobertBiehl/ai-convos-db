@@ -10,6 +10,8 @@ from .protocol import digest, material_event
 
 STATE = """
 CREATE TABLE IF NOT EXISTS event_log(workspace TEXT,event TEXT PRIMARY KEY,cursor INT,direction TEXT,event_json TEXT,envelope TEXT);
+CREATE TABLE IF NOT EXISTS history_material(workspace TEXT,event TEXT,event_json TEXT,PRIMARY KEY(workspace,event));
+CREATE TABLE IF NOT EXISTS history_outbox(workspace TEXT,target TEXT,event TEXT,event_json TEXT,PRIMARY KEY(workspace,target,event));
 CREATE TABLE IF NOT EXISTS published(workspace TEXT,entity TEXT,revision TEXT,event TEXT,PRIMARY KEY(workspace,entity,revision));
 CREATE TABLE IF NOT EXISTS cursors(workspace TEXT PRIMARY KEY,cursor INT);
 CREATE TABLE IF NOT EXISTS heads(workspace TEXT,entity TEXT,sort_key TEXT,event TEXT,PRIMARY KEY(workspace,entity));

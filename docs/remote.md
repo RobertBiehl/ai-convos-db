@@ -17,9 +17,15 @@ This is a security-sensitive preview. It uses established primitives through
 `cryptography` and has protocol/acceptance tests, but has not received the
 independent review required before calling it production-grade encryption.
 Payloads and keys remain opaque to a passive relay or database compromise.
-Version 1 does not provide a transparency log or MLS consensus, so an actively
-malicious relay can still manipulate availability and membership views before a
-later client-signed rotation.
+Membership, roles, device certificates, removals, history entitlements, epoch
+key commitments, and approvals are carried in a client-signed hash chain.
+Clients pin the chain they have observed and reject rollback, forks, invalid
+transitions, relay metadata that disagrees with the signed head, and keys
+outside the signed device entitlement or commitment. A workspace omitted by
+the relay is excluded from upload rather than used with stale state. Version 1 does
+not provide cross-client gossip or an external transparency log, so a malicious
+relay can still withhold updates or partition clients that have not compared
+their pinned heads.
 
 ## Install from this repository
 
@@ -99,9 +105,10 @@ convos remote enable
 The CLI prompts for the recovery key without placing it in shell history or the
 process list. Recovery enrolls a new independently signed device, restores the
 complete personal history, and rotates the personal workspace. It never copies
-a DuckDB file. Team keys are deliberately not in the recovery bundle: a new
-team device remains pending until a workspace admin runs
-`convos remote approve-devices WORKSPACE`.
+a DuckDB file. Team keys are deliberately not in the recovery bundle. A
+recovered device remains pending in each team workspace until the same user
+authorizes it from an existing device or the other represented team members
+approve it.
 
 `enable` installs the standard Convos conversation-capture hooks and a
 persistent user service: launchd on macOS and systemd on Linux. Each lifecycle
@@ -145,7 +152,6 @@ convos remote grant-selected backend alice EVENT_ID [EVENT_ID ...]
 convos remote grant-all backend alice
 convos remote remove backend alice
 convos remote remove-device backend DEVICE_ID
-convos remote approve-devices backend
 ```
 
 New members receive no old events or keys by default. `grant-selected`
@@ -155,6 +161,71 @@ and resets their history boundary. User or device removal rotates the epoch.
 Device removal is workspace-specific, so it does not disable the device's
 personal workspace or unrelated teams. It cannot erase plaintext or keys
 already obtained.
+
+### Device approval
+
+A workspace is one independently encrypted sync scope: the automatically
+created personal workspace or one named team workspace such as `backend`. It
+has its own signed member/role map, authorized device roster, removal
+tombstones, key epochs, and history policy. Approval for one workspace grants
+nothing in another.
+
+On the pending device:
+
+```bash
+convos remote request-device backend
+```
+
+The request signs the exact workspace ID, current signed-state hash and epoch,
+user ID, device ID, root-certified signing/encryption keys, certificate hash,
+nonce, activation time, and expiry. It grants nothing by itself.
+
+An existing device belonging to the same user can approve it immediately:
+
+```bash
+convos remote approve-device backend DEVICE_ID
+```
+
+The new device inherits that device's workspace access, the user's existing
+role, and the same history-inheritance flag. No administrator action is needed.
+Selected-history evidence is rewrapped to the new device; a durable local
+outbox retries that publication after a crash. An explicit rejection
+invalidates the proposal, and an explicitly removed device ID cannot use this
+path or be reauthorized.
+
+If the user has no authorized device in the workspace, authorization requires a
+strict majority of the other users represented by authorized devices in the
+signed roster. Each user gets one vote even if they have several devices; the
+requesting user is excluded. Every voter runs the same `approve-device`
+command. The final vote atomically advances the signed state and rotates the
+workspace epoch. In a two-user team this is one vote from the other user, with
+a one-hour activation delay enforced against the relay's clock and stored
+proposal window; a client-supplied approval timestamp cannot bypass or revive
+it. A one-user team with no authorized device has no electorate and cannot use
+team voting.
+
+Majority recovery is future-only. It restores the user's existing membership
+and role but does not silently release older keys. History grants remain
+administrator-controlled with `grant-selected` and `grant-all`. Alternatively,
+the recovered device can ask the other represented users to activate the
+history entitlement it already had:
+
+```bash
+# Recovered device
+convos remote request-history backend
+
+# Other represented users, one vote each
+convos remote approve-history backend DEVICE_ID
+```
+
+History activation is a separate signed majority decision and does not change
+membership or role. It can only install epoch keys held by the device that
+finalizes the vote and selected evidence available to that device; voting
+cannot recreate material that no remaining device has.
+On the recovered device, the next ordinary sync detects that its earliest
+available epoch moved backward, rewinds the delivery cursor, and idempotently
+imports all newly decryptable events. `convos remote approvals backend` shows
+active device and history proposals.
 
 ## Daily operation
 
