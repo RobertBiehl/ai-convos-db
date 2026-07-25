@@ -24,13 +24,10 @@ Local-first memory for coding agents. Capture Claude Code and Codex work automat
 
 - Fast full-text search with direct source, day, role, project, conversation, and thinking filters
 - Hybrid semantic search (BM25 + embeddings + Reciprocal Rank Fusion) via `convos query`
-- Reproducible offline retrieval evaluation with exact-ID judgments, hit@k, and MRR
-- Private browser and CLI flight recorder for exact messages, tools, and edits
 - Fetch from ChatGPT and Claude using browser cookies
 - Import exports from ChatGPT, Claude, Claude Code, and Codex
 - Capture completed Claude Code + Codex turns just in time with lifecycle hooks
-- Deterministic project resume packets from live Git and exact archived turns
-- Exact cross-project activity digests and private self-contained dashboards
+- Deterministic project resume packets and exact session replay
 - Optional code-change provenance: blame, timeline, time travel, and graph browsing
 - Optional end-to-end encrypted personal multi-device and team synchronization
 - Local secret scanning with mandatory pre-encryption team redaction
@@ -85,44 +82,13 @@ archive text to a generation service:
 uv tool install "ai-convos-db[explore]"
 convos related CONVERSATION_OR_MESSAGE_ID
 convos trail CONVERSATION_OR_MESSAGE_ID
-convos map CONVERSATION_OR_MESSAGE_ID
 ```
 
 `related` returns one strongest matching turn per neighboring conversation,
 collapses exact duplicate turns, excludes known injected agent scaffolding, and
 prints exact `read --around` pivots. `trail` follows those evidence turns
 through a bounded, cycle-free multi-hop semantic graph with text, JSON, JSONL,
-and DOT output. `map` opens the same graph as a private self-contained local
-HTML explorer with clickable evidence and no server or network assets. See [semantic conversation
-exploration](docs/explore.md).
-
-Synthesize a private answer from those local conversations with exact turn
-citations:
-
-```bash
-uv tool install "ai-convos-db[ask]"
-convos ask --setup
-convos ask "What did we decide about memory synchronization?"
-```
-
-Model setup is explicit: it downloads and verifies an official 2.50 GB local
-Qwen3 GGUF plus the retrieval model. Normal questions require cached models,
-make no network request, and never upload archive text. Answers must cite exact
-supplied turns; invalid or missing citations fail closed to labeled retrieval
-evidence. Use `--evidence-only` to skip generation entirely. See [private cited
-archive answers](docs/ask.md).
-
-Install both optional products to turn a validated cited answer into durable
-project memory without copying text or re-entering message IDs:
-
-```bash
-uv tool install "ai-convos-db[ask,memory]"
-convos init
-convos ask "What did we decide about storage?" --remember
-```
-
-Persistence is explicit and project-scoped. Invalid or evidence-only answers
-never reach the memory ledger, while ordinary Ask remains read-only.
+and DOT output. See [semantic conversation exploration](docs/explore.md).
 
 Audit an archive for high-confidence credentials without printing their values:
 
@@ -154,23 +120,13 @@ text as untrusted and prints exact `read --around` commands for verification.
 `-f json` exposes the same deterministic structure to agents. See [project
 resume packets](docs/resume.md).
 
-Review exact recent archive activity across projects without generating a
-summary:
-
 ```bash
-uv tool install "ai-convos-db[pulse]"
-convos pulse -d 7
-convos pulse -d 7 -f html --open
+convos replay CONVERSATION_ID
+convos replay CONVERSATION_ID --around MESSAGE_ID -n 40 --activity 120
 ```
 
-Pulse groups cwd-bound sessions by their live Git root and reports exact
-message, role, edit, distinct-file, and stored tool-status counts. It excludes
-message content, makes no completion or productivity claims, omits cwd-less web
-conversations unless `--include-web` is explicit, suppresses short sessions
-without captured tools/edits unless `--min-messages 1` is set, and
-secret-scrubs displayed metadata. The HTML is a private mode-`0600`,
-self-contained local artifact with no scripts or network assets. See [activity
-pulse](docs/pulse.md).
+Replay returns a bounded exact message window with its ordered tool calls and
+file edits. It is evidence of captured activity, not an inferred summary.
 
 Track and reconcile Codex and Claude Code memories through a canonical local
 overlay without rewriting either provider's generated state:
@@ -286,30 +242,17 @@ convos read f2b9c5a9 -n 20 -c 2000 -f jsonl
 convos read f2b9c5a9 --around 01ab -n 20 -f jsonl
 ```
 
-Browse the same evidence as a human:
+Replay one conversation with its captured tool and edit evidence:
 
 ```bash
-uv tool install "ai-convos-db[library]"
-convos library
+uv tool install "ai-convos-db[resume]"
+convos replay CONVERSATION_ID
+convos replay CONVERSATION_ID --around MESSAGE_ID -f json
 ```
 
-Library serves a fresh tokenized URL on `127.0.0.1`, searches with exact words
-or cached local hybrid retrieval, and replays a bounded hit-centered window of
-messages, tool calls, statuses, durations, and file edits. Use `convos replay
-CONVERSATION_ID -f json` for the same deterministic evidence without a browser.
-It is read-only, loads no network assets, and stops with Ctrl-C. The URL is an
-accidental-access barrier, not protection from hostile software running as the
-same OS user. See [conversation Library](docs/library.md).
-
-Measure retrieval against private exact-ID judgments:
-
-```bash
-uv tool install "ai-convos-db[eval]"
-convos eval private-retrieval.jsonl --mode both -k 8
-```
-
-The offline report compares hit@k and MRR without including archived message
-content. See [retrieval evaluation](docs/eval.md).
+Replay is part of the Resume product and keeps the same deterministic,
+explicitly bounded evidence contract. See [project handoff and
+replay](docs/resume.md).
 
 List and analyze with read-only DuckDB SQL (schema in `docs/database.md`):
 

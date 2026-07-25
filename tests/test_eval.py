@@ -1,15 +1,15 @@
-import json, tomllib
+import json
 from pathlib import Path
 
 import duckdb, pytest, typer
 from typer.testing import CliRunner
 
 from ai_convos import cli
-import ai_convos_eval as ev
+from evals import retrieval as ev
 
 
 def app():
-    root=typer.Typer(); root.command("dummy")(lambda:None); ev.register(root); return root
+    root=typer.Typer(); root.command("dummy")(lambda:None); root.command("eval")(ev.eval_cmd); return root
 def archive(tmp_path,monkeypatch):
     repo=tmp_path/"repo"; (repo/"sub").mkdir(parents=True); other=tmp_path/"other"; other.mkdir(); db=tmp_path/"convos.db"; monkeypatch.setattr(cli,"DB_PATH",db); monkeypatch.setattr(cli,"DATA_DIR",tmp_path); monkeypatch.setattr(cli,"drain_hooks",lambda *a,**k:None); monkeypatch.setattr(ev,"drain_hooks",lambda:None)
     conn=duckdb.connect(str(db)); cli.init_schema(conn); conn.executemany("INSERT INTO conversations (id,source,title,cwd) VALUES (?,?,?,?)",[("c1abcdef12345678","codex","Memory",str(repo/"sub")),("c2abcdef12345678","codex","Other",str(other))]); conn.executemany("INSERT INTO messages (id,conversation_id,role,content) VALUES (?,?,?,?)",[("m1abcdef12345678","c1abcdef12345678","user","canonical memory ledger"),("m2abcdef12345678","c2abcdef12345678","user","canonical cooking ledger")]); cli.rebuild_fts_index(conn); conn.close(); return repo
@@ -17,9 +17,7 @@ def cases(path,rows):
     path.write_text("\n".join(json.dumps(r) for r in rows)); return path
 
 
-def test_distribution_metadata_registration_and_help():
-    root=Path(__file__).parents[1]; project=tomllib.loads((root/"apps/eval/pyproject.toml").read_text())["project"]; core=tomllib.loads((root/"pyproject.toml").read_text())["project"]
-    assert project["dependencies"][0]=="ai-convos-db>=0.6,<0.7" and project["entry-points"]["convos.commands"]=={"eval":"ai_convos_eval:register"} and core["optional-dependencies"]["eval"]==["ai-convos-eval>=0.1,<0.2"]
+def test_development_tool_help():
     help_=CliRunner().invoke(app(),["eval","--help"]).output
     assert all(word in help_ for word in ("exact-ID","--mode","--min-hit-rate","--format"))
 

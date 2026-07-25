@@ -14,15 +14,11 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-ask = ["ai-convos-ask>=0.1,<0.2"]
-eval = ["ai-convos-eval>=0.1,<0.2"]
 explore = ["ai-convos-explore>=0.1,<0.2"]
-library = ["ai-convos-library>=0.1,<0.2"]
 memory = ["ai-convos-memory>=0.1,<0.2"]
-pulse = ["ai-convos-pulse>=0.1,<0.2"]
 redact = ["ai-convos-redact>=0.1,<0.2"]
 resume = ["ai-convos-resume>=0.1,<0.2"]
-dev = ["pytest>=8.0.0", "pytest-asyncio>=0.23.0", "ai-convos-ask", "ai-convos-changegraph", "ai-convos-eval", "ai-convos-explore", "ai-convos-library", "ai-convos-memory", "ai-convos-pulse", "ai-convos-redact", "ai-convos-resume", "ai-convos-remote", "ai-convos-remote-server"]
+dev = ["pytest>=8.0.0", "pytest-asyncio>=0.23.0", "ai-convos-changegraph", "ai-convos-explore", "ai-convos-memory", "ai-convos-redact", "ai-convos-resume", "ai-convos-remote", "ai-convos-remote-server"]
 
 [project.scripts]
 convos = "ai_convos:app"
@@ -47,13 +43,9 @@ package = true
 members = ["apps/*"]
 
 [tool.uv.sources]
-ai-convos-ask = { workspace = true }
 ai-convos-changegraph = { workspace = true }
-ai-convos-eval = { workspace = true }
 ai-convos-explore = { workspace = true }
-ai-convos-library = { workspace = true }
 ai-convos-memory = { workspace = true }
-ai-convos-pulse = { workspace = true }
 ai-convos-redact = { workspace = true }
 ai-convos-resume = { workspace = true }
 ai-convos-remote-server = { workspace = true }

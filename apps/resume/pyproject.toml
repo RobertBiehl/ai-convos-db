@@ -1,7 +1,7 @@
 [project]
 name = "ai-convos-resume"
 version = "0.1.0"
-description = "Deterministic project handoff packets from live Git and exact conversation evidence"
+description = "Deterministic project handoff and session replay from exact conversation evidence"
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.12"

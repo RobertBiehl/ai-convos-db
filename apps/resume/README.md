@@ -1,4 +1,5 @@
 # ai-convos-resume
 
-Build a bounded, deterministic project handoff from live Git state and exact
-local conversation turns. See the [full documentation](https://github.com/RobertBiehl/ai-convos-db/blob/master/docs/resume.md).
+Build bounded deterministic project handoffs from live Git state, or replay one
+conversation with its exact tools and edits. See the [full
+documentation](https://github.com/RobertBiehl/ai-convos-db/blob/master/docs/resume.md).

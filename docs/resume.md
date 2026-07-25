@@ -1,4 +1,4 @@
-# Deterministic project resume packets
+# Deterministic project handoff and replay
 
 `ai-convos-resume` turns the manual continuation workflow into one bounded local
 command:
@@ -66,6 +66,26 @@ packet. Every excerpt retains its exact message ID after clipping.
 The command flushes pending local capture hooks before reading, which can update
 the local archive. It never edits the target repository, generates a handoff
 file, starts a model, or accesses the network.
+
+## Deterministic session replay
+
+Use the same product to inspect one conversation as ordered, bounded evidence:
+
+```bash
+convos replay CONVERSATION_ID
+convos replay CONVERSATION_ID --around MESSAGE_ID -n 40 --activity 120
+convos replay CONVERSATION_ID -f json
+```
+
+Replay selects an exact message window, then joins only tool calls and file
+edits whose message IDs occur in that window. Events are ordered by message
+position, event timestamp, and stable ID. `-n` bounds messages, `-c` clips every
+message and activity payload, and `--activity` caps the combined tool/edit
+count. Text and JSON results explicitly report activity truncation.
+
+Replay is evidence of what was captured, not proof that an absent action never
+happened. Superseded message history, orphan activity, thinking, artifacts, and
+attachments are intentionally excluded.
 
 ## Honest limitations
 

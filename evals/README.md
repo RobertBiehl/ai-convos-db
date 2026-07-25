@@ -6,18 +6,12 @@ read_when:
   - Changing search ranking or filters
 ---
 
-# Retrieval evaluation
+# Development retrieval evaluation
 
-`convos eval` measures whether literal or hybrid retrieval returns exact
+`evals/retrieval.py` measures whether literal or hybrid retrieval returns exact
 conversation/message identities that a user marked relevant. It turns retrieval
 quality into a reproducible gate instead of tuning embeddings or prompts by
 intuition.
-
-Install the optional product:
-
-```bash
-uv tool install "ai-convos-db[eval]"
-```
 
 Create a private JSONL file with one judgment per line:
 
@@ -33,12 +27,12 @@ record; missing and ambiguous ground truth fails closed. Optional fields are
 `mode` (`hybrid`, `literal`, or `both`), `source`, `days`, `role`, `cwd`,
 `conversation`, and per-case `k`.
 
-Run one engine or compare both:
+Run it from the repository checkout:
 
 ```bash
-convos eval private-retrieval.jsonl
-convos eval private-retrieval.jsonl --mode both -k 8
-convos eval private-retrieval.jsonl --mode hybrid --min-hit-rate 0.9 -f json
+uv run python evals/retrieval.py private-retrieval.jsonl
+uv run python evals/retrieval.py private-retrieval.jsonl --mode both -k 8
+uv run python evals/retrieval.py private-retrieval.jsonl --mode hybrid --min-hit-rate 0.9 -f json
 ```
 
 The report includes hit@k, mean reciprocal rank (MRR), per-case rank, returned

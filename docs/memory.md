@@ -206,18 +206,6 @@ mark changed or missing evidence instead of silently treating it as current.
 Evidence is bound to the immutable canonical revision hash, so revising a
 memory does not rewrite the prior revision's support.
 
-The optional Ask product can perform the same operation after local cited
-synthesis:
-
-```bash
-convos ask "What did we decide?" --cwd /path/to/project --remember
-```
-
-This is only a convenience bridge. Ask must first produce a citation-valid
-answer; Memory then independently resolves every cited message, checks scope,
-and stores its hash. Failed synthesis and ordinary Ask calls never mutate the
-ledger.
-
 ### Evidence health and reverse provenance
 
 ```bash

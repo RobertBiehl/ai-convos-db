@@ -11,8 +11,6 @@ convos related MESSAGE_ID -f jsonl
 convos trail MESSAGE_ID
 convos trail MESSAGE_ID --depth 3 --width 4 --max-nodes 30 --min-score .7
 convos trail MESSAGE_ID -f dot
-convos map MESSAGE_ID
-convos map MESSAGE_ID --no-open --output /private/path/memory-map.html
 ```
 
 Every result is another conversation plus its strongest matching embedded
@@ -48,27 +46,6 @@ Text output includes explicit parent and child prefixes plus exact `read
 record followed by self-contained edge records with their child node. DOT emits
 the identical graph without creating a file; visual rendering requires a
 separately installed Graphviz `dot` command.
-
-## Local visual map
-
-`map` renders the trail directly as a self-contained layered HTML graph, so
-Graphviz is unnecessary for normal visual exploration. Clicking a conversation
-shows its provider, IDs, edge score, evidence timestamp, bounded transcript
-snippet, and exact `convos read --around` pivot. It opens the default browser
-unless `--no-open` is supplied.
-
-No local server is started and the artifact contains no CDN, font, image, or
-other network reference. Its content-security policy denies every resource
-except the file's own inline style and fixed rendering script. Titles and
-transcript snippets are embedded as base64 JSON and assigned only with DOM
-`textContent`, so archived markup is displayed as evidence rather than executed.
-
-The default output is a unique mode-`0600` file in the operating system's
-temporary directory. An explicit `--output` is also private, published without
-overwrite, and rejects existing or symbolic-link targets. The map contains
-bounded private archive text; delete an explicit artifact when it is no longer
-needed and apply the desired operating-system retention policy to temporary
-files.
 
 Explore reads the existing DuckDB projection without modifying it. It downloads
 no model, invokes no generator, sends no archive text to a service, and does not

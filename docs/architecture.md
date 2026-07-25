@@ -12,22 +12,18 @@ read_when:
 
 Single-file CLI that normalizes conversations from multiple AI providers into a unified DuckDB database with full-text search.
 
-Optional installable products add change provenance, semantic trails, local
-cited answers, reproducible retrieval evaluation, deterministic resume packets,
-factual activity dashboards, a private conversation browser, secret-safe
-sharing, memory synchronization, the remote client, and a self-hosted E2EE
-relay without changing the core storage contract. See [private answers](ask.md),
-[retrieval evaluation](eval.md), [conversation Library](library.md),
-[semantic exploration](explore.md), [project resume](resume.md), [activity
-pulse](pulse.md), [secret protection](redact.md), [memory
-synchronization](memory.md), and
+Optional installable products add change provenance, semantic trails,
+deterministic project handoff and session replay, secret-safe sharing, memory
+synchronization, the remote client, and a self-hosted E2EE relay without
+changing the core conversation contract. See [semantic
+exploration](explore.md), [project handoff and replay](resume.md), [secret
+protection](redact.md), [memory synchronization](memory.md), and
 [`remote.md`](remote.md).
 
-The Library product also exposes deterministic conversation replay: it reuses
-the core bounded message reader, then joins tool calls and file edits only by
-the selected exact message IDs. This keeps conversation-level presentation out
-of core while giving humans and agents one ordered, explicitly truncated view
-of captured activity.
+Resume also exposes deterministic conversation replay: it selects a bounded
+message window, then joins tool calls and file edits only by those exact message
+IDs. This gives humans and agents one ordered, explicitly truncated view of
+captured activity without a browser or generation model.
 The memory product separates device-local checkout paths from repository scope:
 normalized origin evidence identifies clones and worktrees, root commits provide
 a fallback lineage anchor, and differing fork origins remain isolated.
@@ -141,8 +137,8 @@ when using `convos query` or `convos embed`.
 applications. It returns untruncated exact turn records and accepts
 `local_only=True` when an application must fail rather than download a missing
 retrieval model. This also applies while embedding pending hook messages.
-`ai-convos-ask`, `ai-convos-eval`, and `ai-convos-library` use that mode;
-generation and presentation remain outside core.
+Installed retrieval products can use that mode; generation and presentation
+remain outside core.
 
 Literal `search` is conversation-first as well: BM25 ranks messages, then only
 the strongest matching message from each conversation consumes a result slot.

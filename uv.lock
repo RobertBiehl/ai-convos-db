@@ -4,33 +4,14 @@ requires-python = ">=3.12"
 
 [manifest]
 members = [
-    "ai-convos-ask",
     "ai-convos-changegraph",
     "ai-convos-db",
-    "ai-convos-eval",
     "ai-convos-explore",
-    "ai-convos-library",
     "ai-convos-memory",
-    "ai-convos-pulse",
     "ai-convos-redact",
     "ai-convos-remote",
     "ai-convos-remote-server",
     "ai-convos-resume",
-]
-
-[[package]]
-name = "ai-convos-ask"
-version = "0.1.0"
-source = { editable = "apps/ask" }
-dependencies = [
-    { name = "ai-convos-db" },
-    { name = "typer" },
-]
-
-[package.metadata]
-requires-dist = [
-    { name = "ai-convos-db", editable = "." },
-    { name = "typer", specifier = ">=0.12.0" },
 ]
 
 [[package]]
@@ -63,17 +44,10 @@ dependencies = [
 ]
 
 [package.optional-dependencies]
-ask = [
-    { name = "ai-convos-ask" },
-]
 dev = [
-    { name = "ai-convos-ask" },
     { name = "ai-convos-changegraph" },
-    { name = "ai-convos-eval" },
     { name = "ai-convos-explore" },
-    { name = "ai-convos-library" },
     { name = "ai-convos-memory" },
-    { name = "ai-convos-pulse" },
     { name = "ai-convos-redact" },
     { name = "ai-convos-remote" },
     { name = "ai-convos-remote-server" },
@@ -81,20 +55,11 @@ dev = [
     { name = "pytest" },
     { name = "pytest-asyncio" },
 ]
-eval = [
-    { name = "ai-convos-eval" },
-]
 explore = [
     { name = "ai-convos-explore" },
 ]
-library = [
-    { name = "ai-convos-library" },
-]
 memory = [
     { name = "ai-convos-memory" },
-]
-pulse = [
-    { name = "ai-convos-pulse" },
 ]
 redact = [
     { name = "ai-convos-redact" },
@@ -105,19 +70,11 @@ resume = [
 
 [package.metadata]
 requires-dist = [
-    { name = "ai-convos-ask", marker = "extra == 'ask'", editable = "apps/ask" },
-    { name = "ai-convos-ask", marker = "extra == 'dev'", editable = "apps/ask" },
     { name = "ai-convos-changegraph", marker = "extra == 'dev'", editable = "apps/changegraph" },
-    { name = "ai-convos-eval", marker = "extra == 'dev'", editable = "apps/eval" },
-    { name = "ai-convos-eval", marker = "extra == 'eval'", editable = "apps/eval" },
     { name = "ai-convos-explore", marker = "extra == 'dev'", editable = "apps/explore" },
     { name = "ai-convos-explore", marker = "extra == 'explore'", editable = "apps/explore" },
-    { name = "ai-convos-library", marker = "extra == 'dev'", editable = "apps/library" },
-    { name = "ai-convos-library", marker = "extra == 'library'", editable = "apps/library" },
     { name = "ai-convos-memory", marker = "extra == 'dev'", editable = "apps/memory" },
     { name = "ai-convos-memory", marker = "extra == 'memory'", editable = "apps/memory" },
-    { name = "ai-convos-pulse", marker = "extra == 'dev'", editable = "apps/pulse" },
-    { name = "ai-convos-pulse", marker = "extra == 'pulse'", editable = "apps/pulse" },
     { name = "ai-convos-redact", marker = "extra == 'dev'", editable = "apps/redact" },
     { name = "ai-convos-redact", marker = "extra == 'redact'", editable = "apps/redact" },
     { name = "ai-convos-remote", marker = "extra == 'dev'", editable = "apps/remote" },
@@ -132,42 +89,12 @@ requires-dist = [
     { name = "pytest-asyncio", marker = "extra == 'dev'", specifier = ">=0.23.0" },
     { name = "typer", specifier = ">=0.12.0" },
 ]
-provides-extras = ["ask", "eval", "explore", "library", "memory", "pulse", "redact", "resume", "dev"]
-
-[[package]]
-name = "ai-convos-eval"
-version = "0.1.0"
-source = { editable = "apps/eval" }
-dependencies = [
-    { name = "ai-convos-db" },
-    { name = "typer" },
-]
-
-[package.metadata]
-requires-dist = [
-    { name = "ai-convos-db", editable = "." },
-    { name = "typer", specifier = ">=0.12.0" },
-]
+provides-extras = ["explore", "memory", "redact", "resume", "dev"]
 
 [[package]]
 name = "ai-convos-explore"
 version = "0.1.0"
 source = { editable = "apps/explore" }
-dependencies = [
-    { name = "ai-convos-db" },
-    { name = "typer" },
-]
-
-[package.metadata]
-requires-dist = [
-    { name = "ai-convos-db", editable = "." },
-    { name = "typer", specifier = ">=0.12.0" },
-]
-
-[[package]]
-name = "ai-convos-library"
-version = "0.1.0"
-source = { editable = "apps/library" }
 dependencies = [
     { name = "ai-convos-db" },
     { name = "typer" },
@@ -191,23 +118,6 @@ dependencies = [
 [package.metadata]
 requires-dist = [
     { name = "ai-convos-db", editable = "." },
-    { name = "typer", specifier = ">=0.12.0" },
-]
-
-[[package]]
-name = "ai-convos-pulse"
-version = "0.1.0"
-source = { editable = "apps/pulse" }
-dependencies = [
-    { name = "ai-convos-db" },
-    { name = "ai-convos-redact" },
-    { name = "typer" },
-]
-
-[package.metadata]
-requires-dist = [
-    { name = "ai-convos-db", editable = "." },
-    { name = "ai-convos-redact", editable = "apps/redact" },
     { name = "typer", specifier = ">=0.12.0" },
 ]
 

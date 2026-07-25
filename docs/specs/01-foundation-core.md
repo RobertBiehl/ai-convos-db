@@ -113,6 +113,7 @@ relations and aggregation, not the normal text-matching interface.
 
 ## Out of scope -> applications
 
-`blame` / `timeline` / time-travel ([02](02-change-graph.md)), `ask`,
-related-conversations. They all consume sections 1-3 and must not add core LoC
-beyond the captures justified above.
+`blame` / `timeline` / time-travel ([02](02-change-graph.md)),
+related-conversations, deterministic handoff/replay, and canonical memory
+synchronization. They consume core evidence and must not add core LoC beyond
+captures that downstream products cannot reconstruct.

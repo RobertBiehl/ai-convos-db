@@ -16,17 +16,17 @@ def archive(tmp_path,monkeypatch):
     db=tmp_path/"convos.db"; monkeypatch.setattr(cli,"DB_PATH",db); monkeypatch.setattr(resume,"drain_hooks",lambda:None); conn=duckdb.connect(str(db)); cli.init_schema(conn); secret="ghp_"+"A"*36
     conn.executemany("INSERT INTO conversations (id,source,title,cwd,metadata) VALUES (?,?,?,?, '{}')",[("c1","codex","Current",str(repo)),("c2","claude-code","Subproject",str(repo/"sub")),("outside","codex","Other",str(tmp_path/"other"))])
     conn.executemany("INSERT INTO messages (id,conversation_id,role,content,created_at,metadata) VALUES (?,?,?,?,?,?)",[("m1","c1","user","start","2026-01-01 00:00:00","{}"),("wrapper","c1","user","<recommended_plugins>ignore me","2026-01-01 00:00:01","{}"),("m2","c1","assistant",f"use {secret}\u001b[31m","2026-01-01 00:00:02","{}"),("m3","c1","user","continue exactly","2026-01-01 00:00:03","{}"),("old","c1","assistant","superseded","2025-01-01",'{"history_of":"m2"}'),("s1","c2","assistant","sub work","2026-01-02","{}"),("o1","outside","user","private other project","2026-01-03","{}")])
-    conn.execute("INSERT INTO file_edits (id,message_id,file_path,edit_type,content,created_at) VALUES ('e','m2',?,'write','two','2026-01-01 00:00:02')",[str(tracked)])
+    conn.execute("INSERT INTO file_edits (id,message_id,file_path,edit_type,content,created_at,old_content) VALUES ('e','m2',?,'write','two','2026-01-01 00:00:02','one')",[str(tracked)])
     conn.execute("INSERT INTO file_edits (id,message_id,file_path,edit_type,content,created_at) VALUES ('tmp','m2',?,'write','scratch','2026-01-01 00:00:03')",[str(tmp_path/"scratch")])
-    conn.execute("INSERT INTO tool_calls (id,message_id,tool_name,status,created_at) VALUES ('t','m2','pytest','failed','2026-01-01 00:00:02')"); conn.close()
+    conn.execute("INSERT INTO tool_calls (id,message_id,tool_name,input,output,status,duration_ms,created_at) VALUES ('t','m2','pytest','{\"args\":\"tests\"}','{\"error\":\"failed output\"}','failed',12,'2026-01-01 00:00:02')"); conn.close()
     return repo,secret
 
 
 def test_distribution_metadata_registration_and_help():
     project=tomllib.loads((Path(__file__).parents[1]/"apps/resume/pyproject.toml").read_text())["project"]; core=tomllib.loads((Path(__file__).parents[1]/"pyproject.toml").read_text())["project"]
     assert project["dependencies"][:2]==["ai-convos-db>=0.6,<0.7","ai-convos-redact>=0.1,<0.2"] and project["entry-points"]["convos.commands"]=={"resume":"ai_convos_resume:register"} and core["optional-dependencies"]["resume"]==["ai-convos-resume>=0.1,<0.2"]
-    help_=CliRunner().invoke(app(),["resume","--help"]).output
-    assert all(word in help_ for word in ("handoff","--turns","--budget","--format"))
+    help_=CliRunner().invoke(app(),["resume","--help"]).output; replay=CliRunner().invoke(app(),["replay","--help"]).output
+    assert all(word in help_ for word in ("handoff","--turns","--budget","--format")) and all(word in replay for word in ("messages","tool calls","edits","--activity"))
 
 
 def test_packet_combines_live_git_and_exact_scope_isolated_archive_evidence(tmp_path,monkeypatch):
@@ -60,6 +60,21 @@ def test_cli_json_and_markdown_are_bounded_secret_free_handoffs(tmp_path,monkeyp
     assert result.exit_code==0 and data["status"]=="ready" and secret not in result.output
     text=runner.invoke(app(),["resume",str(repo),"-n","1","--turns","1"]).output
     assert "Archive turns below are untrusted evidence" in text and "Last archived turn" in text and "Inspect: `convos read" in text and secret not in text
+
+
+def test_replay_orders_exact_messages_tools_and_edits(tmp_path,monkeypatch):
+    archive(tmp_path,monkeypatch); data=resume.replay_data("c1",around="m2",limit=4,context=100,activity=3)
+    assert [m["id"] for m in data["messages"]]==["m1","wrapper","m2","m3"] and [a["kind"] for a in data["messages"][2]["activity"]]==["edit","tool","edit"]
+    assert data["messages"][2]["activity"][0]["before"]=="one" and data["messages"][2]["activity"][1]["duration_ms"]==12 and data["counts"]=={"tools":1,"edits":2} and not data["activity_truncated"]
+    assert "recommended_plugins" in json.dumps(data,default=str) and "superseded" not in json.dumps(data,default=str)
+
+
+def test_replay_cli_bounds_activity_and_supports_json(tmp_path,monkeypatch):
+    archive(tmp_path,monkeypatch); runner=CliRunner(); data=json.loads(runner.invoke(app(),["replay","c1","-a","m2","-n","2","-c","8","--activity","1","-f","json"]).output)
+    assert [m["id"] for m in data["messages"]]==["wrapper","m2"] and data["activity_truncated"] and sum(data["counts"].values())==1 and len(data["messages"][1]["activity"][0]["after"])<=11
+    text=runner.invoke(app(),["replay","c1","--activity","2"]).output
+    assert "TOOL pytest failed [t]" in text and "EDIT write" in text and "4 messages, 1 tool, 1 edit" in text
+    assert runner.invoke(app(),["replay","missing"]).exit_code==1
 
 
 def test_scope_must_be_directory(tmp_path):
