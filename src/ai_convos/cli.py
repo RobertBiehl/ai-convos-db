@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import json, time, zipfile, hashlib, struct, sqlite3, subprocess, ssl, urllib.request, re, os, sysconfig, site, csv, sys, shutil, shlex, fcntl, signal
+import json, time, zipfile, hashlib, struct, sqlite3, subprocess, ssl, urllib.request, re, os, sysconfig, site, csv, sys, shutil, shlex, fcntl, signal, tempfile
 from importlib.metadata import entry_points, version
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
@@ -16,7 +16,7 @@ def find_root():
 PROJECT_ROOT = find_root()
 DATA_DIR, DB_PATH = PROJECT_ROOT / "data", PROJECT_ROOT / "data" / "convos.db"
 STATE_PATH = DATA_DIR / "sync_state.json"
-HOOK_DIR, HOOK_STATE, HOOK_EMBED_DIRTY, HOOK_FTS_DIRTY = DATA_DIR/"hook_inbox", DATA_DIR/"hook_state.json", DATA_DIR/"hook_embeddings_dirty", DATA_DIR/"hook_fts_dirty"
+HOOK_DIR, HOOK_STATE, HOOK_EMBED_DIRTY, HOOK_FTS_DIRTY, _NOISE = DATA_DIR/"hook_inbox", DATA_DIR/"hook_state.json", DATA_DIR/"hook_embeddings_dirty", DATA_DIR/"hook_fts_dirty", " AND NOT regexp_matches(content,'^(Base directory for this skill:|# AGENTS\\.md instructions for|<(codex_internal_context|environment_context|local-command-caveat|recommended_plugins|skill)( |>))')"
 
 # ---- db helpers ----
 def get_db(read_only: bool = False):
@@ -38,8 +38,10 @@ def load_state():
 def save_state(state):
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     STATE_PATH.write_text(json.dumps(state))
-def atomic_json(path: Path, data):
-    path.parent.mkdir(parents=True, exist_ok=True); tmp = path.with_name(f".{path.name}.{os.getpid()}"); tmp.write_text(json.dumps(data)); os.replace(tmp, path)
+def atomic_write(path: Path, text):
+    if path.is_symlink() or path.exists() and not path.is_file(): typer.echo(f"Refusing unsafe managed file: {path}", err=True); raise typer.Exit(1)
+    path.parent.mkdir(parents=True, exist_ok=True); mode = path.stat().st_mode&0o777 if path.exists() else 0o600; fd, tmp = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent); f = os.fdopen(fd, "w"); f.write(text); f.close(); os.chmod(tmp, mode); os.replace(tmp, path)
+def atomic_json(path: Path, data): atomic_write(path, json.dumps(data))
 
 def detect_source(path: Path):
     if path.is_dir(): return "codex" if (path / "sessions").exists() else "claude-code"
@@ -250,7 +252,7 @@ def chatgpt_headers(cookies, base, ua, debug_profile: str | None = None):
 def merge_results(dst: "ParseResult", src: "ParseResult"):
     dst.convs += src.convs; dst.msgs += src.msgs; dst.tools += src.tools; dst.attachs += src.attachs
 
-def fetch_json(url: str, cookies: dict[str, str], headers: dict = None, timeout: int = 15, retries: int = 1) -> dict:
+def fetch_json(url: str, cookies: dict[str, str], headers: dict = None, timeout: int = 15, retries: int = 1, rate: list[int] | None = None) -> dict:
     parts = []
     for k, v in cookies.items():
         s = f"{k}={v}"
@@ -266,8 +268,8 @@ def fetch_json(url: str, cookies: dict[str, str], headers: dict = None, timeout:
                 return json.loads(resp.read())
         except Exception as e:
             if i == retries: raise
-            delay = 30*(i+1) if getattr(e, "code", None) == 429 else 1+i
-            if getattr(e, "code", None) == 429: typer.echo(f"  rate limited; retrying in {delay}s", err=True)
+            delay = max(min(30*2**(rate[0] if rate is not None else i), 900), int(h) if str(h := (getattr(e, "headers", {}) or {}).get("Retry-After", 0)).isdigit() else 0) if getattr(e, "code", None) == 429 else 1+i
+            if getattr(e, "code", None) == 429: typer.echo(f"  rate limited; retrying in {delay}s", err=True); rate is not None and rate.__setitem__(0, rate[0]+1)
             time.sleep(delay)
 
 # ---- result type ----
@@ -328,11 +330,11 @@ def fetch_chatgpt(browser: str = "safari", limit: int = 0, profiles: list[str | 
     def fetch_with_profile(profile: str | None) -> ParseResult:
         cookies, base = chatgpt_cookie_base(browser, hosts, profile)
         headers = chatgpt_headers(cookies, base, ua, debug_profile=profile if debug else None)
-        r = ParseResult()
+        r, rate = ParseResult(), [0]
         def parse_item_raw(item):
             cid = gen_id("chatgpt", item["id"])
             gizmo = item.get("gizmo_id")
-            conv = fetch_json(f"{base}/backend-api/conversation/{item['id']}", cookies, headers, timeout=20, retries=2)
+            conv = fetch_json(f"{base}/backend-api/conversation/{item['id']}", cookies, headers, timeout=20, retries=2, rate=rate)
             msgs, tools, attachs = chatgpt_mapping(cid, conv.get("mapping", {}))
             return dict(conv=dict(id=cid, source="chatgpt", title=item.get("title"), created_at=ts_any(conv.get("create_time") or item.get("create_time")),
                                   updated_at=ts_any(conv.get("update_time") or item.get("update_time")), model=item.get("model"), cwd=None, git_branch=None,
@@ -340,7 +342,7 @@ def fetch_chatgpt(browser: str = "safari", limit: int = 0, profiles: list[str | 
                         msgs=msgs, tools=tools, attachs=attachs)
         offset, total, fetched, seen = 0, None, 0, set()
         while True:
-            data = fetch_json(f"{base}/backend-api/conversations?offset={offset}&limit=100", cookies, headers, timeout=20, retries=1)
+            data = fetch_json(f"{base}/backend-api/conversations?offset={offset}&limit=100", cookies, headers, timeout=20, retries=1, rate=rate)
             total = total if total is not None else data.get("total")
             items, keys = data.get("items", []), ",".join(data.keys())
             if debug: print(f"  chatgpt page offset={offset} items={len(items)} total={total} keys={keys}", flush=True)
@@ -536,10 +538,9 @@ def parse_codex_session(jsonl: Path) -> dict | None:
         return json.loads(a) if isinstance((a := p.get("arguments", {})), str) else a
 
     mitems = [(i, p, t) for i, p in items if p.get("type") == "message" and p.get("role") not in ("developer", "system") and (t := extract_msg_text(p))]
-    msgs = [dict(id=gen_id(src, f"{cid}:{i}"), conversation_id=cid, role=p["role"], content=t.strip(),
-                thinking=None, created_at=timestamps[i] if i < len(timestamps) else None, model=None, metadata="{}", parent_id=None)
-           for i, p, t in mitems]
-    if not msgs: return None
+    if not (msgs := [dict(id=gen_id(src, f"{cid}:{i}"), conversation_id=cid, role=p["role"], content=t.strip(),
+                          thinking=None, created_at=timestamps[i] if i < len(timestamps) else None, model=None, metadata="{}", parent_id=None)
+                     for i, p, t in mitems]): return None
     anchor = lambda k: gen_id(src, f"{cid}:{next((i for i, _, _ in reversed(mitems) if i <= k), mitems[0][0])}")  # function_call items are not messages; attach to nearest preceding one
 
     tools = [dict(id=gen_id(src, f"tool:{cid}:{i}"), message_id=anchor(i), tool_name=p["name"],
@@ -551,7 +552,7 @@ def parse_codex_session(jsonl: Path) -> dict | None:
                  created_at=timestamps[i] if i < len(timestamps) else None)
             for i, p in items if p.get("type") == "function_call_output"]
     custom_out = {p.get("call_id"):p.get("output", "") for _, p in items if p.get("type") == "custom_tool_call_output"}
-    tools += [dict(id=gen_id(src, f"custom:{cid}:{i}"), message_id=anchor(i), tool_name=p["name"], input=json.dumps({"code":p.get("input", "")}), output=json.dumps(custom_out.get(p.get("call_id"), "")), status="complete" if p.get("call_id") in custom_out or p.get("status") == "completed" else p.get("status", "pending"), duration_ms=None, created_at=timestamps[i] if i < len(timestamps) else None) for i, p in items if p.get("type") == "custom_tool_call"]
+    tools += [dict(id=gen_id(src, f"custom:{cid}:{i}"), message_id=anchor(i), tool_name=p["name"], input=json.dumps({"code":p.get("input", "")}), output=json.dumps(custom_out.get(p.get("call_id"), "")), status="failed" if any(x in json.dumps(custom_out.get(p.get("call_id"), "")).lower() for x in ("script failed","verification failed")) or re.search(r"exit code: [1-9]\d*",json.dumps(custom_out.get(p.get("call_id"), "")).lower()) else "complete" if p.get("call_id") in custom_out or p.get("status") == "completed" else p.get("status", "pending"), duration_ms=None, created_at=timestamps[i] if i < len(timestamps) else None) for i, p in items if p.get("type") == "custom_tool_call"]
 
     def patch_edits(args):
         """File edits from shell commands, exact or skipped: apply_patch hunks (context+minus -> context+plus,
@@ -582,9 +583,10 @@ def parse_codex_session(jsonl: Path) -> dict | None:
         flush(); return out
 
     def custom_edits(p):
-        code = p.get("input", ""); names = re.findall(r"await\s+tools\.apply_patch\(\s*(\w+)\s*\)", code)
-        vals = {n:json.loads(s) for n, s in re.findall(r"(?:const|let|var)\s+(\w+)\s*=\s*(\"(?:\\.|[^\"\\])*\")", code, re.S) if n in names}
-        patches = [vals[n] for n in names if n in vals] + [json.loads(s) for s in re.findall(r"await\s+tools\.apply_patch\(\s*(\"(?:\\.|[^\"\\])*\")\s*\)", code, re.S)]
+        code = p.get("input", ""); names = re.findall(r"await\s+tools\.apply_patch\(\s*(\w+)\s*\)", code); out=json.dumps(custom_out.get(p.get("call_id"), "")).lower(); ok=any(x in out for x in ("script completed","exit code: 0","success. updated")) and not any(x in out for x in ("script failed","verification failed")) and not re.search(r"exit code: [1-9]\d*",out)
+        if not ok or p.get("name") == "apply_patch": return patch_edits({"cmd":code}) if ok else []
+        vals = {n:v for n, s in re.findall(r"(?:const|let|var)\s+(\w+)\s*=\s*(\"(?:\\.|[^\"\\])*\")", code, re.S) if n in names and (v := safe_parse("codex custom edit", json.loads, s)) is not None}
+        patches = [vals[n] for n in names if n in vals] + [p for s in re.findall(r"await\s+tools\.apply_patch\(\s*(\"(?:\\.|[^\"\\])*\")\s*\)", code, re.S) if (p := safe_parse("codex custom edit", json.loads, s)) is not None]
         return [e for patch in patches if "*** Begin Patch" in patch for e in patch_edits({"cmd":patch})]
 
     edits = [dict(id=gen_id(src, f"edit:{cid}:{i}:{j}"), message_id=anchor(i), file_path=fp, edit_type=op,
@@ -637,9 +639,7 @@ def upsert(conn, r: ParseResult):
     return len(r.convs), len(r.msgs), len(r.tools), len(r.attachs), len(r.edits), len(new_convs), len(updated), changed_msgs
 
 def hook_root(source): return Path(os.environ.get("CLAUDE_CONFIG_DIR", Path.home()/".claude"))/"projects" if source == "claude-code" else Path(os.environ.get("CODEX_HOME", Path.home()/".codex"))/"sessions"
-def hook_result(source, path):
-    s = (parse_claude_code_session if source == "claude-code" else parse_codex_session)(path)
-    return ParseResult(convs=[s["conv"]], msgs=s["msgs"], tools=s["tools"], edits=s["edits"]) if s else ParseResult()
+def hook_result(source, path): s = (parse_claude_code_session if source == "claude-code" else parse_codex_session)(path); return ParseResult(convs=[s["conv"]], msgs=s["msgs"], tools=s["tools"], edits=s["edits"]) if s else ParseResult()
 def enqueue_hook(source, payload):
     path = Path(payload["transcript_path"]).expanduser().resolve(); root = hook_root(source).expanduser().resolve()
     if source not in ("claude-code", "codex") or path.suffix != ".jsonl" or not path.is_relative_to(root): raise ValueError(f"Invalid {source} transcript path")
@@ -651,7 +651,7 @@ def retry_hook(work, force=False):
     work.unlink(missing_ok=True) if q.exists() else os.replace(work, q)
 def merge_embed_dirty(ids):
     old = set(json.loads(HOOK_EMBED_DIRTY.read_text())) if HOOK_EMBED_DIRTY.exists() else set(); atomic_json(HOOK_EMBED_DIRTY, sorted(old | set(ids)))
-def drain_hooks(embed=False):
+def drain_hooks(embed=False, local_only=False):
     HOOK_DIR.mkdir(parents=True, exist_ok=True); done = []
     with (HOOK_DIR/".lock").open("w") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX); state = json.loads(HOOK_STATE.read_text()) if HOOK_STATE.exists() else {}
@@ -665,7 +665,8 @@ def drain_hooks(embed=False):
                 e = json.loads(work.read_text()); path = Path(e["path"]); key = work.stem; st = path.stat(); snap = [st.st_mtime_ns, st.st_size]
                 if state.get(key) == snap: work.unlink(); continue
                 r = hook_result(e["source"], path); st2 = path.stat()
-                if snap != [st2.st_mtime_ns, st2.st_size] or not r.convs: retry_hook(work); continue
+                if snap != [st2.st_mtime_ns, st2.st_size]: retry_hook(work); continue
+                if not r.convs: done.append((work, key, snap, set())); continue
                 conn = get_db(); init_schema(conn)
                 try: changed = upsert(conn, r)[-1] | ({m["id"] for m in r.msgs} if e.get("retry") else set())
                 finally: conn.close()
@@ -680,7 +681,7 @@ def drain_hooks(embed=False):
             atomic_json(HOOK_STATE, state)
             [work.unlink(missing_ok=True) for work, _, _, _ in done]
     if embed:
-        try: embed_hook_pending()
+        try: embed_hook_pending(local_only=local_only)
         except Exception as e: log_parse_error("hook embeddings", e)
     return len(done)
 
@@ -700,28 +701,27 @@ def flush_fts():
     return True
 
 # ---- embeddings ----
-_MODEL, _MCFG, _LLAMA_LOG = None, dict(repo_id="ggml-org/embeddinggemma-300m-qat-q8_0-GGUF", filename="embeddinggemma-300m-qat-Q8_0.gguf", embedding=True, n_ctx=16384, n_batch=2048, n_ubatch=2048, n_seq_max=8, n_gpu_layers=-1), None
-def _llama():
+_MODEL, _MCFG, _LLAMA_LOG = None, dict(repo_id="ggml-org/embeddinggemma-300m-qat-q8_0-GGUF", filename="embeddinggemma-300m-qat-Q8_0.gguf", revision="66f974f8cd48cc3b9c41c516b95508e75b4bee64", embedding=True, n_ctx=16384, n_batch=2048, n_ubatch=2048, n_seq_max=8, n_gpu_layers=-1), None
+def embedding_model_path(local_only=False): from huggingface_hub import hf_hub_download; return hf_hub_download(_MCFG["repo_id"],_MCFG["filename"],revision=_MCFG["revision"],local_files_only=local_only)
+def _llama(local_only=False):
     global _MODEL, _LLAMA_LOG
     if _MODEL is None:
         from llama_cpp import Llama; import llama_cpp.llama_cpp as lc, warnings; warnings.filterwarnings("ignore", message="The `local_dir_use_symlinks` argument is deprecated.*", category=UserWarning)
         if _LLAMA_LOG is None: _LLAMA_LOG = lc.llama_log_callback(lambda *_: None); lc.llama_log_set(_LLAMA_LOG, None)
-        cfg = _MCFG.copy(); nseq = cfg.pop("n_seq_max", 0)
+        cfg = _MCFG.copy(); nseq = cfg.pop("n_seq_max", 0); [cfg.pop(k) for k in ("repo_id","filename","revision")]
         if nseq:
             orig = lc.llama_context_default_params
             lc.llama_context_default_params = lambda o=orig, n=nseq: (setattr(p := o(), "n_seq_max", n) or p)
-        try: _MODEL = Llama.from_pretrained(**cfg, verbose=False)
+        try: _MODEL = Llama(model_path=embedding_model_path(local_only), **cfg, verbose=False)
         finally:
             if nseq: lc.llama_context_default_params = orig
     return _MODEL
-def embed_texts(ss: list[str], doc: bool = False) -> list[list[float]]:
-    p = "task: search result | document: " if doc else "task: search result | query: "
-    return [d["embedding"] for d in _llama().create_embedding([p + (s or "")[:1600] for s in ss])["data"]]
-def embed_text(s: str, doc: bool = False) -> list[float]:
-    return embed_texts([s], doc)[0]
-def embed_pending(batch: int = 32, ids=None):
+def embed_texts(ss: list[str], doc: bool = False, local_only=False) -> list[list[float]]:
+    p = "task: search result | document: " if doc else "task: search result | query: "; return [d["embedding"] for d in _llama(local_only).create_embedding([p + (s or "")[:1600] for s in ss])["data"]]
+def embed_text(s: str, doc: bool = False, local_only=False) -> list[float]: return embed_texts([s], doc, local_only)[0]
+def embed_pending(batch: int = 32, ids=None, local_only=False):
     if ids == []: return
-    Q = "FROM messages WHERE embedding IS NULL AND content IS NOT NULL AND content != ''" + (f" AND id IN ({','.join(['?']*len(ids))})" if ids is not None else ""); ps = ids or []
+    Q = "FROM messages WHERE embedding IS NULL AND content IS NOT NULL AND content != ''" + _NOISE + (f" AND id IN ({','.join(['?']*len(ids))})" if ids is not None else ""); ps = ids or []
     conn = get_db(read_only=True); n = conn.execute(f"SELECT COUNT(*) {Q}", ps).fetchone()[0]; conn.close()
     if not n: return
     typer.echo(f"Embedding {n} messages...", err=True); done = 0
@@ -730,11 +730,11 @@ def embed_pending(batch: int = 32, ids=None):
         if not rows: break
         updates = []
         for ch in [rows[i:i+_MCFG["n_seq_max"]] for i in range(0, len(rows), _MCFG["n_seq_max"])]:
-            updates += [(e, mid) for (mid, _), e in zip(ch, embed_texts([c for _, c in ch], doc=True))]
+            updates += [(e, mid) for (mid, _), e in zip(ch, embed_texts([c for _, c in ch], doc=True, local_only=local_only))]
         conn = get_db(); conn.executemany("UPDATE messages SET embedding=? WHERE id=? AND embedding IS NULL", updates); conn.close()
         done += len(rows); typer.echo(f"  {done}/{n}\r", nl=False, err=True)
     typer.echo(err=True)
-def embed_hook_pending(all_msgs=False, batch=32):
+def embed_hook_pending(all_msgs=False, batch=32, local_only=False):
     HOOK_DIR.mkdir(parents=True, exist_ok=True)
     with (HOOK_DIR/".embed.lock").open("w") as embed_lock:
         fcntl.flock(embed_lock, fcntl.LOCK_EX); claim = HOOK_EMBED_DIRTY.with_name(f".{HOOK_EMBED_DIRTY.name}.{os.getpid()}")
@@ -743,7 +743,7 @@ def embed_hook_pending(all_msgs=False, batch=32):
             if HOOK_EMBED_DIRTY.exists(): os.replace(HOOK_EMBED_DIRTY, claim)
             elif not all_msgs: return
         ids = json.loads(claim.read_text()) if claim.exists() else []
-        try: embed_pending(batch, None if all_msgs else ids)
+        try: embed_pending(batch, None if all_msgs else ids, local_only)
         except BaseException:
             with (HOOK_DIR/".lock").open("w") as lock: fcntl.flock(lock, fcntl.LOCK_EX); merge_embed_dirty(ids)
             raise
@@ -769,11 +769,11 @@ def _fts_ro(hybrid=False):
     if not c.execute("SELECT 1 FROM information_schema.schemata WHERE schema_name='fts_main_messages'").fetchone():
         c.close(); w = get_db(); load_fts(w); ensure_fts_index(w); w.close(); c = _ro(); load_fts(c)
     return c
-def _filt(source, days, role):
+def _filt(source, days, role, cwd=None, conversation=None):
     w, p = [], []
-    if source: w.append("c.source = ?"); p.append(source)
-    if days: w.append("m.created_at > ?"); p.append(datetime.now() - timedelta(days=days))
-    if role: w.append("m.role = ?"); p.append(role)
+    [(w.append(q),p.append(v)) for v,q in ((source,"c.source = ?"),(datetime.now()-timedelta(days=days) if days else None,"m.created_at > ?"),(role,"m.role = ?")) if v]
+    if cwd: raw,resolved=map(str,(Path(cwd).expanduser().absolute(),Path(cwd).expanduser().resolve())); w.append("(c.cwd=? OR starts_with(c.cwd,?) OR c.cwd=? OR starts_with(c.cwd,?))"); p.extend((raw,raw.rstrip("/")+"/",resolved,resolved.rstrip("/")+"/"))
+    if conversation: w.append("starts_with(c.id,?)"); p.append(conversation)
     return w, p
 def _clip(s, n): return (s or "")[:n] + ("..." if s and len(s) > n else "")
 def _fmt_hit(content, ts, role, title, src, cid, cwd, q, ctx, meta):
@@ -797,14 +797,14 @@ def drain_hooks_cmd(): drain_hooks()
 @app.command()
 def init():
     conn = get_db(); init_schema(conn); rebuild_fts_index(conn); conn.close(); HOOK_FTS_DIRTY.unlink(missing_ok=True)
-    install_skills()
+    sync(False, 300, True, True, False, False, True); install_skills(); install_hooks(False, False); [typer.echo(ep.load()()) for ep in entry_points(group="convos.init")]
     typer.echo(f"Database initialized at {DB_PATH}")
 
 @app.command()
-def search(query: str, source: Optional[str] = typer.Option(None, "-s"), days: Optional[int] = typer.Option(None, "-d"), role: Optional[str] = typer.Option(None, "-r"), thinking: bool = typer.Option(False, "--thinking", "-t"), limit: int = typer.Option(20, "-n"), context: int = typer.Option(300, "-c"), fmt: str = typer.Option("text", "-f", "--format")):
+def search(query: str, source: Optional[str] = typer.Option(None, "-s"), days: Optional[int] = typer.Option(None, "-d"), role: Optional[str] = typer.Option(None, "-r"), cwd: Optional[Path] = typer.Option(None, "--cwd", "-w"), conversation: Optional[str] = typer.Option(None, "--conversation"), thinking: bool = typer.Option(False, "--thinking", "-t"), limit: int = typer.Option(20, "-n"), context: int = typer.Option(300, "-c"), fmt: str = typer.Option("text", "-f", "--format")):
     drain_hooks()
     if (conn := _fts_ro()) is None: return
-    w, p = _filt(source, days, role)
+    w, p = _filt(source, days, role, cwd, conversation)
     results = conn.execute(f"""SELECT m.id, m.content, m.thinking, m.role, m.created_at, fts_main_messages.match_bm25(m.id, ?) as score, c.title, c.source, c.id, c.cwd
         FROM messages m JOIN conversations c ON m.conversation_id = c.id WHERE score IS NOT NULL{' AND ' + ' AND '.join(w) if w else ''}
         QUALIFY ROW_NUMBER() OVER (PARTITION BY c.id ORDER BY score DESC)=1 ORDER BY score DESC LIMIT ?""", [query] + p + [limit]).fetchall()
@@ -834,26 +834,27 @@ def read_cmd(conversation: str, limit: int = typer.Option(20, "-n", min=1), cont
     typer.echo(f"[{src}] {title or 'Untitled'}{f' @ {cwd}' if cwd else ''} ({cid})")
     [typer.echo(f"\n{m['role']} @ {m['created_at'] or '?'}\n{m['content']}{f'''\n[THINKING]\n{m['thinking']}''' if m['thinking'] else ''}") for m in data]; typer.echo(f"\n{len(data)} messages")
 
-@app.command("query")
-def query_cmd(q: str, source: Optional[str] = typer.Option(None, "-s"), days: Optional[int] = typer.Option(None, "-d"), role: Optional[str] = typer.Option(None, "-r"), limit: int = typer.Option(10, "-n"), context: int = typer.Option(300, "-c"), fmt: str = typer.Option("text", "-f", "--format")):
-    drain_hooks(embed=True)
-    if (conn := _fts_ro(True)) is None: return
-    if not conn.execute("SELECT COUNT(*) FROM messages WHERE embedding IS NOT NULL").fetchone()[0]:
-        conn.close(); typer.echo("No embeddings yet. Run `pip install ai-convos-db[hybrid]` and `convos embed`, or use `convos search` for BM25 only.", err=True); return
-    try: qv = embed_text(q, doc=False)
-    except Exception as e: conn.close(); typer.echo(f"Hybrid embedding failed: {e}", err=True); return
-    w, p = _filt(source, days, role)
-    rows = conn.execute(f"""WITH qe AS (SELECT ?::FLOAT[768] AS v),
-        base AS (SELECT m.id, m.embedding FROM messages m JOIN conversations c ON c.id=m.conversation_id WHERE m.content IS NOT NULL AND m.content NOT LIKE 'Base directory for this skill:%' AND m.content NOT LIKE '<local-command-caveat>%'{' AND ' + ' AND '.join(w) if w else ''}),
+def hybrid_hits(q, source=None, days=None, role=None, limit=10, local_only=False, cwd=None, conversation=None):
+    drain_hooks(embed=True, local_only=local_only); conn = _fts_ro(True)
+    if conn is None: raise ValueError("Archive retrieval is unavailable")
+    if not conn.execute("SELECT COUNT(*) FROM messages WHERE embedding IS NOT NULL").fetchone()[0]: conn.close(); raise ValueError("No embeddings yet. Run `convos embed`, or use `convos search` for BM25 only.")
+    try: qv = embed_text(q,False,True) if local_only else embed_text(q,False)
+    except Exception as e: conn.close(); raise ValueError(f"Hybrid embedding failed: {e}") from e
+    w, p = _filt(source, days, role, cwd, conversation); rows = conn.execute(f"""WITH qe AS (SELECT ?::FLOAT[768] AS v),
+        base AS (SELECT m.id, m.embedding FROM messages m JOIN conversations c ON c.id=m.conversation_id WHERE m.content IS NOT NULL{_NOISE}{' AND ' + ' AND '.join(w) if w else ''}),
         fts AS (SELECT id, ROW_NUMBER() OVER (ORDER BY score DESC) AS r FROM (SELECT id, fts_main_messages.match_bm25(id, ?) AS score FROM base) s WHERE score IS NOT NULL LIMIT 50),
         vec AS (SELECT b.id, ROW_NUMBER() OVER (ORDER BY array_cosine_similarity(b.embedding, qe.v) DESC) AS r FROM base b, qe WHERE b.embedding IS NOT NULL LIMIT 50),
         fused AS (SELECT id, SUM(1.0/(60+r)) AS rrf FROM (SELECT id, r FROM fts UNION ALL SELECT id, r FROM vec) GROUP BY id)
         SELECT fused.rrf, m.id, m.role, m.content, m.created_at, c.title, c.source, c.id, c.cwd FROM fused JOIN messages m ON m.id = fused.id JOIN conversations c ON c.id = m.conversation_id
         QUALIFY ROW_NUMBER() OVER (PARTITION BY c.id ORDER BY fused.rrf DESC)=1 ORDER BY fused.rrf DESC LIMIT ?""", [qv] + p + [q, limit]).fetchall()
-    conn.close()
+    conn.close(); return [dict(score=score, message_id=mid, role=r, content=content, created_at=ts, title=title, source=src, conversation_id=cid, cwd=cwd) for score, mid, r, content, ts, title, src, cid, cwd in rows]
+@app.command("query")
+def query_cmd(q: str, source: Optional[str] = typer.Option(None, "-s"), days: Optional[int] = typer.Option(None, "-d"), role: Optional[str] = typer.Option(None, "-r"), cwd: Optional[Path] = typer.Option(None, "--cwd", "-w"), conversation: Optional[str] = typer.Option(None, "--conversation"), limit: int = typer.Option(10, "-n"), context: int = typer.Option(300, "-c"), fmt: str = typer.Option("text", "-f", "--format")):
+    try: rows = hybrid_hits(q, source, days, role, limit, cwd=cwd, conversation=conversation)
+    except ValueError as e: typer.echo(str(e), err=True); return
     if not rows: typer.echo("No results"); return
-    if fmt != "text": emit([dict(score=score, message_id=mid, role=r, content=_clip(content, context), created_at=ts, title=title, source=src, conversation_id=cid, cwd=cwd) for score, mid, r, content, ts, title, src, cid, cwd in rows], fmt); return
-    for score, _, r, content, ts, title, src, cid, cwd in rows: _fmt_hit(content, ts, r, title, src, cid, cwd, q, context, f"score: {score:.4f}")
+    if fmt != "text": emit([{**r,"content":_clip(r["content"],context)} for r in rows], fmt); return
+    for x in rows: _fmt_hit(x["content"], x["created_at"], x["role"], x["title"], x["source"], x["conversation_id"], x["cwd"], q, context, f"score: {x['score']:.4f}")
     typer.echo(f"\n{len(rows)} results")
 
 @app.command("embed")
@@ -871,12 +872,13 @@ def doctor(verbose: bool = typer.Option(False, "-v")):
     if DB_PATH.exists():
         try:
             conn = get_db(read_only=True); cols = set(conn.execute("SELECT table_name,column_name FROM information_schema.columns").fetchall()); required = {"conversations":("id","source","title","created_at","updated_at","model","cwd","git_branch","project_id","metadata"), "messages":("id","conversation_id","role","content","thinking","created_at","model","metadata","embedding","parent_id"), "tool_calls":("id","message_id","tool_name","input","output","status","duration_ms","created_at"), "attachments":("id","message_id","filename","mime_type","size","path","url","created_at"), "artifacts":("id","conversation_id","artifact_type","title","content","language","created_at","version"), "file_edits":("id","message_id","file_path","edit_type","content","created_at","old_content")}; missing = [f"{t}.{c}" for t, cs in required.items() for c in cs if (t,c) not in cols]
-            convs, msgs, unembedded, latest = conn.execute("SELECT (SELECT COUNT(*) FROM conversations),(SELECT COUNT(*) FROM messages),(SELECT COUNT(*) FROM messages WHERE embedding IS NULL AND COALESCE(content,'')!=''),(SELECT MAX(updated_at) FROM conversations)").fetchone() if not missing else (0,0,0,None); fts = bool(conn.execute("SELECT 1 FROM information_schema.schemata WHERE schema_name='fts_main_messages'").fetchone()); conn.close()
+            convs, msgs, unembedded, latest = conn.execute(f"SELECT (SELECT COUNT(*) FROM conversations),(SELECT COUNT(*) FROM messages),(SELECT COUNT(*) FROM messages WHERE embedding IS NULL AND COALESCE(content,'')!=''{_NOISE}),(SELECT MAX(updated_at) FROM conversations)").fetchone() if not missing else (0,0,0,None); fts = bool(conn.execute("SELECT 1 FROM information_schema.schemata WHERE schema_name='fts_main_messages'").fetchone()); conn.close()
             typer.echo(f"archive: {convs} convs, {msgs} msgs, {unembedded} unembedded, {DB_PATH.stat().st_size/1024**3:.1f} GB, latest={latest or 'never'}, schema={'ready' if not missing else 'missing:' + ','.join(missing)}, fts={'yes' if fts else 'no'}")
             if missing or not fts: typer.echo("repair: convos init")
             elif unembedded: typer.echo("repair: convos embed")
         except Exception as e: typer.echo(f"archive: unavailable ({e})")
     else: typer.echo(f"archive: missing ({DB_PATH})"); typer.echo("repair: convos init")
+    _,skill,_,dests = _skill_paths(); expected = skill.read_text() if skill.exists() else None; current = sum(expected is not None and p.is_file() and not p.is_symlink() and p.read_text() == expected for p in dests); typer.echo(f"skills: {current}/2 current"); current == 2 or typer.echo("repair: convos install-skills")
     install_hooks(status=True)
     for ep in entry_points(group="convos.doctor"):
         try: typer.echo(ep.load()())
@@ -895,41 +897,39 @@ def doctor(verbose: bool = typer.Option(False, "-v")):
                                "__Secure-next-auth.session-token.1", "cf_clearance", "__cf_bm"] if k in keys]
             typer.echo(f"{name}: chatgpt cookies={len(cg)} keys={','.join(sig) if sig else 'none'}")
 
+def _skill_paths():
+    rel = Path("skills")/"agent-convos"/"SKILL.md"; shares = [Path(p)/"share"/"ai-convos-db" for p in (sysconfig.get_paths().get("data",""),site.getuserbase())]; roots = [PROJECT_ROOT,Path(__file__).resolve().parents[2],*shares]; skill = next((r/rel for r in roots if (r/rel).exists()),roots[-1]/rel); homes = [Path(os.environ.get("CODEX_HOME",Path.home()/".codex")),Path(os.environ.get("CLAUDE_CONFIG_DIR",Path.home()/".claude"))]; return rel,skill,homes,[home/rel for home in homes]
 @app.command()
 def install_skills():
-    rel = Path("skills") / "agent-convos" / "SKILL.md"
-    shares = [Path(p) / "share" / "ai-convos-db" for p in [sysconfig.get_paths().get("data", ""), site.getuserbase()]]
-    roots = [PROJECT_ROOT, Path(__file__).resolve().parents[2], *shares]
-    skill = next((r / rel for r in roots if (r / rel).exists()), roots[-1] / rel)
+    rel, skill, homes, dests = _skill_paths()
     if not skill.exists(): typer.echo(f"Missing skill: {skill}", err=True); raise typer.Exit(1)
-    text = skill.read_text()
-    for base in [Path(os.environ.get("CODEX_HOME", Path.home() / ".codex")) / "skills",
-                 Path.home() / ".claude" / "skills"]:
-        dest = base / "agent-convos" / "SKILL.md"
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        dest.write_text(text)
-        typer.echo(f"Installed {dest}")
+    text = skill.read_text(); resolved = [Path(os.path.realpath(p)) for p in dests]
+    if unsafe := next((p for home,p,target in zip(homes,dests,resolved) if p.is_symlink() or p.exists() and not p.is_file() or any(q.is_symlink() and resolved.count(target)<2 or q.exists() and not q.is_dir() for q in [home/Path(*rel.parts[:i]) for i in range(1,len(rel.parts))])), None): typer.echo(f"Refusing unsafe managed file: {unsafe}", err=True); raise typer.Exit(1)
+    for dest in dests: atomic_write(dest, text); typer.echo(f"Installed {dest}")
 
+def _capture_command(source): root=Path(os.environ.get("CONVOS_PROJECT_ROOT",PROJECT_ROOT)).expanduser().resolve(); return f"{f'CONVOS_PROJECT_ROOT={shlex.quote(str(root))} ' if root!=Path.home()/'.convos' else ''}{shlex.quote(str(Path(sys.executable).with_name('convos')))} capture {source}"
+def _managed_hook(h, source): return h.get("command", "").endswith("convos remote hook") or h.get("command", "").endswith((f" hook {source}", f" capture {source}")) and h.get("statusMessage") in ("Updating conversation archive", "Saving conversation to Convos")
 def edit_hook_config(path, events, source, remove=False):
-    data = json.loads(path.read_text()) if path.exists() else {}; hooks = data.setdefault("hooks", {}); suffixes, messages = (f" hook {source}", f" capture {source}"), ("Updating conversation archive", "Saving conversation to Convos")
+    data = json.loads(path.read_text()) if path.exists() else {}; hooks = data.setdefault("hooks", {})
     for event in list(hooks):
-        for group in hooks[event]: group["hooks"] = [h for h in group.get("hooks", []) if not (h.get("command", "").endswith("convos remote hook") or h.get("command", "").endswith(suffixes) and h.get("statusMessage") in messages)]
+        for group in hooks[event]: group["hooks"] = [h for h in group.get("hooks", []) if not _managed_hook(h, source)]
         hooks[event] = [g for g in hooks[event] if g.get("hooks")]
         if not hooks[event]: del hooks[event]
     if not remove:
-        root=Path(os.environ.get("CONVOS_PROJECT_ROOT",PROJECT_ROOT)).expanduser().resolve(); cmd = f"{f'CONVOS_PROJECT_ROOT={shlex.quote(str(root))} ' if root!=Path.home()/'.convos' else ''}{shlex.quote(shutil.which('convos') or 'convos')} capture {source}"
+        cmd = _capture_command(source)
         for event in events: hooks.setdefault(event, []).append(dict(hooks=[dict(type="command", command=cmd, timeout=5, statusMessage="Saving conversation to Convos")]))
-    atomic_json(path, data); return sum(h.get("command", "").endswith(suffixes) and h.get("statusMessage") in messages for gs in hooks.values() for g in gs for h in g.get("hooks", []))
+    return data, sum(_managed_hook(h, source) for gs in hooks.values() for g in gs for h in g.get("hooks", []))
 
 @app.command("install-hooks")
 def install_hooks(remove: bool = typer.Option(False, "--remove"), status: bool = typer.Option(False, "--status")):
-    cfgs = [(Path(os.environ.get("CLAUDE_CONFIG_DIR", Path.home()/".claude"))/"settings.json", ("Stop", "SessionEnd"), "claude-code"),
-            (Path(os.environ.get("CODEX_HOME", Path.home()/".codex"))/"hooks.json", ("Stop",), "codex")]
-    for path, events, source in cfgs:
+    cfgs = [(Path(os.environ.get("CLAUDE_CONFIG_DIR", Path.home()/".claude"))/"settings.json", ("Stop", "SessionEnd"), "claude-code"), (Path(os.environ.get("CODEX_HOME", Path.home()/".codex"))/"hooks.json", ("Stop",), "codex")]
+    if not status and (unsafe := next((p for p,_,_ in cfgs if p.is_symlink() or p.exists() and not p.is_file() or p.parent.exists() and not p.parent.is_dir()), None)): typer.echo(f"Refusing unsafe managed file: {unsafe}", err=True); raise typer.Exit(1)
+    if not status: cfgs = [(path,events,source,*edit_hook_config(path, events, source, remove)) for path,events,source in cfgs]
+    for path, events, source, *planned in cfgs:
         if status:
-            data = json.loads(path.read_text()) if path.exists() else {}; n = sum(h.get("command", "").endswith((f" hook {source}", f" capture {source}")) and h.get("statusMessage") in ("Updating conversation archive", "Saving conversation to Convos") for gs in data.get("hooks", {}).values() for g in gs for h in g.get("hooks", []))
-        else: n = edit_hook_config(path, events, source, remove)
-        typer.echo(f"{source}: {n} hook{'s' if n != 1 else ''}{' installed' if not status and not remove else ''} ({path})")
+            expected = _capture_command(source); data = json.loads(path.read_text()) if path.exists() else {}; n = sum(sum(h.get("command") == expected and h.get("statusMessage") == "Saving conversation to Convos" for g in data.get("hooks", {}).get(event, []) for h in g.get("hooks", [])) == 1 for event in events); n *= sum(_managed_hook(h, source) for gs in data.get("hooks", {}).values() for g in gs for h in g.get("hooks", [])) == len(events)
+        else: data, n = planned; atomic_json(path, data)
+        typer.echo(f"{source}: {n} hook{'s' if n != 1 else ''}{' installed' if not status and not remove else ''} ({path})" + ("; repair: convos install-hooks" if status and n != len(events) else ""))
     if not status and not remove: typer.echo("Start a new agent session; in Codex, review the user hook with `/hooks`.")
 
 @app.command()
@@ -955,12 +955,12 @@ def export(output: Path, fmt: str = typer.Option("json", "-f"), source: Optional
     conn.close(); typer.echo(f"Exported to {output}")
 
 @app.command()
-def sync(watch: bool = typer.Option(False, "-w"), interval: int = typer.Option(300, "-i"), claude_code: bool = True, codex: bool = True, full: bool = typer.Option(False, "--full", help="Re-parse/re-fetch everything, ignoring incremental state"), verbose: bool = typer.Option(False, "-v", "--verbose")):
+def sync(watch: bool = typer.Option(False, "-w"), interval: int = typer.Option(300, "-i"), claude_code: bool = True, codex: bool = True, full: bool = typer.Option(False, "--full", help="Re-parse/re-fetch everything, ignoring incremental state"), verbose: bool = typer.Option(False, "-v", "--verbose"), local_only: bool = typer.Option(False, "--local-only", help="Import local agent sessions and configured exports without contacting web sources.")):
     if sys.argv[1:2] == ["sync"]: signal.signal(signal.SIGINT, signal.SIG_DFL)
     conn = get_db(); init_schema(conn); conn.close()
     drain_hooks()
     state, dirty = load_state(), False
-    local, web, imports, chatgpt_ok = state.setdefault("local", {}), state.setdefault("web", {}), state.setdefault("imports", {}), {}
+    local, web, imports, chatgpt_ok, offline = state.setdefault("local", {}), state.setdefault("web", {}), state.setdefault("imports", {}), {}, local_only is True
     def set_state(section, key, val):
         nonlocal dirty
         if state.setdefault(section, {}).get(key) != val: state[section][key] = val; dirty = True
@@ -1038,12 +1038,12 @@ def sync(watch: bool = typer.Option(False, "-w"), interval: int = typer.Option(3
         if paths := [Path(p).expanduser() for p in os.environ.get("CONVOS_IMPORT_PATHS", "").split(",") if p.strip()]:
             start("imports")
             jobs += [j for p in paths if (j := plan_import(p))]
-        if claude_code and (p := Path.home() / ".claude" / "projects").exists():
+        if claude_code and (p := Path(os.environ.get("CLAUDE_CONFIG_DIR", Path.home()/".claude"))/"projects").exists():
             start("Claude Code", "claude-code"); jobs += [j for j in [plan_local("claude-code", p, parse_claude_code)] if j]
-        if codex and (p := Path.home() / ".codex").exists():
+        if codex and (p := Path(os.environ.get("CODEX_HOME", Path.home()/".codex"))).exists():
             start("Codex", "codex"); jobs += [j for j in [plan_local("codex", p, parse_codex)] if j]
-        start("ChatGPT", "chatgpt"); jobs += [j for j in [plan_web("chatgpt", fetch_chatgpt, probe_chatgpt, {} if full else known)] if j]
-        start("Claude", "claude"); jobs += [j for j in [plan_web("claude", fetch_claude, probe_claude)] if j]
+        if not offline: start("ChatGPT", "chatgpt"); jobs += [j for j in [plan_web("chatgpt", fetch_chatgpt, probe_chatgpt, {} if full else known)] if j]
+        if not offline: start("Claude", "claude"); jobs += [j for j in [plan_web("claude", fetch_claude, probe_claude)] if j]
         verbose and typer.echo(f"Planning took {time.perf_counter()-t0:.2f}s")
         if jobs:
             with ThreadPoolExecutor(max_workers=min(4, len(jobs))) as ex:

@@ -104,11 +104,12 @@ plus a parser test, exactly like `embedding`.
 the source has no parent; old DBs migrate (a column-exists assertion like the
 embedding migration test).
 
-## 4. Query syntax (optional, later)
+## 4. Direct filters (shipped; custom syntax rejected)
 
-`cwd:foo role:user "term"` -> structured filters + FTS. Core-eligible (it is
-retrieval ergonomics) but deferrable. Keep it out of M1 unless it lands cheaply;
-otherwise fold into `search` later.
+The proposed `cwd:foo role:user "term"` mini-language was rejected as expensive
+and indirect. `search` and `query` instead expose normal `-s`, `-d`, `-r`,
+`--cwd`, and `--conversation` options. SQL remains the direct escape hatch for
+relations and aggregation, not the normal text-matching interface.
 
 ## Out of scope -> applications
 

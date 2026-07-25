@@ -1,5 +1,55 @@
 # Changelog
 
+## Unreleased
+
+- Capture direct Codex `apply_patch` custom-tool events as raw patches instead
+  of scanning their diff text as JavaScript. Custom edits are recorded only
+  after definite tool success; failed attempts remain auditable tool calls with
+  failed status, without fabricated file edits or repeated parse noise.
+- Stop treating dead lifecycle commands as healthy hooks: capture installation
+  now pins the `convos` executable beside the running interpreter and the
+  resolved custom archive root, while status requires that exact command once
+  in every required event. Old executable paths, duplicates, and misplaced
+  Claude `Stop`/`SessionEnd` handlers report `convos install-hooks` and are
+  repaired idempotently.
+- Detect agent-policy drift directly in `convos doctor`: Codex and Claude skill
+  copies are compared byte-for-byte with the bundled distribution, unsafe file
+  symlinks remain unhealthy, shared declared parent destinations still work,
+  and missing or stale copies report `convos install-skills` as the exact
+  repair without modifying user state.
+- Make first-run setup actually complete: `convos init` now installs core
+  capture hooks, imports existing local Codex and Claude Code sessions, and
+  invokes strictly local, idempotent initializers from installed products; the
+  Memory extra becomes ready in the same command without repeating skill
+  installation. The reusable `sync --local-only` path honors configured agent
+  roots and configured exports while skipping every web probe; downloads,
+  remotes, credentials, network enrollment, and destructive actions remain
+  explicit.
+- Make conflict review readable without exposing the resolution engine: `memory review` now shows friendly providers and before/new/current text, labels unavailable origins explicitly, gives the conversational next step, and omits source IDs, locators, canonical IDs, hashes, and protocol action names while the JSON plan remains unchanged.
+- Make the normal Memory surface speak in memories, projects, delivery, changes, decisions, and backups: bare health now gives plain readiness and exact next actions, human status omits engine counts, current hides source IDs and locators behind JSON, public commands use `--project` while hidden protocol keeps `--scope`, routine help drops ledger and canonical language, and doctor retains complete forensic diagnostics.
+- Let people address memories by displayed first-line title or unique literal text for revision, history, and preview-first deletion, with deterministic ID precedence, project scoping, fail-closed ambiguity, readable `current` headings, and stable IDs retained for automation.
+- Add content-free `convos memory audit` for current or all scopes, covering current and historical revision evidence with verified/changed/missing/unavailable counts, exact read pivots, unique-prefix reverse lookup from an archive message to its supported memories, and corrected archive-level unavailability semantics.
+- Connect private retrieval to durable knowledge with explicit `convos ask --remember`: project-scoped local synthesis must pass the existing citation contract, Memory is preflighted before inference, display markers are removed from canonical text, exact cited turns are independently revalidated and attached, repeated identical answers are idempotent, and ordinary Ask remains read-only.
+- Add revision-scoped memory evidence with repeatable `remember --from MESSAGE_ID`, exact local archive pivots, live verified/changed/missing status, scope checks, content-free ledger records, backup and deletion coverage, schema-v5 migration, and a hard boundary that excludes conversation provenance from remote sync.
+- Add the optional `ai-convos-library` product: a responsive read-only conversation browser bound only to loopback behind a fresh tokenized URL, literal or cached-only hybrid retrieval, source/role/day/project filters, and deterministic bounded session replay across exact messages, tool inputs/outputs, statuses, durations, and before/after file edits; `convos replay` exposes the same ordered evidence to agents with explicit payload/activity bounds and truncation, while text-only browser rendering, no third-party assets, strict response headers, and no archive write surface preserve the local privacy boundary.
+- Add direct `--cwd` and `--conversation` filters to literal and hybrid retrieval, replacing the deferred custom query language, plus the optional `ai-convos-eval` product for offline JSONL exact-ID relevance judgments, literal/hybrid comparison, hit@k, MRR, content-free exact read pivots, and threshold-based CI failure.
+- Add the optional `ai-convos-pulse` product for exact recent cross-project archive activity: Git-root-grouped message, role, edit, distinct-file, and stored tool-status counts; bounded exact IDs and read pivots; explicit cwd-less web opt-in; secret-scrubbed metadata; and atomic private self-contained HTML with no message excerpts, network assets, or inferred task status.
+- Add the optional `ai-convos-resume` product: one deterministic local command combines live Git branch, HEAD, and bounded status with path-isolated recent sessions, exact last-turn IDs, touched files, tool statuses, secret-scrubbed bounded excerpts, explicit untrusted-evidence labeling, JSON output, and exact `read --around` handoffs without generation, network access, or inferred completion claims.
+- Add the standalone `ai-convos-redact` product and make it a mandatory remote-client dependency: local scans report only secret type and exact record location, every team event is scrubbed inside the pre-encryption publish boundary, personal sync stays lossless, redaction markers contain no secret-derived fingerprint, binary attachments are omitted without being read, and a private value-free audit ledger records automatic removals.
+- Add the optional `ai-convos-ask` product for private local RAG answers over the core hybrid retrieval seam, with explicit pinned model setup, a normal-path network prohibition, bounded exact-turn evidence windows, untrusted-excerpt isolation, exact readable and JSON citations, one repair attempt, evidence-only inspection, and fail-closed suppression of malformed or uncited synthesis.
+- Add the optional read-only `ai-convos-explore` product with local semantic `convos related` pivots, bounded cycle-free multi-hop `convos trail` graphs, and private dependency-free clickable `convos map` HTML artifacts from exact conversation or message IDs, with conversation fingerprints, strongest-turn evidence, text/JSON/JSONL/DOT output, injected-scaffolding exclusion, and exact-duplicate collapse; hybrid indexing and health counts now skip that scaffolding too.
+- Synchronize canonical memory automatically across configured personal devices through the existing signed end-to-end encrypted remote, with versioned optional package discovery, watcher-safe root resolution, path-free repository scope, bounded non-lazy encrypted parts for large records, out-of-order and replay convergence, tombstones, and conflict-preserving three-way resolution instead of last-write-wins.
+- Propagate user-owned memory deletion through personal sync with safe remote-only canonical and decrypted-event purging, author-bound relay ciphertext removal, permanent replay-denial tombstones, conflict preservation for local/provider/projected state, recreation support, and explicit historical-backup retention boundaries.
+- Restore supported older private memory snapshots through a validated in-memory migration without modifying the source snapshot, while continuing to reject malformed tables, triggers, cross-scope links, failed integrity checks, and unknown newer schemas.
+- Deliver synchronized memory automatically through Claude Code and Codex `SessionStart` hooks, with nullable Codex transcript handling, bounded live Codex trust diagnostics, one-time trust guidance, dual health reporting, and preflighted atomic-per-file configuration that prevents partial installs or removals.
+- Make bare `convos memory` a delivery-aware project health surface, keep the default command list human-sized while retaining callable agent protocol commands, and render irregular memory plurals correctly.
+- Render `memory current` as readable canonical content and exact provenance by default, including missing and pending source state, with explicit `--json` for agents and automation.
+- Give `remember`, `forget`, and `history` readable defaults with exact IDs, scope, source, revision counts, confirmation guidance, and chronological content while preserving structured `--json` modes.
+- Add atomic private full-ledger snapshots plus preview-first, schema-validated restore with an automatic pre-restore rescue snapshot.
+- Carry memory scopes across clones, worktrees, restored machines, and SSH/HTTPS origin forms through private Git evidence while preserving fork isolation, migrating v1 ledgers without rewriting identities, and failing closed with preview-first explicit adoption for ambiguous legacy splits.
+- Preflight both agent hook configurations before `disable --remove-projection` can delete its owned Claude artifact, preventing partial destructive failure on malformed settings.
+- Add the independently versioned, one-spec-installable `ai-convos-memory` product with a bounded core `memory` extra, complete wheel metadata and public command help, fail-closed one-time global enable with optional counts-only all-project warm-up, idempotent disable with preflighted alias-aware atomic skill delivery, live provider-aware doctor diagnostics, private symlink-safe versioned ledger creation, custom Codex/Claude home support, permission-preserving fail-closed agent settings updates, Git-root-normalized multi-scope provider refresh and migration-safe metadata-derived Claude scopes, direct revisioned user-owned `remember`, `current --owned` auditing and counts, plus dry-run and provider/projection-safe `forget`, project-safe semantic defaults and concise projection previews, human-first scoped and global-safe `sync`, per-project status, and three-way review, readable precedence-safe exact-ID-addressable explicit and automatic bounded indexes plus full small-scope first-session context with explicit misses, traceback-free shape-validated agent injection, exact Codex/Claude revision tracking with live structured source provenance and self-describing history, race-tolerant automatic read/delivery-time lone-source bootstrapping and exact-match linking, versioned transactionally previewable scope-isolated semantic reconciliation, engine-owned identities, stale-aware context, and reversible session-derived Claude projection with drift and symlink protection.
+
 ## 0.6.0
 
 - Add signed workspace-state chains for client-verifiable membership, roles, devices, removals, history entitlements, and epoch keys.

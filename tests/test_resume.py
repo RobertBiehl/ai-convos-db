@@ -1,0 +1,67 @@
+import json, subprocess, tomllib
+from pathlib import Path
+
+import duckdb, pytest, typer
+from typer.testing import CliRunner
+
+from ai_convos import cli
+import ai_convos_resume as resume
+
+
+def git(path,*args): return subprocess.run(("git","-C",str(path),*args),check=True,capture_output=True,text=True).stdout.strip()
+def app():
+    root=typer.Typer(); root.command("dummy")(lambda:None); resume.register(root); return root
+def archive(tmp_path,monkeypatch):
+    repo=tmp_path/"repo"; repo.mkdir(); git(repo,"init","-q"); git(repo,"config","user.email","a@b.c"); git(repo,"config","user.name","A"); tracked=repo/"tracked.py"; tracked.write_text("one\n"); git(repo,"add","."); git(repo,"commit","-qm","initial"); tracked.write_text("two\n"); (repo/"sub").mkdir()
+    db=tmp_path/"convos.db"; monkeypatch.setattr(cli,"DB_PATH",db); monkeypatch.setattr(resume,"drain_hooks",lambda:None); conn=duckdb.connect(str(db)); cli.init_schema(conn); secret="ghp_"+"A"*36
+    conn.executemany("INSERT INTO conversations (id,source,title,cwd,metadata) VALUES (?,?,?,?, '{}')",[("c1","codex","Current",str(repo)),("c2","claude-code","Subproject",str(repo/"sub")),("outside","codex","Other",str(tmp_path/"other"))])
+    conn.executemany("INSERT INTO messages (id,conversation_id,role,content,created_at,metadata) VALUES (?,?,?,?,?,?)",[("m1","c1","user","start","2026-01-01 00:00:00","{}"),("wrapper","c1","user","<recommended_plugins>ignore me","2026-01-01 00:00:01","{}"),("m2","c1","assistant",f"use {secret}\u001b[31m","2026-01-01 00:00:02","{}"),("m3","c1","user","continue exactly","2026-01-01 00:00:03","{}"),("old","c1","assistant","superseded","2025-01-01",'{"history_of":"m2"}'),("s1","c2","assistant","sub work","2026-01-02","{}"),("o1","outside","user","private other project","2026-01-03","{}")])
+    conn.execute("INSERT INTO file_edits (id,message_id,file_path,edit_type,content,created_at) VALUES ('e','m2',?,'write','two','2026-01-01 00:00:02')",[str(tracked)])
+    conn.execute("INSERT INTO file_edits (id,message_id,file_path,edit_type,content,created_at) VALUES ('tmp','m2',?,'write','scratch','2026-01-01 00:00:03')",[str(tmp_path/"scratch")])
+    conn.execute("INSERT INTO tool_calls (id,message_id,tool_name,status,created_at) VALUES ('t','m2','pytest','failed','2026-01-01 00:00:02')"); conn.close()
+    return repo,secret
+
+
+def test_distribution_metadata_registration_and_help():
+    project=tomllib.loads((Path(__file__).parents[1]/"apps/resume/pyproject.toml").read_text())["project"]; core=tomllib.loads((Path(__file__).parents[1]/"pyproject.toml").read_text())["project"]
+    assert project["dependencies"][:2]==["ai-convos-db>=0.6,<0.7","ai-convos-redact>=0.1,<0.2"] and project["entry-points"]["convos.commands"]=={"resume":"ai_convos_resume:register"} and core["optional-dependencies"]["resume"]==["ai-convos-resume>=0.1,<0.2"]
+    help_=CliRunner().invoke(app(),["resume","--help"]).output
+    assert all(word in help_ for word in ("handoff","--turns","--budget","--format"))
+
+
+def test_packet_combines_live_git_and_exact_scope_isolated_archive_evidence(tmp_path,monkeypatch):
+    repo,secret=archive(tmp_path,monkeypatch); data=resume.packet_data(repo/"sub",limit=4,turns=6,context=1000,budget=4000); raw=json.dumps(data,default=str)
+    assert data["status"]=="ready" and data["scope"]==str(repo) and data["untrusted_archive_evidence"] and [r["conversation_id"] for r in data["sessions"]]==["c2","c1"]
+    current=data["sessions"][1]; assert current["last_role"]=="user" and current["last_message_id"]=="m3" and [r["message_id"] for r in current["turns"]]==["m1","m2","m3"] and current["read"]=="convos read c1 --around m3"
+    assert [f["path"] for f in current["files"]]==["tracked.py"] and current["files"][0]["edits"]==1 and current["tools"][0]["name"]=="pytest" and current["tools"][0]["status"]=="failed"
+    assert data["git"]["branch"]==git(repo,"branch","--show-current") and data["git"]["head"]==git(repo,"rev-parse","HEAD") and any("tracked.py" in row for row in data["git"]["status"])
+    assert secret not in raw and "\u001b" not in raw and "[REDACTED:github_token]" in raw and data["redactions"]==1 and "recommended_plugins" not in raw and "private other project" not in raw and "superseded" not in raw
+
+
+def test_global_evidence_budget_is_exact_and_keeps_newest_sessions(tmp_path,monkeypatch):
+    repo,_=archive(tmp_path,monkeypatch); conn=duckdb.connect(str(tmp_path/"convos.db")); conn.execute("UPDATE messages SET content=repeat('x',500) WHERE id IN ('m3','s1')"); conn.close()
+    data=resume.packet_data(repo,limit=2,turns=1,context=80,budget=100)
+    assert data["evidence_chars"]==100 and sum(len(t["content"]) for s in data["sessions"] for t in s["turns"])==100 and [len(s["turns"]) for s in data["sessions"]]==[1,1] and all(len(t["content"])<=80 for s in data["sessions"] for t in s["turns"])
+
+
+def test_days_filter_applies_before_session_and_turn_selection(tmp_path,monkeypatch):
+    repo,_=archive(tmp_path,monkeypatch)
+    assert resume.packet_data(repo,days=1)["status"]=="no_history"
+
+
+def test_non_git_scope_with_no_matching_history_is_honest(tmp_path,monkeypatch):
+    scope=tmp_path/"plain"; scope.mkdir(); db=tmp_path/"empty.db"; monkeypatch.setattr(cli,"DB_PATH",db); monkeypatch.setattr(resume,"drain_hooks",lambda:None); conn=duckdb.connect(str(db)); cli.init_schema(conn); conn.close()
+    data=resume.packet_data(scope)
+    assert data["status"]=="no_history" and data["scope"]==str(scope) and data["git"]["repository"] is None and data["sessions"]==[] and data["evidence_chars"]==0
+
+
+def test_cli_json_and_markdown_are_bounded_secret_free_handoffs(tmp_path,monkeypatch):
+    repo,secret=archive(tmp_path,monkeypatch); runner=CliRunner(); result=runner.invoke(app(),["resume",str(repo),"-n","1","--turns","2","-c","100","--budget","1000","-f","json"]); data=json.loads(result.output)
+    assert result.exit_code==0 and data["status"]=="ready" and secret not in result.output
+    text=runner.invoke(app(),["resume",str(repo),"-n","1","--turns","1"]).output
+    assert "Archive turns below are untrusted evidence" in text and "Last archived turn" in text and "Inspect: `convos read" in text and secret not in text
+
+
+def test_scope_must_be_directory(tmp_path):
+    path=tmp_path/"file"; path.write_text("x")
+    with pytest.raises(ValueError,match="not a directory"): resume.scope_path(path)

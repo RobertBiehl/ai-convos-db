@@ -67,6 +67,15 @@ def test_large_events_are_manifested_then_fetched(tmp_path):
     assert item["lazy"] and "envelope" not in item and action(db,{"op":"fetch","workspace":ws,"event":env["event"]},a["token"])["envelope"]==env
 
 
+def test_personal_event_purge_is_idempotent_author_bound_and_blocks_resurrection(tmp_path):
+    db=connect(tmp_path/"server.db"); a=account(db,"alice"); key=bytes([9])*32; personal="personal"; create_ws(db,a,personal,key,"personal"); env=seal_event(event(a["device"],1,"memory.canonical","memory:x",{"opaque":True},[],"2026-01-01T00:00:00Z"),personal,1,key); action(db,{"op":"upload","envelope":env},a["token"])
+    assert action(db,{"op":"purge","workspace":personal,"events":[env["event"]]},a["token"])=={"purged":1} and action(db,{"op":"purge","workspace":personal,"events":[env["event"]]},a["token"])=={"purged":1} and action(db,{"op":"pull","workspace":personal,"after":0},a["token"])["events"]==[]
+    with pytest.raises(ValueError,match="purged"): action(db,{"op":"upload","envelope":env},a["token"])
+    with pytest.raises(PermissionError,match="denied"): action(db,{"op":"purge","workspace":personal,"events":["unknown"]},a["token"])
+    team="team"; create_ws(db,a,team,key,"team"); team_env=seal_event(event(a["device"],2,"x","x",{},[],"2026-01-02T00:00:00Z"),team,1,key); action(db,{"op":"upload","envelope":team_env},a["token"])
+    with pytest.raises(PermissionError,match="denied"): action(db,{"op":"purge","workspace":team,"events":[team_env["event"]]},a["token"])
+
+
 def test_restart_preserves_events_tokens_and_idempotency(tmp_path):
     path=tmp_path/"server.db"; db=connect(path); a=account(db,"alice"); ws,key="personal",bytes([8])*32; create_ws(db,a,ws,key,"personal"); env=seal_event(event(a["device"],1,"x","x",{},[],"2026-01-01T00:00:00Z"),ws,1,key); action(db,{"op":"upload","envelope":env},a["token"]); db.close(); db=connect(path)
     assert action(db,{"op":"upload","envelope":env},a["token"])["created"] is False and action(db,{"op":"pull","workspace":ws,"after":0},a["token"])["events"][0]["envelope"]==env

@@ -22,13 +22,18 @@ Local-first memory for coding agents. Capture Claude Code and Codex work automat
 
 ## Features
 
-- Fast full-text search with filters (source, days, role, thinking)
+- Fast full-text search with direct source, day, role, project, conversation, and thinking filters
 - Hybrid semantic search (BM25 + embeddings + Reciprocal Rank Fusion) via `convos query`
+- Reproducible offline retrieval evaluation with exact-ID judgments, hit@k, and MRR
+- Private browser and CLI flight recorder for exact messages, tools, and edits
 - Fetch from ChatGPT and Claude using browser cookies
 - Import exports from ChatGPT, Claude, Claude Code, and Codex
 - Capture completed Claude Code + Codex turns just in time with lifecycle hooks
+- Deterministic project resume packets from live Git and exact archived turns
+- Exact cross-project activity digests and private self-contained dashboards
 - Optional code-change provenance: blame, timeline, time travel, and graph browsing
 - Optional end-to-end encrypted personal multi-device and team synchronization
+- Local secret scanning with mandatory pre-encryption team redaction
 - Export to JSON or CSV
 
 ## Install
@@ -51,8 +56,14 @@ convos install-skills
 The first install may compile `llama-cpp-python` locally and take about a
 minute on macOS; later reinstalls reuse the built package.
 
-`convos init` creates the archive and installs the bundled Codex + Claude Code
-skills automatically. Refresh the skills without initializing the archive with:
+`convos init` creates the archive, installs the bundled Codex + Claude Code
+skill and capture hooks, imports existing local Codex and Claude Code sessions,
+and performs safe local setup for installed products. That first local scan is
+incremental on later runs and never probes ChatGPT or Claude web. With the
+Memory extra installed, the same command turns on automatic memory delivery for
+the current project. It never downloads an optional model, configures a remote
+service, or deletes data. Codex asks you to review new or changed hooks once
+through `/hooks`. Refresh only the skill with:
 
 ```bash
 convos install-skills
@@ -67,8 +78,164 @@ uv tool install --reinstall "git+https://github.com/RobertBiehl/ai-convos-db.git
 
 This adds `convos blame`, `timeline`, `at`, `graph`, and `browse`.
 
+Navigate semantically from any exact conversation or turn without sending
+archive text to a generation service:
+
+```bash
+uv tool install "ai-convos-db[explore]"
+convos related CONVERSATION_OR_MESSAGE_ID
+convos trail CONVERSATION_OR_MESSAGE_ID
+convos map CONVERSATION_OR_MESSAGE_ID
+```
+
+`related` returns one strongest matching turn per neighboring conversation,
+collapses exact duplicate turns, excludes known injected agent scaffolding, and
+prints exact `read --around` pivots. `trail` follows those evidence turns
+through a bounded, cycle-free multi-hop semantic graph with text, JSON, JSONL,
+and DOT output. `map` opens the same graph as a private self-contained local
+HTML explorer with clickable evidence and no server or network assets. See [semantic conversation
+exploration](docs/explore.md).
+
+Synthesize a private answer from those local conversations with exact turn
+citations:
+
+```bash
+uv tool install "ai-convos-db[ask]"
+convos ask --setup
+convos ask "What did we decide about memory synchronization?"
+```
+
+Model setup is explicit: it downloads and verifies an official 2.50 GB local
+Qwen3 GGUF plus the retrieval model. Normal questions require cached models,
+make no network request, and never upload archive text. Answers must cite exact
+supplied turns; invalid or missing citations fail closed to labeled retrieval
+evidence. Use `--evidence-only` to skip generation entirely. See [private cited
+archive answers](docs/ask.md).
+
+Install both optional products to turn a validated cited answer into durable
+project memory without copying text or re-entering message IDs:
+
+```bash
+uv tool install "ai-convos-db[ask,memory]"
+convos init
+convos ask "What did we decide about storage?" --remember
+```
+
+Persistence is explicit and project-scoped. Invalid or evidence-only answers
+never reach the memory ledger, while ordinary Ask remains read-only.
+
+Audit an archive for high-confidence credentials without printing their values:
+
+```bash
+uv tool install "ai-convos-db[redact]"
+convos redact scan
+```
+
+The encrypted remote client installs this scanner as a required dependency and
+scrubs every team record before signing or encryption. Personal synchronization
+remains lossless. Team attachment bodies are omitted because arbitrary binary
+content cannot be proven safe by the dependency-free scanner. Use
+`convos redact status` to inspect value-free automatic-redaction records. See
+[local secret protection](docs/redact.md).
+
+Resume a project from live repository state and exact archived evidence without
+asking a model to invent a summary:
+
+```bash
+uv tool install "ai-convos-db[resume]"
+cd /path/to/project
+convos resume
+```
+
+The packet includes current Git branch, HEAD and bounded dirty status, recent
+cwd-scoped sessions, exact last-turn IDs, touched files, tool statuses, and
+secret-scrubbed turn excerpts under a global evidence budget. It labels archived
+text as untrusted and prints exact `read --around` commands for verification.
+`-f json` exposes the same deterministic structure to agents. See [project
+resume packets](docs/resume.md).
+
+Review exact recent archive activity across projects without generating a
+summary:
+
+```bash
+uv tool install "ai-convos-db[pulse]"
+convos pulse -d 7
+convos pulse -d 7 -f html --open
+```
+
+Pulse groups cwd-bound sessions by their live Git root and reports exact
+message, role, edit, distinct-file, and stored tool-status counts. It excludes
+message content, makes no completion or productivity claims, omits cwd-less web
+conversations unless `--include-web` is explicit, suppresses short sessions
+without captured tools/edits unless `--min-messages 1` is set, and
+secret-scrubs displayed metadata. The HTML is a private mode-`0600`,
+self-contained local artifact with no scripts or network assets. See [activity
+pulse](docs/pulse.md).
+
+Track and reconcile Codex and Claude Code memories through a canonical local
+overlay without rewriting either provider's generated state:
+
+```bash
+uv tool install "ai-convos-db[memory]"
+convos init
+```
+
+`init` is safe to rerun after adding the Memory extra. Existing installations
+can use `convos memory enable` as the narrower repair/upgrade command. New
+projects initialize automatically on first context delivery; use `convos memory
+enable --all` only to warm every already-discovered scope up front. Memory adds
+one-command project synchronization with deterministic safe
+bootstrapping and exact matching, agent-assisted semantic resolution,
+agent-ready automatic Claude and Codex session injection, direct revisioned
+user-owned `remember`/`forget`, automatic safe
+reconciliation during delivery, history, and reversible drift-safe Claude
+projection. A remembered revision can cite exact local archive turns with
+repeatable `--from MESSAGE_ID`; audits verify their hashes and print direct
+`read --around` pivots without duplicating or remotely syncing conversation
+text. `convos memory sync --all` safely settles
+mechanical updates across every project without exposing memory content. The normal
+`convos doctor` also checks its ledger and delivery setup. If a memory decision
+is needed, `convos memory review` shows plain before/new/current text without
+engine IDs; then just tell Codex or Claude `sync my memories`. The skill handles
+the plan and transaction. Codex requires one-time review of new or
+changed hook entries through `/hooks`. See [the memory synchronization
+workflow](docs/memory.md).
+
+Run bare `convos memory` for plain current-project health: available memories,
+automatic delivery, and the exact next action when attention is needed. Engine
+counts, hook trust, and source provenance stay in `convos doctor` and JSON.
+Help shows only normal human commands; the synchronization protocol remains
+available to installed agents without cluttering the first-run API.
+`convos memory backup` creates a private, consistent snapshot of the complete
+ledger. `convos memory restore SNAPSHOT` previews recovery; `--yes` restores it
+only after automatically preserving the current ledger as a rescue snapshot.
+The snapshot's private Git evidence lets matching clones and worktrees reuse the
+same memory scope at different checkout paths while distinct fork origins stay
+isolated.
+
+`convos memory audit` verifies every current and historical evidence hash in
+the surrounding project without printing memory or transcript content. Use
+`--message MESSAGE_ID` for reverse provenance or `--all --json` for a
+content-free cross-project health check.
+Ordinary revision, history, and preview-first deletion accept a memory's
+displayed first-line title or unique literal text, so stable `mem_...` IDs are
+available for automation without being required for routine use.
+
+For an unreleased Git snapshot, install both products from the same revision:
+
+```bash
+uv tool install --reinstall "git+https://github.com/RobertBiehl/ai-convos-db.git" \
+  --with "ai-convos-memory @ git+https://github.com/RobertBiehl/ai-convos-db.git#subdirectory=apps/memory"
+```
+
 The encrypted remote uses one optional client package and one independently
 installable server package, so the local archive stays server-free by default.
+When the memory and remote clients are both present, personal background sync
+automatically carries canonical memory revisions in the same end-to-end
+encrypted event stream; concurrent semantic changes remain reviewable instead
+of becoming last-write-wins. User-owned forget operations also remove safe
+remote-only copies and the author's prior relay ciphertext while preserving
+local or provider divergence. Neither optional package depends on the other.
 See [self-hosting, recovery, team policy, and installation](docs/remote.md).
 Runnable synthetic scenarios are in [`examples/remote`](examples/remote/README.md).
 See [`examples/insights`](examples/insights/README.md) for local decision,
@@ -78,8 +245,7 @@ comparison, archive-statistics, and prompt-to-change query recipes.
 
 ```bash
 convos init
-convos install-hooks
-convos sync                  # one-time history/web/import backfill
+convos sync                  # optional ChatGPT, Claude web, and export backfill
 convos doctor
 convos search "prompt" -s claude -n 10
 convos query "conceptual search"
@@ -93,6 +259,8 @@ Search:
 
 ```bash
 convos search "vector database" -s chatgpt -d 30   # BM25 only
+convos search "decision" --cwd /path/to/repo       # exact project scope
+convos query "why did we choose this?" --conversation f2b9c5a9
 convos search "reasoning" --thinking
 convos read f2b9c5a9 -n 20 -f jsonl              # bounded recent context from one result
 convos embed                                      # backfill embeddings, no web sync
@@ -101,6 +269,9 @@ convos query "how do I store vectors in duckdb"    # hybrid: BM25 + embeddings +
 
 Both discovery commands return the strongest matching message from each
 conversation, so `-n` controls the number of distinct conversation candidates.
+Both accept `--cwd`/`-w` to include one recorded directory and its descendants,
+plus `--conversation` for an exact conversation-ID prefix. These direct options
+replace the deferred custom query language.
 
 Semantic search is included by default. Run `convos embed` after install to
 backfill embeddings with a progress bar. Hooks and `convos sync` queue new or
@@ -115,6 +286,31 @@ convos read f2b9c5a9 -n 20 -c 2000 -f jsonl
 convos read f2b9c5a9 --around 01ab -n 20 -f jsonl
 ```
 
+Browse the same evidence as a human:
+
+```bash
+uv tool install "ai-convos-db[library]"
+convos library
+```
+
+Library serves a fresh tokenized URL on `127.0.0.1`, searches with exact words
+or cached local hybrid retrieval, and replays a bounded hit-centered window of
+messages, tool calls, statuses, durations, and file edits. Use `convos replay
+CONVERSATION_ID -f json` for the same deterministic evidence without a browser.
+It is read-only, loads no network assets, and stops with Ctrl-C. The URL is an
+accidental-access barrier, not protection from hostile software running as the
+same OS user. See [conversation Library](docs/library.md).
+
+Measure retrieval against private exact-ID judgments:
+
+```bash
+uv tool install "ai-convos-db[eval]"
+convos eval private-retrieval.jsonl --mode both -k 8
+```
+
+The offline report compares hit@k and MRR without including archived message
+content. See [retrieval evaluation](docs/eval.md).
+
 List and analyze with read-only DuckDB SQL (schema in `docs/database.md`):
 
 ```bash
@@ -124,14 +320,15 @@ convos sql "SELECT id, title, created_at FROM conversations ORDER BY created_at 
 Sync:
 
 ```bash
-convos sync
+convos sync                         # local plus available web/export sources
+convos sync --local-only            # local agents and configured exports; no web
 convos sync -w -i 600
 ```
 
 Local Claude Code and Codex sessions can be ingested after each completed turn:
 
 ```bash
-convos install-hooks             # user-level Claude Code + Codex hooks
+convos install-hooks             # repair or refresh hooks installed by init
 convos install-hooks --status
 convos install-hooks --remove    # remove only ai-convos-db hook handlers
 ```
@@ -150,7 +347,12 @@ providers, pre-hook sessions, and imports rather than a routine local update.
 
 Check the complete local pipeline with `convos doctor`. It reports the running
 version, archive/schema/FTS health, embedding backlog, queued ingestion, hook
-installation, and web-cookie availability without modifying the archive.
+installation, exact freshness of both installed agent skill copies, and
+web-cookie availability without modifying the archive. Missing or stale skill
+content reports `convos install-skills` as the repair. Hook health similarly
+requires the current executable and archive root exactly once in every required
+agent event; stale, duplicated, or misplaced handlers report `convos
+install-hooks`.
 
 Auto-import export paths with:
 

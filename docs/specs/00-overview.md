@@ -59,13 +59,17 @@ separately from the app's logic.
 | thread tree (`messages.parent_id`) | CORE | retrieval fidelity; reconstructable only at ingest | ingest |
 | plugin seam (entry points) | CORE | the clean attach point for every app | - |
 | `file_edits.old_content` capture | CORE | change-graph needs it; only ingest can capture it | ingest |
-| query syntax (`cwd: role: "term"`) | CORE (later) | search ergonomics | search |
+| direct cwd/conversation filters | CORE | remove common text-matching SQL fallbacks without a mini-language | search/query |
 | change-graph: `blame` / `timeline` | APP | analysis over `file_edits` | old_content, cwd/branch |
 | file time-travel (`at`) | APP | reconstruct file @ conversation X | change-graph |
-| `convos ask` (RAG + citations) | APP | synthesis; needs a generation model | retrieve |
-| related conversations | APP | navigation | embeddings |
+| `convos ask` (RAG + citations) | ASK APP | private local synthesis with fail-closed exact citations | retrieve |
+| related conversations, trails, visual maps | EXPLORE APP | local one-hop, bounded multi-hop, and private clickable navigation with exact turn evidence | embeddings |
+| deterministic project handoff | RESUME APP | combines live Git state with bounded exact cwd-scoped archive evidence | read API, file/tool capture |
+| exact cross-project activity digest/dashboard | PULSE APP | factual presentation over recent cwd, message, file, and tool metadata | read API, file/tool capture |
+| reproducible retrieval evaluation | EVAL APP | user-owned exact relevance judgments, hit@k, and MRR over real engines | search/query |
+| private conversation browser and replay | LIBRARY APP | human search plus bounded exact messages/tool calls/edits without a write surface | search/query/read, tool/edit capture |
 | encrypted personal/team synchronization | APP/SERVICE | optional E2EE event transport | protocol, projection, provenance |
-| redaction / secret-scan | LATER APP | policy improvement for team projections | remote policy |
+| redaction / secret-scan | REDACT APP | mandatory local pre-encryption team policy plus standalone archive audit | remote projection |
 
 ## Dependency picture
 
@@ -85,7 +89,7 @@ separately from the app's logic.
         _______________________|________________________
        |               |                |                |
    APPLICATIONS  (one package per installable product, explicit line budgets)
-   change-graph    time-travel       ask              related
+   change-graph    time-travel       ask              explore
    blame/timeline  file @ conv X     RAG + citations  near-dup nav
      ^needs                            ^needs            ^needs
      old_content +                     retrieve +        embeddings
@@ -123,6 +127,11 @@ Core also exposes a tiny **public read API** so apps don't reach into privates:
 core schema stable, and stay within the product budget declared in
 `test_budget.py`.
 
+Installed products may additionally expose a `convos.init` callback. Core runs
+these after schema, skill, and capture-hook setup. This lifecycle is only for
+local, idempotent, non-destructive readiness; it must not download models,
+configure remotes, enroll devices, request credentials, or contact services.
+
 ## Budget plan
 
 - **Now:** 998 / 1000 token-aware LoC (`cli.py` 868, `browser.py` 125, init/main 5).
@@ -145,10 +154,22 @@ core schema stable, and stay within the product budget declared in
   sql` -> `messages.parent_id` + plugin seam. Small, exact, unblocks every app.
 - **M2 - Change-graph.** core capture (`file_edits.old_content`) -> app package
   `ai-convos-changegraph` (`blame` / `timeline` / `at`).
-- **M3 - optional apps.** `ask`, related-conversations, and (if cheap) query
-  syntax.
+- **M3 - optional apps.** Semantic Explore ships related-conversation and
+  exact-turn navigation locally; Ask ships explicit local-model setup and
+  fail-closed exact-turn citations.
 - **M4 - encrypted remote.** Protocol/server -> personal multi-device -> Git
   provenance -> team policies and membership. See [04](04-remote-sync.md).
+- **M5 - sharing hardening.** Standalone local secret audit -> mandatory
+  pre-encryption team redaction -> attachment omission and value-free audit.
+- **M6 - continuation UX.** Deterministic project resume packet -> live Git
+  evidence + exact recent turns -> bounded agent-ready verification handoff.
+- **M7 - activity UX.** Exact Git-root-grouped recent archive counts -> bounded
+  session IDs and read pivots -> private content-free local HTML dashboard.
+- **M8 - retrieval quality.** Direct cwd/conversation filters -> private
+  exact-ID judgment suites -> literal/hybrid hit@k and MRR regression gates.
+- **M9 - human archive UX.** Private loopback Library -> literal or cached-only
+  hybrid search -> bounded hit-centered replay of exact messages, tool calls,
+  and file edits -> deterministic JSON for agents.
 
 ## Remote boundary
 
@@ -161,7 +182,6 @@ assumed to be universal team identities.
 
 ## Open questions
 
-- Query syntax: fold into `search`, or its own thin layer? Core or app?
 - Parent-link availability per source (see [01](01-foundation-core.md) sec 3):
   claude-code jsonl has `parentUuid`; chatgpt `mapping` has `parent`; claude
   web/export varies; codex is linear.

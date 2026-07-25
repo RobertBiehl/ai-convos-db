@@ -1,4 +1,4 @@
-import json, socket, subprocess, time, urllib.request
+import json, os, socket, sqlite3, subprocess, time, urllib.request
 from pathlib import Path
 
 import duckdb
@@ -31,6 +31,37 @@ def test_real_http_background_two_device_delivery_under_ten_seconds(tmp_path):
             except Exception: pass
             time.sleep(.2)
         assert found
+    finally:
+        [w.terminate() for w in workers]; [w.wait(timeout=3) for w in workers]; server.terminate(); server.wait(timeout=3)
+
+
+def test_real_http_background_delivers_large_encrypted_memory_without_lazy_fetch(tmp_path):
+    p=port(); url=f"http://127.0.0.1:{p}"; server=subprocess.Popen(("convos-server","serve","--db",str(tmp_path/"server.db"),"--port",str(p)),stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True); workers=[]
+    try:
+        wait(url+"/v1/health"); a,b=tmp_path/"a",tmp_path/"b"; _,recovery=setup_client(url,"alice","laptop",root=a); setup_client(url,"alice","desktop",recovery,root=b); content="private large memory marker\n"+"x"*70000; env={**os.environ,"CONVOS_PROJECT_ROOT":str(a)}; created=json.loads(subprocess.run(("convos","memory","remember","-","--project","global","--json"),input=content,text=True,env=env,check=True,capture_output=True).stdout)
+        for root in (a,b): workers.append(subprocess.Popen(("convos","remote","watch","--interval","1"),env={**os.environ,"CONVOS_PROJECT_ROOT":str(root)},stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL))
+        end=time.time()+10; found=False
+        while time.time()<end:
+            try: db=sqlite3.connect(b/"memory/state.db"); found=db.execute("SELECT content FROM canonicals").fetchone()==(content,) and db.execute("SELECT COUNT(*) FROM remote_parts").fetchone()[0]==0; db.close()
+            except Exception: pass
+            if found: break
+            time.sleep(.2)
+        state=connect(b/"remote/state.db"); lazy=state.execute("SELECT COUNT(*) FROM lazy_events").fetchone()[0]; state.close(); raw=(tmp_path/"server.db").read_bytes().decode(errors="ignore")
+        assert found and lazy==0 and "private large memory marker" not in raw and str(a) not in raw and str(b) not in raw
+        state=connect(a/"remote/state.db"); old=[r[0] for r in state.execute("SELECT event FROM event_log WHERE json_extract(event_json,'$.kind')='memory.canonical' AND json_extract(event_json,'$.payload.status')='active'").fetchall()]; state.close(); subprocess.run(("convos","memory","forget",created["id"],"--project","global","--json"),env=env,check=True,capture_output=True); end=time.time()+10; forgotten=False
+        while time.time()<end:
+            try: db=sqlite3.connect(b/"memory/state.db"); forgotten=db.execute("SELECT COUNT(*) FROM canonicals").fetchone()[0]==0; db.close(); relay=sqlite3.connect(tmp_path/"server.db"); forgotten=forgotten and relay.execute(f"SELECT COUNT(*) FROM event_tombstones WHERE event IN ({','.join('?'*len(old))})",old).fetchone()[0]==len(old); relay.close()
+            except Exception: forgotten=False
+            if forgotten: break
+            time.sleep(.2)
+        state=connect(b/"remote/state.db"); decrypted="".join(r[0] for r in state.execute("SELECT event_json FROM event_log WHERE json_extract(event_json,'$.kind')='memory.canonical'").fetchall()); state.close(); assert forgotten and "private large memory marker" not in decrypted
+        subprocess.run(("convos","memory","remember","-","--project","global","--json"),input=content,text=True,env=env,check=True,capture_output=True); end=time.time()+10; restored=False
+        while time.time()<end:
+            try: db=sqlite3.connect(b/"memory/state.db"); restored=db.execute("SELECT content FROM canonicals").fetchone()==(content,); db.close()
+            except Exception: pass
+            if restored: break
+            time.sleep(.2)
+        assert restored
     finally:
         [w.terminate() for w in workers]; [w.wait(timeout=3) for w in workers]; server.terminate(); server.wait(timeout=3)
 
