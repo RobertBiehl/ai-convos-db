@@ -299,9 +299,21 @@ class TestCodexParser:
             {"type":"session_meta","timestamp":"2026-01-01T00:00:00Z","payload":{"cwd":"/repo"}},
             {"type":"response_item","timestamp":"2026-01-01T00:00:01Z","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"fix"}]}},
             {"type":"response_item","timestamp":"2026-01-01T00:00:02Z","payload":{"type":"custom_tool_call","name":"exec","call_id":"c1","status":"completed","input":code}},
-            {"type":"response_item","timestamp":"2026-01-01T00:00:03Z","payload":{"type":"custom_tool_call_output","call_id":"c1","output":"ok"}}]))
-        result = parse_codex(tmp_path/".codex"); assert len(result.tools) == 1 and result.tools[0]["tool_name"] == "exec" and result.tools[0]["status"] == "complete" and json.loads(result.tools[0]["input"])["code"] == code and json.loads(result.tools[0]["output"]) == "ok"
+            {"type":"response_item","timestamp":"2026-01-01T00:00:03Z","payload":{"type":"custom_tool_call_output","call_id":"c1","output":[{"type":"input_text","text":"Script completed\nWall time 0.0 seconds\nOutput:\n"},{"type":"input_text","text":"{}"}]}}]))
+        result = parse_codex(tmp_path/".codex"); assert len(result.tools) == 1 and result.tools[0]["tool_name"] == "exec" and result.tools[0]["status"] == "complete" and json.loads(result.tools[0]["input"])["code"] == code and "Script completed" in result.tools[0]["output"]
         assert len(result.edits) == 1 and (result.edits[0]["file_path"], result.edits[0]["old_content"], result.edits[0]["content"]) == ("/repo/src/app.py", "old", "new")
+
+    def test_direct_custom_apply_patch_captures_raw_patch_without_scanning_its_code(self, tmp_path, capsys):
+        from ai_convos.cli import parse_codex
+        sessions = tmp_path/".codex"/"sessions"; sessions.mkdir(parents=True); patch = "*** Begin Patch\n*** Update File: src/app.py\n@@\n-old\n+new\n*** Update File: tests/test_app.py\n@@\n-code = r'await tools.apply_patch(\"\\s\")'\n+code = \"safe\"\n*** End Patch"
+        (sessions/"session.jsonl").write_text("\n".join(json.dumps(x) for x in [
+            {"type":"session_meta","timestamp":"2026-01-01T00:00:00Z","payload":{"cwd":"/repo"}},
+            {"type":"response_item","timestamp":"2026-01-01T00:00:01Z","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"fix both"}]}},
+            {"type":"response_item","timestamp":"2026-01-01T00:00:02Z","payload":{"type":"custom_tool_call","name":"apply_patch","call_id":"c1","input":patch}},
+            {"type":"response_item","timestamp":"2026-01-01T00:00:03Z","payload":{"type":"custom_tool_call_output","call_id":"c1","output":"Exit code: 0\nWall time: 0 seconds\nOutput:\nSuccess. Updated"}}]))
+        result = parse_codex(tmp_path/".codex")
+        assert [(e["file_path"],e["old_content"],e["content"]) for e in result.edits] == [("/repo/src/app.py","old","new"),("/repo/tests/test_app.py",'code = r\'await tools.apply_patch("\\s")\'','code = "safe"')]
+        assert len(result.tools) == 1 and result.tools[0]["tool_name"] == "apply_patch" and not capsys.readouterr().err
 
     def test_custom_exec_patch_text_is_not_an_edit(self, tmp_path):
         from ai_convos.cli import parse_codex
@@ -312,6 +324,20 @@ class TestCodexParser:
             {"type":"response_item","timestamp":"2026-01-01T00:00:01Z","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"inspect"}]}},
             {"type":"response_item","timestamp":"2026-01-01T00:00:02Z","payload":{"type":"custom_tool_call","name":"exec","call_id":"c1","input":code}}]))
         result = parse_codex(tmp_path/".codex"); assert len(result.tools) == 1 and result.edits == []
+
+    def test_failed_custom_edits_do_not_create_file_edits_or_parse_noise(self, tmp_path, capsys):
+        from ai_convos.cli import parse_codex
+        sessions = tmp_path/".codex"/"sessions"; sessions.mkdir(parents=True)
+        malformed = r'const patch = "*** Begin Patch\n*** Update File: x.py\n\-old\n+new\n*** End Patch"; await tools.apply_patch(patch);'; patch = "*** Begin Patch\n*** Update File: y.py\n@@\n-old\n+new\n*** End Patch"
+        (sessions/"session.jsonl").write_text("\n".join(json.dumps(x) for x in [
+            {"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"keep me"}]}},
+            {"type":"response_item","payload":{"type":"custom_tool_call","name":"exec","call_id":"c1","input":malformed}},
+            {"type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"c1","output":[{"type":"input_text","text":"Script failed"},{"type":"input_text","text":"apply_patch verification failed"}]}},
+            {"type":"response_item","payload":{"type":"custom_tool_call","name":"apply_patch","call_id":"c2","input":patch}},
+            {"type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"c2","output":"Exit code: 2\ninvalid patch input"}}]))
+        result = parse_codex(tmp_path/".codex")
+        assert [m["content"] for m in result.msgs] == ["keep me"] and len(result.tools) == 2 and {t["status"] for t in result.tools} == {"failed"} and result.edits == []
+        assert not capsys.readouterr().err
 
     def test_skip_system_messages(self, tmp_path):
         """System and developer messages are skipped."""
@@ -616,7 +642,8 @@ class TestInstallSkills:
         assert src.exists(), "bundled skill missing from repo source tree"
         monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
         monkeypatch.setenv("CODEX_HOME", str(tmp_path / ".codex"))
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "custom-claude"))
         install_skills()
         dests = [tmp_path / ".codex" / "skills" / "agent-convos" / "SKILL.md",
-                 tmp_path / ".claude" / "skills" / "agent-convos" / "SKILL.md"]
+                 tmp_path / "custom-claude" / "skills" / "agent-convos" / "SKILL.md"]
         assert all(d.read_text() == src.read_text() for d in dests)

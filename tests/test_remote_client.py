@@ -1,11 +1,12 @@
-import copy, json, os
+import copy, json, os, sqlite3
 
 import duckdb
 import pytest
+import ai_convos_memory as memory_module
 from cryptography.exceptions import InvalidSignature
 from ai_convos.cli import init_schema
 from ai_convos_remote import (_upload_batches, add_member, approve_device, approve_history, connect, control_body, create, fetch_lazy, grant_all, grant_selected, key, load, pull, publish, refresh, remove_device,
-                              request_device, request_history, setup_client, upload, workspace)
+                              request_device, request_history, setup_client, sync_once, upload, workspace)
 from ai_convos_remote.control import sign as control_sign, vote as device_vote
 from ai_convos_remote.projection import rebuild, scan
 from ai_convos_remote.protocol import certificate, event, identity, seal_history, seal_key, sign_control, unb64
@@ -33,6 +34,30 @@ def test_personal_recovery_multidevice_delivery_and_replay(tmp_path,monkeypatch)
     db=duckdb.connect(str(b/"data/convos.db"),read_only=True); assert db.execute("SELECT title FROM conversations").fetchall()==[("shared",)]; db.close()
     assert len(load(b)["keys"])==2 and server.execute("SELECT epoch FROM workspaces WHERE id=?",(ws,)).fetchone()[0]==2
     assert os.stat(a/"remote").st_mode&0o777==0o700 and os.stat(a/"remote/config.json").st_mode&0o777==0o600 and os.stat(a/"remote/state.db").st_mode&0o777==0o600
+
+
+def test_personal_sync_automatically_bridges_encrypted_memory_between_devices(tmp_path,monkeypatch):
+    server=server_connect(tmp_path/"server.db"); monkeypatch.setattr("ai_convos_remote.request",transport(server)); monkeypatch.setattr("ai_convos_remote.drain_hooks",lambda:None); a,b=tmp_path/"a",tmp_path/"b"; alice,recovery=setup_client("http://server","alice","laptop",root=a); setup_client("http://server","alice","desktop",recovery,root=b)
+    monkeypatch.delenv("CONVOS_MEMORY_DB",raising=False); monkeypatch.setenv("CONVOS_PROJECT_ROOT",str(a)); created=memory_module.remember_data("relay cannot read this","global"); sync_once(a,True); wire="".join(r[0] for r in server.execute("SELECT envelope FROM events").fetchall())
+    assert "relay cannot read this" not in wire and str(a) not in wire
+    sync_once(b,True); db=sqlite3.connect(b/"memory/state.db"); assert db.execute("SELECT content FROM canonicals").fetchall()==[("relay cannot read this",)]; db.close()
+    large="second device-safe revision\n"+"x"*70000; memory_module.remember_data(large,"global",created["id"]); sync_once(a,True); sync_once(b,True); count=server.execute("SELECT COUNT(*) FROM events").fetchone()[0]; sync_once(a,True); sync_once(b,True)
+    db=sqlite3.connect(b/"memory/state.db"); assert db.execute("SELECT content FROM canonicals").fetchall()==[(large,)] and db.execute("SELECT COUNT(*) FROM remote_parts").fetchone()[0]==0; db.close(); state=connect(b/"remote/state.db"); assert state.execute("SELECT COUNT(*) FROM lazy_events").fetchone()[0]==0; state.close(); assert server.execute("SELECT COUNT(*) FROM events").fetchone()[0]==count and "second device-safe revision" not in "".join(r[0] for r in server.execute("SELECT envelope FROM events").fetchall())
+    state=connect(a/"remote/state.db"); old=[r[0] for r in state.execute("SELECT event FROM event_log WHERE json_extract(event_json,'$.kind')='memory.canonical' AND json_extract(event_json,'$.payload.status')='active'").fetchall()]; state.close(); memory_module.forget_data(created["id"],"global"); sync_once(a,True); assert server.execute(f"SELECT COUNT(*) FROM events WHERE event IN ({','.join('?'*len(old))})",old).fetchone()[0]==0 and server.execute(f"SELECT COUNT(*) FROM event_tombstones WHERE event IN ({','.join('?'*len(old))})",old).fetchone()[0]==len(old)
+    sync_once(b,True); db=sqlite3.connect(b/"memory/state.db"); assert db.execute("SELECT COUNT(*) FROM canonicals").fetchone()[0]==db.execute("SELECT COUNT(*) FROM sources").fetchone()[0]==0; db.close(); state=connect(b/"remote/state.db"); rows=state.execute("SELECT event_json FROM event_log WHERE json_extract(event_json,'$.kind')='memory.canonical'").fetchall(); state.close(); assert len(rows)==1 and "second device-safe revision" not in rows[0][0]
+    recreated=memory_module.remember_data(large,"global"); assert recreated["id"]!=created["id"]; sync_once(a,True); sync_once(b,True); db=sqlite3.connect(b/"memory/state.db"); assert db.execute("SELECT content FROM canonicals").fetchall()==[(large,)]; db.close()
+
+
+def test_lost_purge_response_retries_without_resurrecting_forgotten_memory(tmp_path,monkeypatch):
+    server=server_connect(tmp_path/"server.db"); direct=transport(server); monkeypatch.setattr("ai_convos_remote.request",direct); monkeypatch.setattr("ai_convos_remote.drain_hooks",lambda:None); a=tmp_path/"a"; setup_client("http://server","alice",root=a); monkeypatch.delenv("CONVOS_MEMORY_DB",raising=False); monkeypatch.setenv("CONVOS_PROJECT_ROOT",str(a)); created=memory_module.remember_data("purge retry secret","global"); sync_once(a,True); state=connect(a/"remote/state.db"); old=[r[0] for r in state.execute("SELECT event FROM event_log WHERE json_extract(event_json,'$.kind')='memory.canonical'").fetchall()]; state.close(); memory_module.forget_data(created["id"],"global"); lost=[False]
+    def request_lost(cfg,body,auth=True):
+        result=direct(cfg,body,auth)
+        if body["op"]=="purge" and not lost[0]: lost[0]=True; raise ConnectionError("purge response lost")
+        return result
+    monkeypatch.setattr("ai_convos_remote.request",request_lost)
+    with pytest.raises(ConnectionError,match="response lost"): sync_once(a,True)
+    state=connect(a/"remote/state.db"); assert state.execute(f"SELECT COUNT(*) FROM event_log WHERE event IN ({','.join('?'*len(old))})",old).fetchone()[0]==len(old); state.close(); assert server.execute(f"SELECT COUNT(*) FROM event_tombstones WHERE event IN ({','.join('?'*len(old))})",old).fetchone()[0]==len(old)
+    monkeypatch.setattr("ai_convos_remote.request",direct); sync_once(a,True); state=connect(a/"remote/state.db"); assert state.execute(f"SELECT COUNT(*) FROM event_log WHERE event IN ({','.join('?'*len(old))})",old).fetchone()[0]==0; state.close()
 
 
 def test_device_certificates_reject_relay_key_substitution_without_auto_certifying(tmp_path,monkeypatch):

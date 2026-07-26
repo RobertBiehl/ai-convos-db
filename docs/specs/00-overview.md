@@ -59,13 +59,16 @@ separately from the app's logic.
 | thread tree (`messages.parent_id`) | CORE | retrieval fidelity; reconstructable only at ingest | ingest |
 | plugin seam (entry points) | CORE | the clean attach point for every app | - |
 | `file_edits.old_content` capture | CORE | change-graph needs it; only ingest can capture it | ingest |
-| query syntax (`cwd: role: "term"`) | CORE (later) | search ergonomics | search |
+| direct cwd/conversation filters | CORE | remove common text-matching SQL fallbacks without a mini-language | search/query |
 | change-graph: `blame` / `timeline` | APP | analysis over `file_edits` | old_content, cwd/branch |
 | file time-travel (`at`) | APP | reconstruct file @ conversation X | change-graph |
-| `convos ask` (RAG + citations) | APP | synthesis; needs a generation model | retrieve |
-| related conversations | APP | navigation | embeddings |
+| related conversations and trails | EXPLORE APP | local one-hop and bounded multi-hop navigation with exact turn evidence | embeddings |
+| deterministic project handoff and replay | RESUME APP | combines live Git and cwd-scoped evidence or replays exact messages/tools/edits | read API, file/tool capture |
+| provider-stored memory capture | PLANNED CORE | faithful agent state belongs beside conversation provenance; core never writes providers | ingest |
+| canonical memory reconciliation and sync-back | MEMORY APP | optional revision ledger, delivery, projection, and remote convergence | provider memory capture |
+| reproducible retrieval evaluation | DEV TOOL | private exact relevance judgments, hit@k, and MRR guard retrieval changes | search/query |
 | encrypted personal/team synchronization | APP/SERVICE | optional E2EE event transport | protocol, projection, provenance |
-| redaction / secret-scan | LATER APP | policy improvement for team projections | remote policy |
+| redaction / secret-scan | REDACT APP | mandatory local pre-encryption team policy plus standalone archive audit | remote projection |
 
 ## Dependency picture
 
@@ -85,11 +88,11 @@ separately from the app's logic.
         _______________________|________________________
        |               |                |                |
    APPLICATIONS  (one package per installable product, explicit line budgets)
-   change-graph    time-travel       ask              related
-   blame/timeline  file @ conv X     RAG + citations  near-dup nav
-     ^needs                            ^needs            ^needs
-     old_content +                     retrieve +        embeddings
-     cwd/branch                        gen model
+   change-graph    explore             resume/replay     memory
+   blame/timeline  semantic trails     exact evidence    canonical sync
+     ^needs          ^needs              ^needs            ^needs
+     old_content +   embeddings          read + tools      memory capture
+     cwd/branch                          + edits
 
    OPTIONAL REMOTE PRODUCTS (still local-first; see spec 04):
    remote client [protocol, projection, provenance, service] <-> remote server
@@ -123,6 +126,11 @@ Core also exposes a tiny **public read API** so apps don't reach into privates:
 core schema stable, and stay within the product budget declared in
 `test_budget.py`.
 
+Installed products may additionally expose a `convos.init` callback. Core runs
+these after schema, skill, and capture-hook setup. This lifecycle is only for
+local, idempotent, non-destructive readiness; it must not download models,
+configure remotes, enroll devices, request credentials, or contact services.
+
 ## Budget plan
 
 - **Now:** 998 / 1000 token-aware LoC (`cli.py` 868, `browser.py` 125, init/main 5).
@@ -145,10 +153,20 @@ core schema stable, and stay within the product budget declared in
   sql` -> `messages.parent_id` + plugin seam. Small, exact, unblocks every app.
 - **M2 - Change-graph.** core capture (`file_edits.old_content`) -> app package
   `ai-convos-changegraph` (`blame` / `timeline` / `at`).
-- **M3 - optional apps.** `ask`, related-conversations, and (if cheap) query
-  syntax.
+- **M3 - semantic navigation.** Explore ships related-conversation and
+  exact-turn trail navigation locally.
 - **M4 - encrypted remote.** Protocol/server -> personal multi-device -> Git
   provenance -> team policies and membership. See [04](04-remote-sync.md).
+- **M5 - sharing hardening.** Standalone local secret audit -> mandatory
+  pre-encryption team redaction -> attachment omission and value-free audit.
+- **M6 - continuation UX.** Deterministic project resume packet -> live Git
+  evidence + exact recent turns -> bounded agent-ready verification handoff ->
+  exact message/tool/edit replay.
+- **M7 - memory boundary.** Faithfully capture provider-stored memories in core
+  without writing providers -> optional canonical ledger, delivery, projection,
+  and remote sync in the Memory product.
+- **M8 - retrieval quality tooling.** Direct cwd/conversation filters -> private
+  exact-ID judgment suites -> literal/hybrid hit@k and MRR regression gates.
 
 ## Remote boundary
 
@@ -161,7 +179,6 @@ assumed to be universal team identities.
 
 ## Open questions
 
-- Query syntax: fold into `search`, or its own thin layer? Core or app?
 - Parent-link availability per source (see [01](01-foundation-core.md) sec 3):
   claude-code jsonl has `parentUuid`; chatgpt `mapping` has `parent`; claude
   web/export varies; codex is linear.

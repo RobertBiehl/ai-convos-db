@@ -1,10 +1,10 @@
 [project]
 name = "ai-convos-changegraph"
-version = "0.1.0"
+version = "0.7.0"
 description = "Change graph over the convos DB: blame, timeline, time-travel, graph export"
 license = "MIT"
 requires-python = ">=3.12"
-dependencies = ["ai-convos-db", "typer>=0.12.0", "duckdb>=1.0.0"]
+dependencies = ["ai-convos-db>=0.7,<0.8", "typer>=0.12.0", "duckdb>=1.0.0"]
 
 [project.entry-points."convos.commands"]
 changegraph = "ai_convos_changegraph:register"

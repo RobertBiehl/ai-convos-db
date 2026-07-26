@@ -117,6 +117,41 @@ are removed automatically. The hook only updates the local archive. The worker
 observes those changes and performs Git inspection, encryption, network I/O,
 pulling, and projection. Normal work never requires `convos remote sync`.
 
+### Memory on multiple computers
+
+Install and enable `ai-convos-memory` on each computer if canonical agent memory
+should travel with the personal archive. The remote client discovers it as an
+optional adapter; the server and wire protocol need no memory-specific
+installation or account:
+
+```bash
+uv tool install --reinstall "git+https://github.com/RobertBiehl/ai-convos-db.git" \
+  --with "ai-convos-memory @ git+https://github.com/RobertBiehl/ai-convos-db.git#subdirectory=apps/memory" \
+  --with "ai-convos-remote @ git+https://github.com/RobertBiehl/ai-convos-db.git#subdirectory=apps/remote"
+convos memory enable
+```
+
+The background worker then sends canonical revisions and tombstones through the
+personal workspace automatically. Memory never enters team workspaces.
+Sequential changes converge without a prompt; concurrent semantic changes stay
+pending locally for `convos memory review` or the installed agent workflow.
+The relay sees ciphertext and envelope metadata, not memory text or absolute
+checkout paths. Preserve the recovery key and continue taking private
+`convos memory backup` snapshots: the remote synchronizes canonical state, not
+native Codex/Claude files, hooks, or the complete device-local ledger.
+Large canonical records are encrypted in bounded parts and reassembled locally,
+so they continue through background sync without opting unrelated large remote
+records into eager download.
+
+Forgetting a user-owned canonical publishes an encrypted tombstone, then
+removes that device author's prior canonical events from the personal relay.
+The relay retains only opaque event-ID tombstones so deleted ciphertext cannot
+be replayed. Recipients erase decrypted event payloads and automatically remove
+an unchanged remote-only canonical; locally revised, projected, or
+provider-backed state is retained. Relay and client backups created before the
+forget operation are not rewritten and must be expired separately when
+historical deletion is required.
+
 ## Team workspaces
 
 Users create their own account before an administrator adds them:
@@ -140,6 +175,15 @@ Linking a Git checkout stores its checkout root only on that device. Encrypted
 root-commit and remote evidence identifies other clones. A linked non-Git path
 uses a local root binding. Every relevant turn, tool, edit, checkpoint, and
 changeset is shared automatically after the one-time link.
+
+The client requires `ai-convos-redact` and runs it inside the team `publish`
+boundary before event signing and encryption. High-confidence credential spans
+become typed markers without secret-derived hashes; personal workspaces remain
+lossless. Team attachment records and bodies are omitted, and their bodies are
+not read while building a team projection. `convos redact status` shows only
+the local workspace, record, field path, line, and secret kind. The relay cannot
+scan because it receives no plaintext. See [local secret
+protection](redact.md) for supported forms and the non-retroactive boundary.
 
 A changeset may span several repositories. Each edit is authorized separately.
 When only part belongs to a workspace, recipients get allowed edits plus an
@@ -258,6 +302,11 @@ starting it again. The backup contains ciphertext, ACL metadata, key envelopes,
 and delivery cursors, but no workspace key. Clients can safely retry uploads and
 pulls after rollback because event insertion and local projection are
 idempotent.
+
+A backup taken before a memory forget operation still contains the older
+encrypted events and predates their event-ID tombstones. Treat relay-backup
+retention as part of the deletion policy; restoring such a backup can make that
+historical ciphertext available to newly recovered clients again.
 
 Client recovery requires the server backup plus the user's recovery key. Loss
 of every enrolled device and the recovery key is permanent data loss.

@@ -2,21 +2,23 @@
 import json, os, time, urllib.error, urllib.parse, urllib.request
 from pathlib import Path; from typing import Optional
 
-import typer
+import duckdb, typer
+from ai_convos_redact import protect as protect_record
 _pending=[]
 def register(app): _pending.append(app) if "remote" not in globals() else app.add_typer(remote,name="remote")
-from ai_convos.cli import DB_PATH, PROJECT_ROOT, drain_hooks, get_db, install_hooks
+from ai_convos.cli import PROJECT_ROOT, drain_hooks, install_hooks
 from .control import approved, electorate, proposal as device_proposal, record as control_record, sign as control_sign, state_hash, verify_proposal, verify_state, vote as device_vote
 from .provenance import repository
-from .projection import connect, project, project_many, query as graph_query, rebuild as rebuild_projection, scan, sequence
+from .projection import bridge_purges, bridge_records, connect, project, project_many, query as graph_query, rebuild as rebuild_projection, scan, sequence
 from .protocol import (b64, certificate, digest, event, identity, material_event, open_event, open_key, public, public_id, recover,
                        recovery_bundle, seal_event, seal_history, seal_key, sign_control, signer, unb64, verify_certificate)
 from .service import edit_hooks, enable
 
 remote=typer.Typer(help="End-to-end encrypted personal and team synchronization")
+def local_root(root=None): return Path(root or os.environ.get("CONVOS_PROJECT_ROOT",PROJECT_ROOT))
 def paths(root=None):
-    base=Path(root or os.environ.get("CONVOS_PROJECT_ROOT",PROJECT_ROOT))/"remote"; return base,base/"config.json",base/"state.db"
-def core_path(root=None): return Path(root or os.environ.get("CONVOS_PROJECT_ROOT",PROJECT_ROOT))/"data"/"convos.db"
+    base=local_root(root)/"remote"; return base,base/"config.json",base/"state.db"
+def core_path(root=None): return local_root(root)/"data"/"convos.db"
 def load(root=None):
     _,path,_=paths(root)
     if not path.exists(): raise ValueError("Remote is not configured. Run `convos remote setup`.")
@@ -99,13 +101,14 @@ def rotate(cfg,ws,members,devices,deactivate=(),root=None):
         records|={d["id"]:server_record(d) for d in devices if d["user_id"] in new_users and d["id"] not in removed and d.get("active",1) and d.get("allowed",1)}
     control=control_body(cfg,previous,new,action,meta,records,removed,approval); envs={d:seal_key(new,r["device"]["box_public"],f"workspace:{ws}:epoch:{epoch}") for d,r in records.items()}; request(cfg,sign_control(cfg["device"],{"op":"rotate","workspace":ws,"control":control,"envelopes":envs})); cfg["keys"][f"{ws}:{epoch}"]=b64(new); cfg["workspaces"][ws]["epoch"]=epoch; cfg["controls"][ws]=control; update_recovery(cfg,root); cfg["device"]["id"] in records and membership_event(cfg,ws,epoch,members,root); return epoch
 def publish(cfg,state,ws,record,root=None,defer=False,known=None):
+    if cfg["workspaces"][ws]["kind"]=="team" and (record:=protect_record(record,root,ws)) is None: return None
     revision=digest(record["payload"]); old=(record["entity"],revision) in known if known is not None else state.execute("SELECT event FROM published WHERE workspace=? AND entity=? AND revision=?",(ws,record["entity"],revision)).fetchone()
     if old: return old[0] if known is None else None
     seq=int((state.execute("SELECT value FROM meta WHERE key=?",(f"seq:{ws}",)).fetchone() or ["0"])[0])+1; prev=(state.execute("SELECT value FROM meta WHERE key=?",(f"prev:{ws}",)).fetchone() or [None])[0]; value=event(cfg["device"],seq,record["kind"],record["entity"],record["payload"],[prev] if prev else (),record.get("observed_at")); epoch=cfg["workspaces"][ws]["epoch"]; env=seal_event(value,ws,epoch,key(cfg,ws,epoch))
     state.execute("INSERT INTO event_log VALUES (?,?,?,?,?,?)",(ws,value["id"],0,"out",json.dumps(value),json.dumps(env))); state.execute("INSERT INTO published VALUES (?,?,?,?)",(ws,record["entity"],revision,value["id"])); state.execute("INSERT OR REPLACE INTO meta VALUES (?,?),(?,?)",(f"seq:{ws}",str(seq),f"prev:{ws}",value["id"])); sequence(state,ws,value)
     if not defer: state.commit()
     if known is not None: known.add((record["entity"],revision))
-    project(core_path(root),state,value,ws,cfg["device"]["id"]); return value["id"]
+    project(core_path(root),state,value,ws,cfg["device"]["id"],root=root); return value["id"]
 def membership_event(cfg,ws,epoch,members,root=None):
     state=connect(paths(root)[2]); publish(cfg,state,ws,{"kind":"workspace.membership","entity":f"membership:{epoch}","payload":{"epoch":epoch,"members":members}},root); upload(cfg,state,root); state.close()
 def control_event(cfg,ws,action,target,root=None):
@@ -126,7 +129,11 @@ def upload(cfg,state,root=None):
             if env["epoch"]!=current: env=seal_event(json.loads(raw),ws,current,key(cfg,ws,current)); state.execute("UPDATE event_log SET envelope=? WHERE event=?",(json.dumps(env),eid))
             envs.append(env)
         result=request(cfg,{"op":"upload_many","envelopes":envs})["events"]; [state.execute("UPDATE event_log SET cursor=?,envelope=NULL WHERE event=?",(r["cursor"],batch[i][1])) for i,r in enumerate(result)]; state.commit()
+def purge_events(cfg,state,ws,events):
+    for i in range(0,len(events),500):
+        batch=events[i:i+500]; request(cfg,{"op":"purge","workspace":ws,"events":batch}); state.execute(f"DELETE FROM published WHERE workspace=? AND event IN ({','.join('?'*len(batch))})",(ws,*batch)); state.execute(f"DELETE FROM event_log WHERE workspace=? AND event IN ({','.join('?'*len(batch))})",(ws,*batch)); state.commit()
 def pull(cfg,state,root=None):
+    root=local_root(root)
     server=refresh(cfg,root)
     for ws in server["workspaces"]:
         if not ws["device_authorized"]: continue
@@ -143,18 +150,19 @@ def pull(cfg,state,root=None):
             if material and material["id"]!=value["id"]: state.execute("INSERT OR REPLACE INTO history_material VALUES (?,?,?)",(ws["id"],material["id"],json.dumps(material)))
             if material: incoming.append((ws["id"],material))
             after=max(after,item["cursor"])
-        project_many(core_path(root),state,incoming,cfg["device"]["id"])
+        project_many(core_path(root),state,incoming,cfg["device"]["id"],root)
         state.execute("INSERT OR REPLACE INTO cursors VALUES (?,?)",(ws["id"],after)); state.execute("INSERT OR REPLACE INTO meta VALUES (?,?),(?,?)",(f"history_from:{ws['id']}",str(ws["history_from"]),f"key_from:{ws['id']}",str(earliest))); state.commit()
 def fetch_lazy(cfg,state,event_id=None,root=None):
+    root=local_root(root)
     server=refresh(cfg,root); controls={ws["id"]:ws["controls"] for ws in server["workspaces"]}; sql="SELECT workspace,event,cursor FROM lazy_events"+(" WHERE event=?" if event_id else ""); rows=[r for r in state.execute(sql,(event_id,) if event_id else ()).fetchall() if r[0] in controls]
     for ws,eid,cursor in rows:
         devices={r["device"]["id"]:r["device"] for control in controls[ws] for r in control["devices"].values()}
         env=request(cfg,{"op":"fetch","workspace":ws,"event":eid})["envelope"]
         if (env["workspace"],env["event"])!=(ws,eid) or not access_from(cfg,ws)<=env["epoch"]<=cfg["controls"][ws]["epoch"]: raise ValueError("lazy event response mismatch")
-        value=open_event(env,key(cfg,ws,env["epoch"]),signer(devices,env["author"])); material=material_event(value,devices,cfg["device"]); sequence(state,ws,value); state.execute("INSERT OR IGNORE INTO event_log VALUES (?,?,?,?,?,NULL)",(ws,eid,cursor,"in",json.dumps(value))); material and material["id"]!=value["id"] and state.execute("INSERT OR REPLACE INTO history_material VALUES (?,?,?)",(ws,material["id"],json.dumps(material))); material and project(core_path(root),state,material,ws,cfg["device"]["id"]); state.execute("DELETE FROM lazy_events WHERE event=?",(eid,))
+        value=open_event(env,key(cfg,ws,env["epoch"]),signer(devices,env["author"])); material=material_event(value,devices,cfg["device"]); sequence(state,ws,value); state.execute("INSERT OR IGNORE INTO event_log VALUES (?,?,?,?,?,NULL)",(ws,eid,cursor,"in",json.dumps(value))); material and material["id"]!=value["id"] and state.execute("INSERT OR REPLACE INTO history_material VALUES (?,?,?)",(ws,material["id"],json.dumps(material))); material and project(core_path(root),state,material,ws,cfg["device"]["id"],root=root); state.execute("DELETE FROM lazy_events WHERE event=?",(eid,))
     state.commit(); return len(rows)
 def sync_once(root=None,force=False):
-    cfg=load(root); _,_,state_path=paths(root); state=connect(state_path); drain_hooks(); upload(cfg,state,root); flush_selected(cfg,state,root); core=get_db(read_only=True)
+    root=local_root(root); cfg=load(root); _,_,state_path=paths(root); state=connect(state_path); drain_hooks(); upload(cfg,state,root); flush_selected(cfg,state,root); core=duckdb.connect(str(core_path(root)),read_only=True) if core_path(root).is_file() else None
     stamp=core_path(root).stat().st_mtime_ns if core_path(root).exists() else 0; previous=int((state.execute("SELECT value FROM meta WHERE key='core_mtime'").fetchone() or ["0"])[0])
     if core and (force or stamp!=previous):
         active={w["id"] for w in cfg["server_state"]["workspaces"]}
@@ -164,7 +172,15 @@ def sync_once(root=None,force=False):
             known={(r[0],r[1]) for r in state.execute("SELECT entity,revision FROM published WHERE workspace=?",(ws,)).fetchall()}; [publish(cfg,state,ws,r,root,True,known) for r in scan(core,state,cfg["device"]["id"],meta["kind"],repos,roots)]
         state.execute("INSERT OR REPLACE INTO meta VALUES ('core_mtime',?)",(str(stamp),)); state.commit()
     if core: core.close()
-    upload(cfg,state,root); pull(cfg,state,root); state.execute("INSERT OR REPLACE INTO meta VALUES ('last_sync',?)",(str(time.time()),)); state.commit(); state.close()
+    active={w["id"] for w in cfg["server_state"]["workspaces"]}
+    for ws,meta in cfg["workspaces"].items():
+        if ws not in active or meta["kind"]!="personal" or f"{ws}:{meta['epoch']}" not in cfg["keys"]: continue
+        known={(r[0],r[1]) for r in state.execute("SELECT entity,revision FROM published WHERE workspace=?",(ws,)).fetchall()}; [publish(cfg,state,ws,r,root,True,known) for r in bridge_records(root,state,ws,meta["kind"])]
+    state.commit()
+    upload(cfg,state,root)
+    for ws,meta in cfg["workspaces"].items():
+        if ws in active and meta["kind"]=="personal": purge_events(cfg,state,ws,bridge_purges(root,state,ws,meta["kind"]))
+    pull(cfg,state,root); state.execute("INSERT OR REPLACE INTO meta VALUES ('last_sync',?)",(str(time.time()),)); state.commit(); state.close()
 def add_member(cfg,ws,user,remove=False,root=None):
     refresh(cfg,root); members={u:m["role"] for u,m in cfg["controls"][ws]["members"].items()}; devices=[]
     if remove:

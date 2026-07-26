@@ -1,8 +1,11 @@
 import json, subprocess
+from pathlib import Path
 
 import duckdb
+import pytest
 from ai_convos.cli import init_schema
-from ai_convos_remote.projection import connect, project, rebuild, scan, sequence
+import ai_convos_remote.projection as projection_module
+from ai_convos_remote.projection import bridges, connect, project, rebuild, scan, sequence
 from ai_convos_remote.protocol import event, identity, seal_history
 
 
@@ -19,6 +22,14 @@ def test_personal_scan_strips_local_roots_and_rebuilds_duckdb(tmp_path):
     for i,value in enumerate(events): state.execute("INSERT INTO event_log VALUES (?,?,?,?,?,?)",("personal",value["id"],i,"in",json.dumps(value),"{}")); project(tmp_path/"target.db",state,value,"personal","other-device")
     target=duckdb.connect(str(tmp_path/"target.db"),read_only=True); assert target.execute("SELECT title,cwd FROM conversations").fetchone()==("title",None); assert target.execute("SELECT content FROM messages WHERE role='user'").fetchone()[0]=="change it"; assert target.execute("SELECT file_path FROM file_edits").fetchone()[0]=="a.py"; target.close()
     before=state.execute("SELECT COUNT(*) FROM edits").fetchone()[0]; (tmp_path/"target.db").unlink(); assert rebuild(tmp_path/"target.db",state)==len(events); assert duckdb.connect(str(tmp_path/"target.db"),read_only=True).execute("SELECT COUNT(*) FROM messages").fetchone()[0]==2 and state.execute("SELECT COUNT(*) FROM edits").fetchone()[0]==before
+
+
+def test_optional_projection_bridge_contract_fails_closed(monkeypatch):
+    class Entry:
+        def load(self): return lambda:{"v":2,"records":lambda *_:[],"project":lambda *_:None}
+    bridges.cache_clear(); monkeypatch.setattr(projection_module,"entry_points",lambda **_:[Entry()])
+    with pytest.raises(ValueError,match="Unsupported remote bridge"): bridges()
+    bridges.cache_clear()
 
 
 def test_out_of_order_revisions_converge_and_replay_deduplicates(tmp_path):
@@ -47,6 +58,13 @@ def test_record_schema_is_fixed_and_same_origin_ids_from_authors_do_not_collide(
 def test_team_scope_includes_prompt_turn_and_linked_repo_only(tmp_path):
     repo,core=source(tmp_path); state=connect(tmp_path/"state.db"); personal=scan(core,state,"d"); rid=next(r["payload"]["id"] for r in personal if r["kind"]=="repository.observed"); team=scan(core,state,"d","team",[rid],[])
     kinds=[r["kind"] for r in team]; assert kinds.count("conversation.record")==1 and kinds.count("message.record")==2 and "file_edit.record" in kinds and "changeset.observed" in kinds
+
+
+def test_team_projection_never_reads_attachment_bodies(tmp_path,monkeypatch):
+    repo,core=source(tmp_path); body=tmp_path/"secret.bin"; body.write_bytes(b"secret"); core.execute("INSERT INTO attachments (id,message_id,filename,path) VALUES ('a','m','secret.bin',?)",[str(body)]); state=connect(tmp_path/"state.db"); personal=scan(core,state,"d"); rid=next(r["payload"]["id"] for r in personal if r["kind"]=="repository.observed")
+    original=Path.read_bytes; monkeypatch.setattr(Path,"read_bytes",lambda path:pytest.fail("team projection read attachment body") if path==body else original(path))
+    records=scan(core,state,"d","team",[rid],[])
+    assert any(r["kind"]=="attachment.record" for r in records) and not any(r["kind"]=="attachment.chunk" for r in records)
 
 
 def test_cross_repo_changeset_is_sliced_per_edit_with_opaque_boundary(tmp_path):

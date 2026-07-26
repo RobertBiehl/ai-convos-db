@@ -1,6 +1,6 @@
 """Tests for repository constraints."""
 
-import token, tokenize
+import token, tokenize, tomllib
 from pathlib import Path
 
 TOKEN_WHITELIST = {token.OP, token.NAME, token.NUMBER, token.STRING}
@@ -25,10 +25,16 @@ def test_app_line_budgets():
     root = Path(__file__).resolve().parents[1]
     for src in sorted((root / "apps").glob("*/src")):
         loc = _loc(sorted(src.rglob("*.py")))
-        limit = {"remote": 700, "remote_server": 275}.get(src.parent.name, 200)
+        limit = {"memory": 650, "remote": 725, "remote_server": 275}.get(src.parent.name, 200)
         assert loc < limit, f"App {src.parent.name} budget exceeded: {loc} >= {limit}"
 
 
 def test_remote_has_two_product_packages():
     root = Path(__file__).resolve().parents[1]
     assert {p.parent.name for p in (root / "apps").glob("remote*/pyproject.toml")} == {"remote", "remote_server"}
+
+
+def test_installable_product_versions_are_aligned():
+    root = Path(__file__).resolve().parents[1]; files = [root/"pyproject.toml", *sorted((root/"apps").glob("*/pyproject.toml"))]
+    versions = {f.parent.name:tomllib.loads(f.read_text())["project"]["version"] for f in files}
+    assert set(versions.values()) == {"0.7.0"}, versions

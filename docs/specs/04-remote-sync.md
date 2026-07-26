@@ -13,7 +13,7 @@ status: accepted (2026-07-10)
 
 Convos synchronizes a global provenance graph across a person's computers and
 authorized team members without giving the server plaintext. Normal use is
-automatic: local hooks capture work, a background client publishes immutable
+automatic: local hooks capture work, a background client publishes signed
 events, and other clients update local search and graph projections. Explicit
 sync exists only for repair and backfill.
 
@@ -36,7 +36,8 @@ provider transcripts -> local convos DuckDB -> event projector -> encrypted outb
 
 - DuckDB is a rebuildable local search projection, not a wire format.
 - The local graph database is a rebuildable typed projection, not evidence.
-- Signed immutable events are durable evidence.
+- Signed events are durable evidence, except for the narrow personal-memory
+  privacy purge defined below.
 - The server stores ciphertext, public device records, workspace ACLs, key
   envelopes, opaque event headers, cursors, invitation state, and quotas.
 - Semantic search, embeddings, Git inspection, and graph queries execute only
@@ -118,8 +119,11 @@ a possible later key-management profile, not a v1 dependency.
 The signature covers every field except `signature`; the event id covers the
 body before `id` and `signature` are added. Unknown kinds and payload versions
 are retained and forwarded even when the local projector cannot interpret
-them. Events are never edited or deleted. Corrections, identity links,
-retractions, key changes, and tombstones are new events.
+them. Events are never edited. Corrections, identity links, retractions, key
+changes, and tombstones are new events. The sole deletion exception is an
+author-bound purge of superseded `memory.canonical` events from a personal
+workspace after its signed tombstone is durable. The relay keeps only opaque
+event-id replay-denial tombstones; team events cannot use this operation.
 
 Required initial kinds:
 
@@ -143,6 +147,16 @@ verify before persistence, and project in deterministic `(observed_at, id)`
 order where no causal relationship exists. Per-workspace, per-device `seq` and
 previous-event parents detect replay and interior gaps in either arrival order;
 clocks never establish causality.
+
+For personal-memory privacy deletion, a device may purge only explicit event
+ids that it authored and only after publishing the corresponding memory
+tombstone. Purge is idempotent: clients remove local ciphertext and decrypted
+event rows only after relay acknowledgement, while replay-denial tombstones
+prevent the same event ids from being uploaded again. Recipients remove an
+unchanged remote-only memory and its revisions; a locally changed memory or one
+with another provider origin or active projection survives, with the deleted
+remote origin redacted to hash and link metadata. This preserves conflicts
+instead of treating deletion as last-writer-wins.
 
 Large event bodies and attachments use encrypted blobs. Pull returns manifests;
 clients fetch bodies eagerly only when required for the active local projection
@@ -239,6 +253,8 @@ CLI.
 - Explicit sync reconciles the full local archive with the event ledger.
 - Server database and blob directory are backed up together from a consistent
   snapshot and restored without decryption.
+- Forget does not rewrite historical client or relay backups. Operators must
+  choose and enforce backup retention appropriate to their deletion policy.
 - Real archives and evaluation datasets remain local and untracked.
 
 ## Completion evidence

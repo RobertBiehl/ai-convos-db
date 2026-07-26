@@ -1,6 +1,6 @@
 [project]
 name = "ai-convos-db"
-version = "0.6.0"
+version = "0.7.0"
 description = "Local-first searchable memory for ChatGPT, Claude, Claude Code, and Codex agents"
 readme = "README.md"
 license = "MIT"
@@ -14,7 +14,11 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8.0.0", "pytest-asyncio>=0.23.0", "ai-convos-changegraph", "ai-convos-remote", "ai-convos-remote-server"]
+explore = ["ai-convos-explore>=0.7,<0.8"]
+memory = ["ai-convos-memory>=0.7,<0.8"]
+redact = ["ai-convos-redact>=0.7,<0.8"]
+resume = ["ai-convos-resume>=0.7,<0.8"]
+dev = ["pytest>=8.0.0", "pytest-asyncio>=0.23.0", "ai-convos-changegraph", "ai-convos-explore", "ai-convos-memory", "ai-convos-redact", "ai-convos-resume", "ai-convos-remote", "ai-convos-remote-server"]
 
 [project.scripts]
 convos = "ai_convos:app"
@@ -40,6 +44,10 @@ members = ["apps/*"]
 
 [tool.uv.sources]
 ai-convos-changegraph = { workspace = true }
+ai-convos-explore = { workspace = true }
+ai-convos-memory = { workspace = true }
+ai-convos-redact = { workspace = true }
+ai-convos-resume = { workspace = true }
 ai-convos-remote-server = { workspace = true }
 ai-convos-remote = { workspace = true }
 

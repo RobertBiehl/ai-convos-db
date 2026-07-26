@@ -27,6 +27,7 @@ CREATE TABLE IF NOT EXISTS key_envelopes(workspace TEXT,epoch INT,device TEXT,en
 CREATE TABLE IF NOT EXISTS workspace_device_exclusions(workspace TEXT,device TEXT,PRIMARY KEY(workspace,device));
 CREATE TABLE IF NOT EXISTS events(cursor INTEGER PRIMARY KEY AUTOINCREMENT,workspace TEXT,event TEXT,author TEXT,epoch INT,seq INT,envelope TEXT,wire_hash TEXT,created REAL,UNIQUE(workspace,event));
 CREATE UNIQUE INDEX IF NOT EXISTS event_author_sequence ON events(workspace,author,seq);
+CREATE TABLE IF NOT EXISTS event_tombstones(workspace TEXT,event TEXT,author TEXT,deleted REAL,PRIMARY KEY(workspace,event));
 CREATE TABLE IF NOT EXISTS workspace_controls(workspace TEXT,revision INT,state_hash TEXT UNIQUE,state TEXT,PRIMARY KEY(workspace,revision));
 CREATE TABLE IF NOT EXISTS device_proposals(id TEXT PRIMARY KEY,workspace TEXT,base TEXT,target_user TEXT,target_device TEXT,proposal TEXT,not_before REAL,expires REAL,active INT);
 CREATE TABLE IF NOT EXISTS device_votes(proposal TEXT,voter_user TEXT,voter_device TEXT,approve INT,vote TEXT,PRIMARY KEY(proposal,voter_user));
@@ -170,6 +171,7 @@ def rotate(db, actor, req):
 def store_event(db,actor,env):
     ws=env["workspace"]; device_member(db,ws,actor); epoch=db.execute("SELECT epoch FROM workspaces WHERE id=?",(ws,)).fetchone()[0]
     if env["author"]!=actor["id"] or env["epoch"]!=epoch: raise PermissionError("event author or epoch rejected")
+    if db.execute("SELECT 1 FROM event_tombstones WHERE workspace=? AND event=?",(ws,env["event"])).fetchone(): raise ValueError("event was purged")
     wire=digest(env); old=db.execute("SELECT wire_hash,cursor FROM events WHERE workspace=? AND event=?",(ws,env["event"])).fetchone()
     if old:
         if old["wire_hash"]!=wire: raise ValueError("event id already has different ciphertext")
@@ -227,6 +229,12 @@ def action(db, req, token=None):
     if op == "upload_many":
         if len(req["envelopes"])>500: raise ValueError("upload batch limit is 500")
         result=[store_event(db,actor,env) for env in req["envelopes"]]; db.commit(); return {"events":result}
+    if op == "purge":
+        ids=req.get("events"); ws=req.get("workspace")
+        if not isinstance(ids,list) or not ids or len(ids)>500 or len(set(ids))!=len(ids) or any(not isinstance(e,str) for e in ids): raise ValueError("purge requires 1 to 500 unique event ids")
+        device_member(db,ws,actor); kind=db.execute("SELECT kind FROM workspaces WHERE id=?",(ws,)).fetchone()[0]; found={r["event"]:r["author"] for r in rows(db,f"SELECT event,author FROM events WHERE workspace=? AND event IN ({','.join('?'*len(ids))})",(ws,*ids))}|{r["event"]:r["author"] for r in rows(db,f"SELECT event,author FROM event_tombstones WHERE workspace=? AND event IN ({','.join('?'*len(ids))})",(ws,*ids))}
+        if kind!="personal" or any(found.get(e)!=actor["id"] for e in ids): raise PermissionError("event purge denied")
+        [db.execute("INSERT OR IGNORE INTO event_tombstones VALUES (?,?,?,?)",(ws,e,actor["id"],time.time())) for e in ids]; db.execute(f"DELETE FROM events WHERE workspace=? AND event IN ({','.join('?'*len(ids))})",(ws,*ids)); db.commit(); return {"purged":len(ids)}
     if op == "pull":
         m = device_member(db,req["workspace"],actor); out = rows(db, "SELECT cursor,event,envelope,LENGTH(envelope) size FROM events WHERE workspace=? AND cursor>? AND epoch>=? AND EXISTS(SELECT 1 FROM key_envelopes k WHERE k.workspace=events.workspace AND k.epoch=events.epoch AND k.device=?) ORDER BY cursor LIMIT ?", (req["workspace"],req.get("after",0),m["history_from"],actor["id"],req.get("limit",500)))
         return {"events":[{"cursor":r["cursor"],**({"lazy":True,"event":r["event"],"size":r["size"]} if r["size"]>65536 else {"envelope":json.loads(r["envelope"])})} for r in out]}

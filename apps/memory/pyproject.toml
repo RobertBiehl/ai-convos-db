@@ -1,0 +1,34 @@
+[project]
+name = "ai-convos-memory"
+version = "0.7.0"
+description = "Cross-provider memory revision tracking and agent-assisted synchronization for ai-convos-db"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.12"
+dependencies = ["ai-convos-db>=0.7,<0.8", "typer>=0.12.0"]
+
+[project.urls]
+Documentation = "https://github.com/RobertBiehl/ai-convos-db/blob/master/docs/memory.md"
+Repository = "https://github.com/RobertBiehl/ai-convos-db"
+
+[project.entry-points."convos.commands"]
+memory = "ai_convos_memory:register"
+
+[project.entry-points."convos.init"]
+memory = "ai_convos_memory:initialize"
+
+[project.entry-points."convos.doctor"]
+memory = "ai_convos_memory:doctor_status"
+
+[project.entry-points."convos.remote"]
+memory = "ai_convos_memory:remote_bridge"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.uv.sources]
+ai-convos-db = { workspace = true }

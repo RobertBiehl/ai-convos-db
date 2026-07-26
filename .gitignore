@@ -18,4 +18,5 @@ dist/
 
 data/
 *.db
+pulse.html
 .DS_Store

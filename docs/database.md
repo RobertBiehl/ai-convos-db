@@ -137,8 +137,9 @@ ORDER BY score DESC
 `embedding` column using DuckDB's built-in `array_cosine_similarity`. Top-50
 from each source is fused with Reciprocal Rank Fusion (`SUM(1/(60+rank))`),
 then the strongest message from each conversation is returned in fused order.
-Source/day/role filters are applied before candidate selection; injected skill
-and local-command wrapper messages are excluded from semantic candidates.
+Source/day/role/cwd/conversation filters are applied before candidate selection;
+injected skill and local-command wrapper messages are excluded from semantic
+candidates. A cwd filter includes the exact recorded path and descendants.
 
 Embeddings are produced by embeddinggemma-300M (768d) with the
 `task: search result | document:` prefix at index time and `query:` at query
@@ -148,6 +149,12 @@ Use `convos embed` to backfill missing embeddings without fetching from web
 APIs. Hooks and `convos sync` queue new or changed messages for just-in-time
 embedding by `convos query`. Inference runs without a database lock; only each
 result batch update is locked.
+
+Installed applications can call
+`ai_convos.cli.hybrid_hits(query, source, days, role, limit, local_only=False, cwd=None, conversation=None)`
+for the same ordered, one-hit-per-conversation records without parsing CLI
+output. Records retain full content plus exact message and conversation IDs.
+`local_only=True` forbids an implicit retrieval-model download.
 
 The `embedding` column is preserved across upserts when message `content`
 is unchanged, so only new or edited messages are queued again.

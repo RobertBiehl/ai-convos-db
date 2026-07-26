@@ -12,9 +12,37 @@ read_when:
 
 Single-file CLI that normalizes conversations from multiple AI providers into a unified DuckDB database with full-text search.
 
-Two optional packages add the remote client, local provenance projection, and
-self-hosted E2EE relay without changing the core storage contract. See
-[`specs/04-remote-sync.md`](specs/04-remote-sync.md) and [`remote.md`](remote.md).
+Optional installable products add change provenance, semantic trails,
+deterministic project handoff and session replay, secret-safe sharing, memory
+synchronization, the remote client, and a self-hosted E2EE relay without
+changing the core conversation contract. See [semantic
+exploration](explore.md), [project handoff and replay](resume.md), [secret
+protection](redact.md), [memory synchronization](memory.md), and
+[`remote.md`](remote.md).
+
+Resume also exposes deterministic conversation replay: it selects a bounded
+message window, then joins tool calls and file edits only by those exact message
+IDs. This gives humans and agents one ordered, explicitly truncated view of
+captured activity without a browser or generation model.
+The memory product separates device-local checkout paths from repository scope:
+normalized origin evidence identifies clones and worktrees, root commits provide
+a fallback lineage anchor, and differing fork origins remain isolated.
+When both optional clients are installed, an entry-point adapter maps canonical
+memory revisions onto signed encrypted personal-workspace events. Incoming
+events remain normal revisioned sources in the memory ledger, so deterministic
+one-sided advances converge while concurrent semantic changes use the existing
+plan/resolve/apply path. Team workspaces never receive memory events.
+The adapter partitions large UTF-8 canonical content into independently signed
+encrypted records below the relay's lazy threshold and publishes no partial
+local canonical until hash-verified reassembly completes.
+Exact archive evidence belongs to the device-local memory ledger and one
+canonical revision hash. It stores only archive identity and content hashes,
+renders direct local read pivots, and is omitted from remote canonical events.
+After a user-owned forget tombstone is durably uploaded, the adapter asks the
+relay to remove only the same device author's prior personal canonical event
+IDs. The relay keeps an opaque replay-denial tombstone; recipients erase their
+decrypted event copies and purge a canonical only when it remains remote-only
+and unchanged.
 
 ```
 ┌─────────────────┐     ┌─────────────────┐     ┌─────────────────┐
@@ -40,9 +68,30 @@ self-hosted E2EE relay without changing the core storage contract. See
 
 ## Key Design Decisions
 
-### Single File
+### Single-file core
 
-All logic lives in `src/ai_convos/cli.py`. This keeps the codebase simple and avoids import complexity. The file (and total `src/ai_convos/`) is held under the 1000-line budget enforced by `tests/test_budget.py`.
+All core ingest, schema, and retrieval logic lives in `src/ai_convos/cli.py`.
+Installable applications live under `apps/` and attach through entry points.
+The `convos.commands` group registers commands, `convos.doctor` contributes
+diagnostics, and `convos.init` performs explicitly bounded setup after core
+initialization. Init callbacks must be local, idempotent, and non-destructive;
+model downloads, remote configuration, credentials, and network enrollment
+always require their product's explicit command.
+Core initialization also runs the ordinary sync pipeline in `--local-only`
+mode. It honors configured Codex and Claude roots, imports local agent sessions
+and configured export paths incrementally, and does not plan either web source
+or load the embedding model.
+The same bundled-skill resolver powers installation and `doctor`. Health is
+content-exact rather than version-label based: each regular non-symlink managed
+copy must match the wheel's bundled `SKILL.md`, so upgrades cannot silently
+leave one agent on stale retrieval policy.
+Capture hooks use the same exact-state rule. Their managed command pins the
+`convos` executable beside the running interpreter plus the resolved archive
+root. Health requires one exact handler in each provider event, preventing an
+old tool path, duplicate, or misplaced lifecycle handler from masquerading as
+working capture.
+The total `src/ai_convos/` core remains under the 1000-line budget enforced by
+`tests/test_budget.py`; every application has its own honest product budget.
 
 ### ParseResult Normalization
 
@@ -83,6 +132,13 @@ Pipeline: filtered BM25 top-50 ∪ cosine top-50 → Reciprocal Rank Fusion → 
 strongest message per conversation.
 The embedding model loads lazily, so users pay model startup/download cost only
 when using `convos query` or `convos embed`.
+
+`hybrid_hits()` is the public in-process form of that pipeline for installed
+applications. It returns untruncated exact turn records and accepts
+`local_only=True` when an application must fail rather than download a missing
+retrieval model. This also applies while embedding pending hook messages.
+Installed retrieval products can use that mode; generation and presentation
+remain outside core.
 
 Literal `search` is conversation-first as well: BM25 ranks messages, then only
 the strongest matching message from each conversation consumes a result slot.
@@ -125,7 +181,8 @@ ai-convos-db/
 ├── src/ai_convos/
 │   ├── __init__.py      # exports app
 │   ├── cli.py           # all logic
-│   └── browser.py       # playwright helpers (optional)
+│   └── __main__.py      # module entry point
+├── apps/                # optional user-installable products
 ├── data/
 │   └── convos.db        # DuckDB database
 ├── tests/

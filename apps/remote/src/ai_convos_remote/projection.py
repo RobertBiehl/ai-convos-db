@@ -1,6 +1,8 @@
 """Portable record/event projection. The immutable event ledger can rebuild every local view."""
 import base64, hashlib, json, os, sqlite3
 from datetime import date, datetime
+from functools import lru_cache
+from importlib.metadata import entry_points
 from pathlib import Path
 
 import duckdb
@@ -28,19 +30,26 @@ COLUMNS={"conversations":["id","source","title","created_at","updated_at","model
 FKS={"messages":(("conversation_id","conversations"),("parent_id","messages")),"tool_calls":(("message_id","messages"),),"attachments":(("message_id","messages"),),"artifacts":(("conversation_id","conversations"),),"file_edits":(("message_id","messages"),)}
 
 def connect(path): db=graph_connect(path); db.executescript(STATE); return db
+@lru_cache(maxsize=1)
+def bridges():
+    result=[entry.load()() for entry in entry_points(group="convos.remote")]
+    if any(set(b)!={"v","records","project","purges"} or b["v"]!=2 or isinstance(b["v"],bool) or any(not callable(b[k]) for k in ("records","project","purges")) for b in result): raise ValueError("Unsupported remote bridge")
+    return result
+def bridge_records(root,state,workspace,kind): return [record for bridge in bridges() for record in bridge["records"](root,state,workspace,kind)]
+def bridge_purges(root,state,workspace,kind): return sorted({event for bridge in bridges() for event in bridge["purges"](root,state,workspace,kind)})
 def clean(v):
     if isinstance(v,(datetime,date)): return v.isoformat()
     if isinstance(v,dict): return {k:clean(x) for k,x in v.items()}
     if isinstance(v,(list,tuple)): return [clean(x) for x in v]
     return v
-def _records(core,state):
+def _records(core,state,blobs=True):
     out=[]; imported={(r[0],r[1]) for r in state.execute("SELECT table_name,row_id FROM imported_rows").fetchall()}
     for kind,table in TABLES.items():
         cur=core.execute(f"SELECT * EXCLUDE (embedding) FROM {table}" if table=="messages" else f"SELECT * FROM {table}"); cols=[d[0] for d in cur.description]
         for values in cur.fetchall():
             row=dict(zip(cols,map(clean,values))); attachment=Path(row["path"]).expanduser() if table=="attachments" and row.get("path") else None; row["embedding"]=None if "embedding" in row else row.get("embedding"); row["cwd"]=None if table=="conversations" else row.get("cwd"); row["path"]=None if table=="attachments" else row.get("path")
             if (table,row["id"]) not in imported: out.append(dict(kind=kind,entity=f"{table}:{row['id']}",payload=dict(table=table,columns=cols,row=[row[c] for c in cols])))
-            if attachment and attachment.is_file() and (table,row["id"]) not in imported:
+            if blobs and attachment and attachment.is_file() and (table,row["id"]) not in imported:
                 data=attachment.read_bytes(); blob=hashlib.sha256(data).hexdigest(); chunks=[data[i:i+49152] for i in range(0,len(data),49152)] or [b""]
                 out += [dict(kind="attachment.chunk",entity=f"attachment:{row['id']}:{blob}:{i}",payload={"attachment":row["id"],"blob":blob,"index":i,"total":len(chunks),"sha256":blob,"size":len(data),"data":base64.b64encode(chunk).decode()}) for i,chunk in enumerate(chunks)]
     return out
@@ -56,7 +65,7 @@ def _team_scope(core,provenance,repositories,roots):
             if prompt:=core.execute("SELECT id FROM messages WHERE conversation_id=? AND role='user' AND created_at<=(SELECT created_at FROM messages WHERE id=?) ORDER BY created_at DESC LIMIT 1",(row[0],turn)).fetchone(): users.add(prompt[0])
     return convs,turns|users,cs,origins
 def scan(core,graph,device,kind="personal",repositories=(),roots=()):
-    provenance=capture_graph(core,graph,device); records=_records(core,graph); imported={r[0] for r in graph.execute("SELECT row_id FROM imported_rows WHERE table_name='file_edits'").fetchall()}; blocked={r["payload"]["changeset"] for r in provenance if r["kind"]=="edit.observed" and r["payload"]["origin"] in imported}; provenance=[r for r in provenance if not (r["kind"]=="edit.observed" and r["payload"]["origin"] in imported or r["kind"] in ("changeset.observed","checkpoint.link") and r["payload"].get("id",r["payload"].get("changeset")) in blocked)]
+    provenance=capture_graph(core,graph,device); records=_records(core,graph,kind=="personal"); imported={r[0] for r in graph.execute("SELECT row_id FROM imported_rows WHERE table_name='file_edits'").fetchall()}; blocked={r["payload"]["changeset"] for r in provenance if r["kind"]=="edit.observed" and r["payload"]["origin"] in imported}; provenance=[r for r in provenance if not (r["kind"]=="edit.observed" and r["payload"]["origin"] in imported or r["kind"] in ("changeset.observed","checkpoint.link") and r["payload"].get("id",r["payload"].get("changeset")) in blocked)]
     edit_paths={r["payload"]["origin"]:r["payload"]["file"] for r in provenance if r["kind"]=="edit.observed"}; file_paths={r["payload"]["id"]:r["payload"]["path"] for r in provenance if r["kind"]=="file.observed"}
     for r in records:
         if r["kind"]=="file_edit.record" and (fid:=edit_paths.get(r["payload"]["row"][0])): r["payload"]["row"][2]=file_paths[fid]
@@ -100,7 +109,7 @@ def apply_record(db_path,state,value,workspace,local_device=None,db=None):
     state.execute("INSERT OR REPLACE INTO heads VALUES (?,?,?,?)",(workspace,head,sort,value["id"])); state.execute("INSERT OR REPLACE INTO imported_rows VALUES (?,?,?)",(table,values[0],value["id"]));
     if own: state.commit()
     return True
-def project(db_path,state,value,workspace,local_device=None,db=None):
+def project(db_path,state,value,workspace,local_device=None,db=None,root=None):
     if value["kind"] in TABLES: return apply_record(db_path,state,value,workspace,local_device,db)
     if value["kind"]=="workspace.policy":
         p=value["payload"]; state.execute("INSERT OR REPLACE INTO policies VALUES (?,?,?,COALESCE((SELECT local_root FROM policies WHERE workspace=? AND kind=? AND value=?),NULL))",(workspace,p["kind"],p["value"],workspace,p["kind"],p["value"])); state.commit(); return True
@@ -118,11 +127,14 @@ def project(db_path,state,value,workspace,local_device=None,db=None):
             path=Path(db_path).parent.parent/"remote/attachments"/workspace/p["blob"]; path.parent.mkdir(parents=True,exist_ok=True); tmp=path.with_name(f".{path.name}.{os.getpid()}"); tmp.write_bytes(content); os.chmod(tmp,0o600); os.replace(tmp,path); state.execute("INSERT OR REPLACE INTO attachment_blobs VALUES (?,?,?,?)",(workspace,value["author"],p["attachment"],str(path))); state.execute("DELETE FROM attachment_chunks WHERE workspace=? AND author=? AND blob=?",(workspace,value["author"],p["blob"])); target=foreign_id(workspace,value["author"],"attachments",p["attachment"]); target_db=db or (duckdb.connect(str(db_path)) if Path(db_path).exists() else None)
             if target_db: target_db.execute("UPDATE attachments SET path=? WHERE id=?",(str(path),target)); db or target_db.close()
         state.commit(); return True
+    if root is not None:
+        for bridge in bridges():
+            if (result:=bridge["project"](root,state,value,workspace,local_device)) is not None: return result
     return project_graph(state,value,workspace)
-def project_many(db_path,state,items,local_device=None):
+def project_many(db_path,state,items,local_device=None,root=None):
     records=any(v["kind"] in TABLES and v["author"]!=local_device for _,v in items); db=None
     if records: Path(db_path).parent.mkdir(parents=True,exist_ok=True); db=duckdb.connect(str(db_path)); init_schema(db)
-    try: [project(db_path,state,v,ws,local_device,db) for ws,v in items]
+    try: [project(db_path,state,v,ws,local_device,db,root) for ws,v in items]
     finally:
         if db: db.close()
     state.commit(); return len(items)
