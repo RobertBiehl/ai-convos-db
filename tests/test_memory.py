@@ -24,8 +24,8 @@ def test_memory_distribution_metadata_and_public_help():
     assert {"scan","plan","apply","reconcile","context","install-hook","project","runtime-hook","adopt-scope"} <= hidden
     for command, description in (("current","List current synchronized memories"),("audit","Check whether remembered conversation evidence"),("context","Render agent-ready"),("review","Read memory changes that still need a decision"),("remember","Create or revise a memory you own"),("forget","Delete a memory created with remember"),("backup","Save a private backup of all memory"),("restore","Preview or restore a complete memory backup"),("install-hook","Install, inspect, or remove"),("history","Show a memory's exact revision history")):
         result = CliRunner().invoke(memory, [command,"--help"]); assert result.exit_code == 0 and description in result.output
-    remember_help=CliRunner().invoke(memory,["remember","--help"]).output; forget_help=CliRunner().invoke(memory,["forget","--help"]).output
-    assert "--from" in remember_help and "repeatable" in remember_help and "--replace" in remember_help and "ID, title, or text" in remember_help+forget_help and "--project" in remember_help+forget_help and "--scope" not in remember_help+forget_help
+    remember,forget=commands["remember"],commands["forget"]; options=lambda command:{opt for param in command.params for opt in param.opts}; descriptions=" ".join((param.help or "") for command in (remember,forget) for param in command.params)
+    assert {"--from","--replace","--project"} <= options(remember) and "--project" in options(forget) and "--scope" not in options(remember)|options(forget) and "repeatable" in descriptions and "ID, title, or text" in descriptions
 def codex_memory(root, content="alpha", scope="/repo"):
     (root/"MEMORY.md").write_text(f"# Task Group: Core choice\n\nscope: test\napplies_to: cwd={scope}; reuse_rule=safe\n\n## Reusable knowledge\n\n- {content}\n")
 def claude_memory(root, content="beta"):
