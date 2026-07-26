@@ -16,7 +16,7 @@ members = [
 
 [[package]]
 name = "ai-convos-changegraph"
-version = "0.1.0"
+version = "0.7.0"
 source = { editable = "apps/changegraph" }
 dependencies = [
     { name = "ai-convos-db" },
@@ -33,7 +33,7 @@ requires-dist = [
 
 [[package]]
 name = "ai-convos-db"
-version = "0.6.0"
+version = "0.7.0"
 source = { editable = "." }
 dependencies = [
     { name = "cryptography" },
@@ -93,7 +93,7 @@ provides-extras = ["explore", "memory", "redact", "resume", "dev"]
 
 [[package]]
 name = "ai-convos-explore"
-version = "0.1.0"
+version = "0.7.0"
 source = { editable = "apps/explore" }
 dependencies = [
     { name = "ai-convos-db" },
@@ -108,7 +108,7 @@ requires-dist = [
 
 [[package]]
 name = "ai-convos-memory"
-version = "0.1.0"
+version = "0.7.0"
 source = { editable = "apps/memory" }
 dependencies = [
     { name = "ai-convos-db" },
@@ -123,7 +123,7 @@ requires-dist = [
 
 [[package]]
 name = "ai-convos-redact"
-version = "0.1.0"
+version = "0.7.0"
 source = { editable = "apps/redact" }
 dependencies = [
     { name = "ai-convos-db" },
@@ -138,7 +138,7 @@ requires-dist = [
 
 [[package]]
 name = "ai-convos-remote"
-version = "0.6.0"
+version = "0.7.0"
 source = { editable = "apps/remote" }
 dependencies = [
     { name = "ai-convos-db" },
@@ -157,7 +157,7 @@ requires-dist = [
 
 [[package]]
 name = "ai-convos-remote-server"
-version = "0.6.0"
+version = "0.7.0"
 source = { editable = "apps/remote_server" }
 dependencies = [
     { name = "cryptography" },
@@ -168,7 +168,7 @@ requires-dist = [{ name = "cryptography", specifier = ">=42.0.0" }]
 
 [[package]]
 name = "ai-convos-resume"
-version = "0.1.0"
+version = "0.7.0"
 source = { editable = "apps/resume" }
 dependencies = [
     { name = "ai-convos-db" },

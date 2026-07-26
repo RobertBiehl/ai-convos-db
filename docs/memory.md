@@ -128,7 +128,7 @@ uv tool install --reinstall "git+https://github.com/RobertBiehl/ai-convos-db.git
   --with "ai-convos-memory @ git+https://github.com/RobertBiehl/ai-convos-db.git#subdirectory=apps/memory"
 ```
 
-Memory 0.1 supports `ai-convos-db>=0.6,<0.7`. The package metadata enforces
+Memory 0.7 supports `ai-convos-db>=0.7,<0.8`. The package metadata enforces
 that contract, so an independently installed memory wheel cannot silently pair
 with an unsupported core CLI.
 `init` installs both agent skill copies, core capture hooks, and both agents'

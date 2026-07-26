@@ -417,7 +417,7 @@ def _codex_hook_trust(command, cwd):
     process = None
     try:
         process = subprocess.Popen([binary,"app-server","--stdio"], cwd=cwd, text=True, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL); output = queue.Queue(); threading.Thread(target=_rpc_reader,args=(process.stdout,output),daemon=True).start()
-        process.stdin.write(json.dumps({"id":1,"method":"initialize","params":{"clientInfo":{"name":"ai-convos-memory","title":"ai-convos-memory","version":"0.1.0"}}})+"\n"); process.stdin.flush(); _rpc_wait(output, 1)
+        process.stdin.write(json.dumps({"id":1,"method":"initialize","params":{"clientInfo":{"name":"ai-convos-memory","title":"ai-convos-memory","version":"0.7.0"}}})+"\n"); process.stdin.flush(); _rpc_wait(output, 1)
         process.stdin.write(json.dumps({"method":"initialized","params":{}})+"\n"+json.dumps({"id":2,"method":"hooks/list","params":{"cwds":[cwd]}})+"\n"); process.stdin.flush(); result = _rpc_wait(output, 2)
         return next((h["trustStatus"] for row in result["data"] for h in row["hooks"] if h["command"] == command), "missing")
     except (OSError, ValueError, KeyError, TypeError, TimeoutError): return "unknown"

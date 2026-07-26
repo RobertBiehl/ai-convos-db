@@ -31,7 +31,7 @@ matching approval step. New projects bootstrap automatically on their first
 context delivery, so there is no per-project enable ritual. Use `convos memory
 enable --all` to warm every already-discovered project during setup.
 
-The 0.1 release requires `ai-convos-db>=0.6,<0.7`; installers reject older or
+The 0.7 release requires `ai-convos-db>=0.7,<0.8`; installers reject older or
 newer incompatible core releases instead of creating a broken mixed-version
 CLI.
 

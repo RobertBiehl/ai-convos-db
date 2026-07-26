@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.7.0
 
 - Avoid downloading legacy ChatGPT conversations already covered by a completed
   account-scoped sync frontier; normal sync now fetches their details only after
