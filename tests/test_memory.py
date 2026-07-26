@@ -1,7 +1,7 @@
 import json, os, sqlite3, subprocess, sys, tomllib
 from pathlib import Path
 
-import duckdb, pytest
+import duckdb, pytest, typer
 from typer.testing import CliRunner
 import ai_convos_memory as memory_module
 from ai_convos_memory import _current, adopt_scope_data, apply_data, audit_data, backup_data, context_data, context_hook_config, doctor_status, initialize, memory, plan_data, projection_data, reconcile_data, remote_project, remote_records, remove_projection, restore_data, runtime_context, scan_store, sync_all_data, sync_data, write_projection
@@ -19,9 +19,9 @@ def test_memory_product_import_does_not_reenter_core_plugins():
 def test_memory_distribution_metadata_and_public_help():
     root = Path(__file__).resolve().parents[1]; project = tomllib.loads((root/"apps"/"memory"/"pyproject.toml").read_text())["project"]; core = tomllib.loads((root/"pyproject.toml").read_text())["project"]
     assert project["readme"] == "README.md" and set(project["urls"]) == {"Documentation","Repository"} and "ai-convos-db>=0.6,<0.7" in project["dependencies"] and project["entry-points"]["convos.init"] == {"memory":"ai_convos_memory:initialize"} and project["entry-points"]["convos.remote"] == {"memory":"ai_convos_memory:remote_bridge"} and memory_module.remote_bridge()["v"] == 2 and set(memory_module.remote_bridge()) == {"v","records","project","purges"} and core["optional-dependencies"]["memory"] == ["ai-convos-memory>=0.1,<0.2"]
-    overview = CliRunner().invoke(memory, ["--help"]).output
-    assert all(f"│ {command}" in overview for command in ("status","audit","sync","review","remember","forget","backup","restore","enable","disable","current","history"))
-    assert all(f"│ {command}" not in overview for command in ("scan","plan","apply","reconcile","context","install-hook","project","runtime-hook","adopt-scope"))
+    commands=typer.main.get_command(memory).commands; public={name for name,command in commands.items() if not command.hidden}; hidden={name for name,command in commands.items() if command.hidden}
+    assert {"status","audit","sync","review","remember","forget","backup","restore","enable","disable","current","history"} <= public
+    assert {"scan","plan","apply","reconcile","context","install-hook","project","runtime-hook","adopt-scope"} <= hidden
     for command, description in (("current","List current synchronized memories"),("audit","Check whether remembered conversation evidence"),("context","Render agent-ready"),("review","Read memory changes that still need a decision"),("remember","Create or revise a memory you own"),("forget","Delete a memory created with remember"),("backup","Save a private backup of all memory"),("restore","Preview or restore a complete memory backup"),("install-hook","Install, inspect, or remove"),("history","Show a memory's exact revision history")):
         result = CliRunner().invoke(memory, [command,"--help"]); assert result.exit_code == 0 and description in result.output
     remember_help=CliRunner().invoke(memory,["remember","--help"]).output; forget_help=CliRunner().invoke(memory,["forget","--help"]).output

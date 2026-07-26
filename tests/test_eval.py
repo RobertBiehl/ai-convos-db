@@ -18,8 +18,8 @@ def cases(path,rows):
 
 
 def test_development_tool_help():
-    help_=CliRunner().invoke(app(),["eval","--help"]).output
-    assert all(word in help_ for word in ("exact-ID","--mode","--min-hit-rate","--format"))
+    command=typer.main.get_command(app()).commands["eval"]; options={opt for param in command.params for opt in param.opts}
+    assert "exact-ID" in command.help and {"--mode","--min-hit-rate","--format"} <= options
 
 
 @pytest.mark.parametrize("row,error",[

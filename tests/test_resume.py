@@ -25,8 +25,8 @@ def archive(tmp_path,monkeypatch):
 def test_distribution_metadata_registration_and_help():
     project=tomllib.loads((Path(__file__).parents[1]/"apps/resume/pyproject.toml").read_text())["project"]; core=tomllib.loads((Path(__file__).parents[1]/"pyproject.toml").read_text())["project"]
     assert project["dependencies"][:2]==["ai-convos-db>=0.6,<0.7","ai-convos-redact>=0.1,<0.2"] and project["entry-points"]["convos.commands"]=={"resume":"ai_convos_resume:register"} and core["optional-dependencies"]["resume"]==["ai-convos-resume>=0.1,<0.2"]
-    help_=CliRunner().invoke(app(),["resume","--help"]).output; replay=CliRunner().invoke(app(),["replay","--help"]).output
-    assert all(word in help_ for word in ("handoff","--turns","--budget","--format")) and all(word in replay for word in ("messages","tool calls","edits","--activity"))
+    commands=typer.main.get_command(app()).commands; handoff,replay=commands["resume"],commands["replay"]; options=lambda command:{opt for param in command.params for opt in param.opts}
+    assert "handoff" in handoff.help and {"--turns","--budget","--format"} <= options(handoff) and all(word in replay.help for word in ("messages","tool calls","edits")) and "--activity" in options(replay)
 
 
 def test_packet_combines_live_git_and_exact_scope_isolated_archive_evidence(tmp_path,monkeypatch):
