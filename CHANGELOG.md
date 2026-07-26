@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Avoid downloading legacy ChatGPT conversations already covered by a completed
+  account-scoped sync frontier; normal sync now fetches their details only after
+  new activity moves them above that frontier.
 - Capture direct Codex `apply_patch` custom-tool events as raw patches instead
   of scanning their diff text as JavaScript. Custom edits are recorded only
   after definite tool success; failed attempts remain auditable tool calls with

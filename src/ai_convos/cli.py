@@ -329,7 +329,7 @@ def fetch_chatgpt(browser: str = "safari", limit: int = 0, profiles: list[str | 
             listed += items[:cut]
             if stop or reported is not None and offset+len(raw) >= reported: break
             offset += max(1, len(raw)-20)
-        page = [it for it in listed if (cid := gen_id("chatgpt", it["id"])) not in known or known[cid] is None or (updated := ts_any(it.get("update_time"))) is None or updated.timestamp() > known[cid]+(5 if cid in legacy else 0)][:limit or len(listed)]
+        page = [it for it in listed if (cid := gen_id("chatgpt", it["id"])) not in known or known[cid] is None or (updated := ts_any(it.get("update_time"))) is None or updated.timestamp() > (frontier.timestamp() if frontier and cid in legacy else known[cid]+(5 if cid in legacy else 0))][:limit or len(listed)]
         if len(page) > CHATGPT_BURST: typer.echo(f"  chatgpt pacing bulk fetch ({CHATGPT_BURST} burst, then {int(CHATGPT_RATE*300)} requests/5m)")
         for at in range(0, len(page), 20):
             results = []

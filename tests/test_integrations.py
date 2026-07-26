@@ -204,6 +204,17 @@ class TestChatGPTAPI:
         monkeypatch.setattr(cli,"fetch_json",fake); known = {cli.gen_id("chatgpt",x):100 for x in ("legacy","exact")}; cli.fetch_chatgpt("safari",known=known,legacy={cli.gen_id("chatgpt","legacy")})
         assert details==["exact"]
 
+    def test_fetch_chatgpt_completed_frontier_covers_legacy_rows(self, monkeypatch):
+        from ai_convos import cli
+        monkeypatch.setattr(cli,"chatgpt_profiles",lambda _:[None]); monkeypatch.setattr(cli,"chatgpt_cookie_base",lambda *a,**k:({},"https://chatgpt.com")); monkeypatch.setattr(cli,"chatgpt_headers",lambda *a,**k:{"ChatGPT-Account-ID":"acct"}); details = []
+        items = [{"id":"legacy-changed","update_time":301},{"id":"legacy-at","update_time":300},{"id":"legacy-old","update_time":299},{"id":"exact-changed","update_time":250},{"id":"new","update_time":200}]
+        def fake(url,*a,**k):
+            if "/conversations?" in url: return {"items":items,"total":len(items)}
+            details.append(url.rsplit("/",1)[-1]); return {"mapping":{}}
+        known = {cli.gen_id("chatgpt",x):100 for x in ("legacy-changed","legacy-at","legacy-old","exact-changed")}; legacy = {cli.gen_id("chatgpt",x) for x in ("legacy-changed","legacy-at","legacy-old")}
+        monkeypatch.setattr(cli,"fetch_json",fake); cli.fetch_chatgpt("safari",known=known,legacy=legacy,frontiers={"default":{"account":"acct","updated":300}})
+        assert details==["legacy-changed","exact-changed","new"]
+
     def test_fetch_chatgpt_stops_below_completed_update_frontier(self, monkeypatch):
         from ai_convos import cli
         monkeypatch.setattr(cli, "chatgpt_profiles", lambda _: [None]); monkeypatch.setattr(cli, "chatgpt_cookie_base", lambda *a, **k: ({}, "https://chatgpt.com")); monkeypatch.setattr(cli, "chatgpt_headers", lambda *a, **k: {"ChatGPT-Account-ID":"acct"}); lists, details = [], []
