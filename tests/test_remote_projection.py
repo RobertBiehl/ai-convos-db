@@ -5,8 +5,9 @@ import duckdb
 import pytest
 from ai_convos.cli import init_schema
 import ai_convos_remote.projection as projection_module
+from ai_convos_remote import publish
 from ai_convos_remote.projection import bridges, connect, project, rebuild, scan, sequence
-from ai_convos_remote.protocol import event, identity, seal_history
+from ai_convos_remote.protocol import b64, event, identity, seal_history
 
 
 def git(path,*args): return subprocess.run(("git","-C",str(path),*args),check=True,capture_output=True).stdout.decode().strip()
@@ -22,6 +23,20 @@ def test_personal_scan_strips_local_roots_and_rebuilds_duckdb(tmp_path):
     for i,value in enumerate(events): state.execute("INSERT INTO event_log VALUES (?,?,?,?,?,?)",("personal",value["id"],i,"in",json.dumps(value),"{}")); project(tmp_path/"target.db",state,value,"personal","other-device")
     target=duckdb.connect(str(tmp_path/"target.db"),read_only=True); assert target.execute("SELECT title,cwd FROM conversations").fetchone()==("title",None); assert target.execute("SELECT content FROM messages WHERE role='user'").fetchone()[0]=="change it"; assert target.execute("SELECT file_path FROM file_edits").fetchone()[0]=="a.py"; target.close()
     before=state.execute("SELECT COUNT(*) FROM edits").fetchone()[0]; (tmp_path/"target.db").unlink(); assert rebuild(tmp_path/"target.db",state)==len(events); assert duckdb.connect(str(tmp_path/"target.db"),read_only=True).execute("SELECT COUNT(*) FROM messages").fetchone()[0]==2 and state.execute("SELECT COUNT(*) FROM edits").fetchone()[0]==before
+
+
+def test_unchanged_provenance_does_not_republish_but_file_change_does(tmp_path):
+    repo,core=source(tmp_path); state=connect(tmp_path/"state.db"); device=identity(); ws="personal"; cfg={"device":device,"workspaces":{ws:{"kind":"personal","epoch":1}},"keys":{f"{ws}:1":b64(bytes(range(32)))}}; known=set()
+    first=scan(core,state,device["id"]); timed=[r for r in first if r["kind"] in ("git.checkpoint","file.version","capture.gap")]; assert timed and all("observed_at" in r and "observed_at" not in r["payload"] for r in timed)
+    assert all(publish(cfg,state,ws,r,tmp_path/"client",True,known) for r in first); baseline=state.execute("SELECT COUNT(*) FROM event_log").fetchone()[0]
+    assert not any(publish(cfg,state,ws,r,tmp_path/"client",True,known) for r in scan(core,state,device["id"])) and state.execute("SELECT COUNT(*) FROM event_log").fetchone()[0]==baseline
+    (repo/"a.py").write_text("changed\n"); emitted={r["kind"] for r in scan(core,state,device["id"]) if publish(cfg,state,ws,r,tmp_path/"client",True,known)}
+    assert emitted=={"git.checkpoint","file.version"} and state.execute("SELECT COUNT(*) FROM event_log").fetchone()[0]==baseline+2
+
+
+def test_provenance_projection_accepts_legacy_payload_timestamp(tmp_path):
+    state=connect(tmp_path/"state.db"); device=identity(); payload={"id":"v","file":"f","content_hash":"h","observed_at":"2025-01-01T00:00:00Z"}; project(tmp_path/"db",state,event(device,1,"file.version","v",payload,[],"2026-01-01T00:00:00Z"),"w")
+    assert state.execute("SELECT observed_at FROM file_versions WHERE id='v'").fetchone()[0]=="2025-01-01T00:00:00Z"
 
 
 def test_optional_projection_bridge_contract_fails_closed(monkeypatch):
