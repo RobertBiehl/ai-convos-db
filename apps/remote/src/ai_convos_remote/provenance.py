@@ -66,9 +66,9 @@ def _where(path,cwd,device,cache=None):
 def _changed(root):
     raw=run(root,"status","--porcelain=v1","-z").decode(errors="replace"); return sorted({x[3:].split(" -> ")[-1] for x in raw.split("\0") if len(x)>3})
 def _checkpoint(repo):
-    paths=_changed(repo["root"]); state=digest((maybe(repo["root"],"diff","--binary","HEAD")+maybe(repo["root"],"diff","--binary","--cached","HEAD")) if repo["head"] else run(repo["root"],"status","--porcelain=v1","-z")); ts=datetime.now(timezone.utc).isoformat().replace("+00:00","Z")
-    return dict(id=digest({"repository":repo["id"],"head":repo["head"],"state":state}),repository=repo["id"],head=repo["head"],state_hash=state,paths=paths,observed_at=ts)
-def _record(kind,entity,payload): return dict(kind=kind,entity=entity,payload=payload)
+    paths=_changed(repo["root"]); state=digest((maybe(repo["root"],"diff","--binary","HEAD")+maybe(repo["root"],"diff","--binary","--cached","HEAD")) if repo["head"] else run(repo["root"],"status","--porcelain=v1","-z"))
+    return dict(id=digest({"repository":repo["id"],"head":repo["head"],"state":state}),repository=repo["id"],head=repo["head"],state_hash=state,paths=paths)
+def _record(kind,entity,payload,observed_at=None): return dict(kind=kind,entity=entity,payload=payload,**({"observed_at":observed_at} if observed_at else {}))
 
 def capture(core, graph, device):
     _git_root.cache_clear(); _repository.cache_clear()
@@ -82,11 +82,11 @@ def capture(core, graph, device):
         if full: versions[(rid,fid)]=(cid,digest((e["content"] or "").encode()),full,path)
         if rid: touched.setdefault(rid,set()).add(path)
     for rid,repo in repos.items():
-        cp=_checkpoint(repo); records.append(_record("git.checkpoint",cp["id"],cp))
+        cp=_checkpoint(repo); observed_at=datetime.now(timezone.utc).isoformat().replace("+00:00","Z"); records.append(_record("git.checkpoint",cp["id"],cp,observed_at))
         for (r,fid),(cid,after,full,path) in versions.items():
-            if r==rid: vid=digest({"file":fid,"content":full}); records.append(_record("file.version",vid,{"id":vid,"file":fid,"content_hash":full,"observed_at":cp["observed_at"]}))
+            if r==rid: vid=digest({"file":fid,"content":full}); records.append(_record("file.version",vid,{"id":vid,"file":fid,"content_hash":full},observed_at))
             if r==rid and path not in cp["paths"] and after==full: records.append(_record("checkpoint.link",digest({"checkpoint":cp["id"],"changeset":cid}),{"checkpoint":cp["id"],"changeset":cid,"evidence":"full_content_match"}))
-        for path in set(cp["paths"])-touched.get(rid,set()): records.append(_record("capture.gap",digest({"checkpoint":cp["id"],"path":path}),{"repository":rid,"checkpoint":cp["id"],"path":path,"relation":"unobserved_change","observed_at":cp["observed_at"]}))
+        for path in set(cp["paths"])-touched.get(rid,set()): records.append(_record("capture.gap",digest({"checkpoint":cp["id"],"path":path}),{"repository":rid,"checkpoint":cp["id"],"path":path,"relation":"unobserved_change"},observed_at))
     graph.commit(); return records
 
 def project(db,value,workspace):
@@ -94,13 +94,13 @@ def project(db,value,workspace):
     if k=="repository.observed": db.execute("INSERT OR REPLACE INTO repositories VALUES (?,?,?,?,?,?)",(p["id"],p.get("lineage"),json.dumps(p["roots"]),json.dumps(p["remotes"]),p["head"],value["observed_at"]))
     elif k=="changeset.observed": db.execute("INSERT OR IGNORE INTO changesets VALUES (?,?,?,?,?)",(p["id"],p["conversation"],p["turn"],p.get("prompt"),p["observed_at"]))
     elif k=="file.observed": db.execute("INSERT OR IGNORE INTO files VALUES (?,?,?,?)",(p["id"],p["repository"],p["path"],p["kind"]))
-    elif k=="file.version": db.execute("INSERT OR IGNORE INTO file_versions VALUES (?,?,?,?)",(p["id"],p["file"],p["content_hash"],p["observed_at"]))
+    elif k=="file.version": db.execute("INSERT OR IGNORE INTO file_versions VALUES (?,?,?,?)",(p["id"],p["file"],p["content_hash"],p.get("observed_at",value["observed_at"])))
     elif k=="edit.observed":
         db.execute("INSERT OR IGNORE INTO edits VALUES (?,?,?,?,?,?,?,?,?)",(p["id"],p["changeset"],p["file"],p["type"],p["before_hash"],p["after_hash"],p["evidence"],p["observed_at"],p["origin"])); p["repository"] and db.execute("INSERT OR IGNORE INTO changeset_repositories VALUES (?,?)",(p["changeset"],p["repository"]))
-    elif k=="git.checkpoint": db.execute("INSERT OR IGNORE INTO checkpoints VALUES (?,?,?,?,?,?)",(p["id"],p["repository"],p["head"],p["state_hash"],json.dumps(p["paths"]),p["observed_at"]))
+    elif k=="git.checkpoint": db.execute("INSERT OR IGNORE INTO checkpoints VALUES (?,?,?,?,?,?)",(p["id"],p["repository"],p["head"],p["state_hash"],json.dumps(p["paths"]),p.get("observed_at",value["observed_at"])))
     elif k=="checkpoint.link": db.execute("INSERT OR IGNORE INTO checkpoint_changesets VALUES (?,?,?)",(p["checkpoint"],p["changeset"],p["evidence"]))
     elif k=="identity.assertion": db.execute("INSERT OR IGNORE INTO assertions VALUES (?,?,?,?,?,?,?)",(p["id"],p["left"],p["relation"],p["right"],p["evidence"],p.get("status","active"),p["observed_at"]))
-    elif k=="capture.gap": db.execute("INSERT OR IGNORE INTO gaps VALUES (?,?,?,?,?,?)",(value["entity"],p["repository"],p["checkpoint"],p["path"],p["relation"],p["observed_at"]))
+    elif k=="capture.gap": db.execute("INSERT OR IGNORE INTO gaps VALUES (?,?,?,?,?,?)",(value["entity"],p["repository"],p["checkpoint"],p["path"],p["relation"],p.get("observed_at",value["observed_at"])))
     elif k=="changeset.boundary": db.execute("INSERT OR IGNORE INTO boundaries VALUES (?,?,?,?)",(value["entity"],workspace,p["changeset"],p["hidden_count"]))
     db.commit(); return k in {"repository.observed","changeset.observed","file.observed","file.version","edit.observed","git.checkpoint","checkpoint.link","identity.assertion","capture.gap","changeset.boundary"}
 
