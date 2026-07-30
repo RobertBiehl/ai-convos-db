@@ -49,13 +49,13 @@ def test_real_http_background_delivers_large_encrypted_memory_without_lazy_fetch
             time.sleep(.2)
         state=connect(b/"remote/state.db"); lazy=state.execute("SELECT COUNT(*) FROM lazy_events").fetchone()[0]; state.close(); raw=(tmp_path/"server.db").read_bytes().decode(errors="ignore")
         assert found and lazy==0 and "private large memory marker" not in raw and str(a) not in raw and str(b) not in raw
-        state=connect(a/"remote/state.db"); old=[r[0] for r in state.execute("SELECT event FROM event_log WHERE json_extract(event_json,'$.kind')='memory.canonical' AND json_extract(event_json,'$.payload.status')='active'").fetchall()]; state.close(); subprocess.run(("convos","memory","forget",created["id"],"--project","global","--json"),env=env,check=True,capture_output=True); end=time.time()+10; forgotten=False
+        state=connect(a/"remote/state.db"); old=[r[0] for r in state.execute("SELECT event FROM receipts WHERE kind='memory.canonical' AND status='active'").fetchall()]; state.close(); subprocess.run(("convos","memory","forget",created["id"],"--project","global","--json"),env=env,check=True,capture_output=True); end=time.time()+10; forgotten=False
         while time.time()<end:
             try: db=sqlite3.connect(b/"memory/state.db"); forgotten=db.execute("SELECT COUNT(*) FROM canonicals").fetchone()[0]==0; db.close(); relay=sqlite3.connect(tmp_path/"server.db"); forgotten=forgotten and relay.execute(f"SELECT COUNT(*) FROM event_tombstones WHERE event IN ({','.join('?'*len(old))})",old).fetchone()[0]==len(old); relay.close()
             except Exception: forgotten=False
             if forgotten: break
             time.sleep(.2)
-        state=connect(b/"remote/state.db"); decrypted="".join(r[0] for r in state.execute("SELECT event_json FROM event_log WHERE json_extract(event_json,'$.kind')='memory.canonical'").fetchall()); state.close(); assert forgotten and "private large memory marker" not in decrypted
+        state=connect(b/"remote/state.db"); settled=state.execute("SELECT kind,status FROM receipts WHERE kind='memory.canonical'").fetchall(); state.close(); assert forgotten and settled and b"private large memory marker" not in (b/"remote/state.db").read_bytes()
         subprocess.run(("convos","memory","remember","-","--project","global","--json"),input=content,text=True,env=env,check=True,capture_output=True); end=time.time()+10; restored=False
         while time.time()<end:
             try: db=sqlite3.connect(b/"memory/state.db"); restored=db.execute("SELECT content FROM canonicals").fetchone()==(content,); db.close()
