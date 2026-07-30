@@ -1,5 +1,6 @@
 """Client-side enrollment, E2EE keyring, automatic sync, membership, and local queries."""
-import json, os, time, urllib.error, urllib.parse, urllib.request
+import fcntl, json, os, time, urllib.error, urllib.parse, urllib.request
+from contextlib import contextmanager
 from pathlib import Path; from typing import Optional
 
 import duckdb, typer
@@ -30,10 +31,15 @@ def request(cfg,body,auth=True):
     safe_url(cfg["url"])
     headers={"Content-Type":"application/json"};
     if auth: headers["Authorization"]="Bearer "+cfg["token"]
-    req=urllib.request.Request(cfg["url"].rstrip("/")+"/v1",data=json.dumps(body).encode(),headers=headers,method="POST")
+    req=urllib.request.Request(cfg["url"].rstrip("/")+"/v2",data=json.dumps(body).encode(),headers=headers,method="POST")
     try: return json.loads(urllib.request.urlopen(req,timeout=10).read())
     except urllib.error.HTTPError as e: raise ValueError(json.loads(e.read())["error"]) from e
-def health(cfg): safe_url(cfg["url"]); return json.loads(urllib.request.urlopen(cfg["url"].rstrip("/")+"/v1/health",timeout=3).read())
+def health(cfg): safe_url(cfg["url"]); result=json.loads(urllib.request.urlopen(cfg["url"].rstrip("/")+"/v2/health",timeout=3).read()); result.get("version")==2 or (_ for _ in ()).throw(ValueError("relay protocol v2 required")); return result
+@contextmanager
+def sync_lock(root):
+    path=paths(root)[0]/"sync.lock"; path.parent.mkdir(parents=True,exist_ok=True); handle=path.open("a+"); os.chmod(path,0o600); fcntl.flock(handle,fcntl.LOCK_EX)
+    try: handle.seek(0); handle.truncate(); handle.write(str(os.getpid())); handle.flush(); yield
+    finally: fcntl.flock(handle,fcntl.LOCK_UN); handle.close()
 def workspace(cfg,value):
     hits=[k for k,v in cfg["workspaces"].items() if k.startswith(value) or v["name"]==value]
     if len(hits)!=1: raise ValueError(f"Workspace must match exactly one of: {', '.join(v['name'] for v in cfg['workspaces'].values())}")
@@ -119,8 +125,9 @@ def _upload_batches(rows,limit=8*1024*1024):
         if batch and (len(batch)==500 or size+len(row[3])>limit): yield batch; batch,size=[],0
         batch.append(row); size+=len(row[3])
     if batch: yield batch
-def upload(cfg,state,root=None):
+def upload(cfg,state,root=None,workspaces=None):
     active={w["id"] for w in refresh(cfg,root)["workspaces"]}
+    if workspaces is not None: active&=set(workspaces)
     rows=[r for r in state.execute("SELECT workspace,event,event_json,envelope FROM event_log WHERE direction='out' AND cursor=0 ORDER BY rowid").fetchall() if r[0] in active]
     for batch in _upload_batches(rows):
         envs=[]
@@ -135,23 +142,42 @@ def purge_events(cfg,state,ws,events):
 def pull(cfg,state,root=None):
     root=local_root(root)
     server=refresh(cfg,root)
+    summary={}
     for ws in server["workspaces"]:
         if not ws["device_authorized"]: continue
+        sid=ws["id"]; current=state.execute("SELECT lifecycle FROM sync_states WHERE workspace=?",(sid,)).fetchone(); lifecycle=current[0] if current else "rebaselining"; state.execute("INSERT OR REPLACE INTO sync_states VALUES (?,?,COALESCE((SELECT tail FROM sync_states WHERE workspace=?),0),COALESCE((SELECT floor FROM sync_states WHERE workspace=?),0),NULL)",(sid,lifecycle,sid,sid)); state.commit()
         devices={r["device"]["id"]:r["device"] for control in ws["controls"] for r in control["devices"].values()}
-        after=(state.execute("SELECT cursor FROM cursors WHERE workspace=?",(ws["id"],)).fetchone() or [0])[0]; seen=(state.execute("SELECT value FROM meta WHERE key=?",(f"history_from:{ws['id']}",)).fetchone() or [str(ws["history_from"])])[0]; earliest=min([k["epoch"] for k in ws["keys"]],default=ws["epoch"]); old_key=int((state.execute("SELECT value FROM meta WHERE key=?",(f"key_from:{ws['id']}",)).fetchone() or [earliest])[0])
+        after=(state.execute("SELECT cursor FROM cursors WHERE workspace=?",(sid,)).fetchone() or [0])[0]; seen=(state.execute("SELECT value FROM meta WHERE key=?",(f"history_from:{sid}",)).fetchone() or [str(ws["history_from"])])[0]; earliest=min([k["epoch"] for k in ws["keys"]],default=ws["epoch"]); old_key=int((state.execute("SELECT value FROM meta WHERE key=?",(f"key_from:{sid}",)).fetchone() or [earliest])[0])
         if ws["history_from"]<int(seen) or earliest<old_key: after=0
-        result=request(cfg,{"op":"pull","workspace":ws["id"],"after":after,"limit":500}); incoming=[]
-        for item in result["events"]:
-            if item.get("lazy"):
-                state.execute("INSERT OR IGNORE INTO lazy_events VALUES (?,?,?,?)",(ws["id"],item["event"],item["cursor"],item["size"])); after=max(after,item["cursor"]); continue
-            env=item["envelope"]
-            if env["workspace"]!=ws["id"] or not access_from(cfg,ws["id"])<=env["epoch"]<=cfg["controls"][ws["id"]]["epoch"]: raise ValueError("event envelope exceeds signed workspace access")
-            value=open_event(env,key(cfg,ws["id"],env["epoch"]),signer(devices,env["author"])); material=material_event(value,devices,cfg["device"]); sequence(state,ws["id"],value); state.execute("INSERT OR IGNORE INTO event_log VALUES (?,?,?,?,?,NULL)",(ws["id"],value["id"],item["cursor"],"in",json.dumps(value)))
-            if material and material["id"]!=value["id"]: state.execute("INSERT OR REPLACE INTO history_material VALUES (?,?,?)",(ws["id"],material["id"],json.dumps(material)))
-            if material: incoming.append((ws["id"],material))
-            after=max(after,item["cursor"])
-        project_many(core_path(root),state,incoming,cfg["device"]["id"],root)
-        state.execute("INSERT OR REPLACE INTO cursors VALUES (?,?)",(ws["id"],after)); state.execute("INSERT OR REPLACE INTO meta VALUES (?,?),(?,?)",(f"history_from:{ws['id']}",str(ws["history_from"]),f"key_from:{ws['id']}",str(earliest))); state.commit()
+        try:
+            total=0
+            while True:
+                result=request(cfg,{"op":"pull","workspace":sid,"after":after,"limit":500}); floor,tail=result["floor"],result["tail"]
+                if not all(isinstance(v,int) and not isinstance(v,bool) and v>=0 for v in (floor,tail)) or floor>tail and tail or after>tail: raise ValueError("relay cursor window is invalid")
+                incoming=[]
+                for item in result["events"]:
+                    if item.get("tombstone"):
+                        old=state.execute("SELECT event FROM event_sequences WHERE workspace=? AND author=? AND seq=?",(sid,item["author"],item["seq"])).fetchone()
+                        if old and old[0]!=item["event"]: raise ValueError("device sequence replay")
+                        state.execute("INSERT OR IGNORE INTO event_sequences VALUES (?,?,?,?,?)",(sid,item["author"],item["seq"],item["event"],"[]")); state.execute("DELETE FROM event_log WHERE workspace=? AND event=?",(sid,item["event"])); state.execute("DELETE FROM lazy_events WHERE workspace=? AND event=?",(sid,item["event"]))
+                        if item["author"]==cfg["device"]["id"] and item["seq"]>=int((state.execute("SELECT value FROM meta WHERE key=?",(f"seq:{sid}",)).fetchone() or ["0"])[0]): state.execute("INSERT OR REPLACE INTO meta VALUES (?,?),(?,?)",(f"seq:{sid}",str(item["seq"]),f"prev:{sid}",item["event"]))
+                        after=max(after,item["cursor"]); continue
+                    env=request(cfg,{"op":"fetch","workspace":sid,"event":item["event"]})["envelope"] if item.get("lazy") else item["envelope"]
+                    if (env["workspace"],env["event"])!=(sid,item.get("event",env["event"])) or not access_from(cfg,sid)<=env["epoch"]<=cfg["controls"][sid]["epoch"]: raise ValueError("event envelope response mismatch")
+                    value=open_event(env,key(cfg,sid,env["epoch"]),signer(devices,env["author"])); material=material_event(value,devices,cfg["device"]); sequence(state,sid,value); state.execute("INSERT OR IGNORE INTO event_log VALUES (?,?,?,?,?,NULL)",(sid,value["id"],item["cursor"],"in",json.dumps(value)))
+                    if value["author"]==cfg["device"]["id"]:
+                        state.execute("INSERT OR IGNORE INTO published VALUES (?,?,?,?)",(sid,value["entity"],digest(value["payload"]),value["id"]))
+                        if value["seq"]>=int((state.execute("SELECT value FROM meta WHERE key=?",(f"seq:{sid}",)).fetchone() or ["0"])[0]): state.execute("INSERT OR REPLACE INTO meta VALUES (?,?),(?,?)",(f"seq:{sid}",str(value["seq"]),f"prev:{sid}",value["id"]))
+                    if material and material["id"]!=value["id"]: state.execute("INSERT OR REPLACE INTO history_material VALUES (?,?,?)",(sid,material["id"],json.dumps(material)))
+                    if material: incoming.append((sid,material))
+                    after=max(after,item["cursor"])
+                project_many(core_path(root),state,incoming,cfg["device"]["id"],root); total+=len(result["events"]); state.execute("INSERT OR REPLACE INTO cursors VALUES (?,?)",(sid,after)); state.execute("INSERT OR REPLACE INTO meta VALUES (?,?),(?,?)",(f"history_from:{sid}",str(ws["history_from"]),f"key_from:{sid}",str(earliest))); state.commit()
+                if after>=tail: break
+                if not result["events"]: raise ValueError("relay tail cannot be reached")
+            state.execute("INSERT OR REPLACE INTO sync_states VALUES (?,'ready',?,?,NULL)",(sid,tail,floor)); state.commit(); summary[sid]={"events":total,"cursor":after,"tail":tail,"floor":floor}
+        except Exception as e:
+            state.execute("INSERT OR REPLACE INTO sync_states VALUES (?,'blocked',COALESCE((SELECT tail FROM sync_states WHERE workspace=?),0),COALESCE((SELECT floor FROM sync_states WHERE workspace=?),0),?)",(sid,sid,sid,str(e))); state.commit(); raise
+    return summary
 def fetch_lazy(cfg,state,event_id=None,root=None):
     root=local_root(root)
     server=refresh(cfg,root); controls={ws["id"]:ws["controls"] for ws in server["workspaces"]}; sql="SELECT workspace,event,cursor FROM lazy_events"+(" WHERE event=?" if event_id else ""); rows=[r for r in state.execute(sql,(event_id,) if event_id else ()).fetchall() if r[0] in controls]
@@ -162,25 +188,22 @@ def fetch_lazy(cfg,state,event_id=None,root=None):
         value=open_event(env,key(cfg,ws,env["epoch"]),signer(devices,env["author"])); material=material_event(value,devices,cfg["device"]); sequence(state,ws,value); state.execute("INSERT OR IGNORE INTO event_log VALUES (?,?,?,?,?,NULL)",(ws,eid,cursor,"in",json.dumps(value))); material and material["id"]!=value["id"] and state.execute("INSERT OR REPLACE INTO history_material VALUES (?,?,?)",(ws,material["id"],json.dumps(material))); material and project(core_path(root),state,material,ws,cfg["device"]["id"],root=root); state.execute("DELETE FROM lazy_events WHERE event=?",(eid,))
     state.commit(); return len(rows)
 def sync_once(root=None,force=False):
-    root=local_root(root); cfg=load(root); _,_,state_path=paths(root); state=connect(state_path); drain_hooks(); upload(cfg,state,root); flush_selected(cfg,state,root); core=duckdb.connect(str(core_path(root)),read_only=True) if core_path(root).is_file() else None
-    stamp=core_path(root).stat().st_mtime_ns if core_path(root).exists() else 0; previous=int((state.execute("SELECT value FROM meta WHERE key='core_mtime'").fetchone() or ["0"])[0])
-    if core and (force or stamp!=previous):
-        active={w["id"] for w in cfg["server_state"]["workspaces"]}
-        for ws,meta in cfg["workspaces"].items():
-            if ws not in active or f"{ws}:{meta['epoch']}" not in cfg["keys"]: continue
-            pol=state.execute("SELECT kind,value,local_root FROM policies WHERE workspace=?",(ws,)).fetchall(); repos=[p[1] for p in pol if p[0]=="repository"]; roots=[p[2] for p in pol if p[0]=="path" and p[2]]
-            known={(r[0],r[1]) for r in state.execute("SELECT entity,revision FROM published WHERE workspace=?",(ws,)).fetchall()}; [publish(cfg,state,ws,r,root,True,known) for r in scan(core,state,cfg["device"]["id"],meta["kind"],repos,roots)]
-        state.execute("INSERT OR REPLACE INTO meta VALUES ('core_mtime',?)",(str(stamp),)); state.commit()
-    if core: core.close()
-    active={w["id"] for w in cfg["server_state"]["workspaces"]}
-    for ws,meta in cfg["workspaces"].items():
-        if ws not in active or meta["kind"]!="personal" or f"{ws}:{meta['epoch']}" not in cfg["keys"]: continue
-        known={(r[0],r[1]) for r in state.execute("SELECT entity,revision FROM published WHERE workspace=?",(ws,)).fetchall()}; [publish(cfg,state,ws,r,root,True,known) for r in bridge_records(root,state,ws,meta["kind"])]
-    state.commit()
-    upload(cfg,state,root)
-    for ws,meta in cfg["workspaces"].items():
-        if ws in active and meta["kind"]=="personal": purge_events(cfg,state,ws,bridge_purges(root,state,ws,meta["kind"]))
-    pull(cfg,state,root); state.execute("INSERT OR REPLACE INTO meta VALUES ('last_sync',?)",(str(time.time()),)); state.commit(); state.close()
+    root=local_root(root)
+    with sync_lock(root):
+        cfg=load(root); _,_,state_path=paths(root); state=connect(state_path)
+        try:
+            drain_hooks(); refresh(cfg,root); ready={r[0] for r in state.execute("SELECT workspace FROM sync_states WHERE lifecycle='ready'").fetchall()}; upload(cfg,state,root,ready); pull(cfg,state,root); ready={r[0] for r in state.execute("SELECT workspace FROM sync_states WHERE lifecycle='ready'").fetchall()}; flush_selected(cfg,state,root,ready); core=duckdb.connect(str(core_path(root)),read_only=True) if core_path(root).is_file() else None; stamp=core_path(root).stat().st_mtime_ns if core_path(root).exists() else 0
+            if core:
+                for ws,meta in cfg["workspaces"].items():
+                    previous=int((state.execute("SELECT value FROM meta WHERE key=?",(f"core_mtime:{ws}",)).fetchone() or ["0"])[0])
+                    if ws not in ready or ws not in {w["id"] for w in cfg["server_state"]["workspaces"]} or f"{ws}:{meta['epoch']}" not in cfg["keys"] or not (force or stamp!=previous): continue
+                    pol=state.execute("SELECT kind,value,local_root FROM policies WHERE workspace=?",(ws,)).fetchall(); repos=[p[1] for p in pol if p[0]=="repository"]; roots=[p[2] for p in pol if p[0]=="path" and p[2]]; known={(r[0],r[1]) for r in state.execute("SELECT entity,revision FROM published WHERE workspace=?",(ws,)).fetchall()}; [publish(cfg,state,ws,r,root,True,known) for r in scan(core,state,cfg["device"]["id"],meta["kind"],repos,roots)]; state.execute("INSERT OR REPLACE INTO meta VALUES (?,?)",(f"core_mtime:{ws}",str(stamp)))
+                core.close()
+            active={w["id"] for w in cfg["server_state"]["workspaces"]}; [publish(cfg,state,ws,r,root,True,known) for ws,meta in cfg["workspaces"].items() if ws in ready and ws in active and meta["kind"]=="personal" and f"{ws}:{meta['epoch']}" in cfg["keys"] for known in [{(r[0],r[1]) for r in state.execute("SELECT entity,revision FROM published WHERE workspace=?",(ws,)).fetchall()}] for r in bridge_records(root,state,ws,meta["kind"])]; state.commit(); upload(cfg,state,root,ready)
+            for ws,meta in cfg["workspaces"].items():
+                if ws in ready and ws in active and meta["kind"]=="personal": purge_events(cfg,state,ws,bridge_purges(root,state,ws,meta["kind"]))
+            pull(cfg,state,root); state.execute("INSERT OR REPLACE INTO meta VALUES ('last_sync',?)",(str(time.time()),)); state.commit()
+        finally: state.close()
 def add_member(cfg,ws,user,remove=False,root=None):
     refresh(cfg,root); members={u:m["role"] for u,m in cfg["controls"][ws]["members"].items()}; devices=[]
     if remove:
@@ -220,8 +243,9 @@ def selected_material(root,ws,event_ids):
 def queue_selected(root,ws,target,values):
     if not values: return
     state=connect(paths(root)[2]); [state.execute("INSERT OR REPLACE INTO history_outbox VALUES (?,?,?,?)",(ws,target,eid,json.dumps(value))) for eid,value in values]; state.commit(); state.close()
-def flush_selected(cfg,state,root=None):
+def flush_selected(cfg,state,root=None,workspaces=None):
     for ws,target,eid,raw in state.execute("SELECT workspace,target,event,event_json FROM history_outbox").fetchall():
+        if workspaces is not None and ws not in workspaces: continue
         head=cfg["controls"].get(ws); record=head and head["devices"].get(target)
         if record and eid not in head["members"][record["user"]]["selected"]: state.execute("DELETE FROM history_outbox WHERE workspace=? AND target=? AND event=?",(ws,target,eid)); continue
         if not record or not record["history"] or cfg["device"]["id"] not in head["devices"]: continue
@@ -293,7 +317,7 @@ def watch(interval:int=typer.Option(2,"--interval")):
 def enable_cmd(remove:bool=typer.Option(False,"--remove")): not remove and install_hooks(False,False); typer.echo(enable(paths()[0],remove))
 def doctor_status():
     try:
-        cfg=load(); state=connect(paths()[2]); pending=state.execute("SELECT COUNT(*) FROM event_log WHERE direction='out' AND cursor=0").fetchone()[0]; lazy=state.execute("SELECT COUNT(*) FROM lazy_events").fetchone()[0]; last=(state.execute("SELECT value FROM meta WHERE key='last_sync'").fetchone() or ["never"])[0]; online="reachable" if health(cfg)["ok"] else "error"; return f"remote: {online}, user={cfg['user'][:8]}, device={cfg['device']['id'][:8]}, workspaces={len(cfg['workspaces'])}, epochs={len(cfg['keys'])}, pending={pending}, lazy={lazy}, last={last}"
+        cfg=load(); state=connect(paths()[2]); pending=state.execute("SELECT COUNT(*) FROM event_log WHERE direction='out' AND cursor=0").fetchone()[0]; lazy=state.execute("SELECT COUNT(*) FROM lazy_events").fetchone()[0]; lifecycle=",".join(f"{r[0][:8]}:{r[1]}" for r in state.execute("SELECT workspace,lifecycle FROM sync_states ORDER BY workspace").fetchall()) or "uninitialized"; last=(state.execute("SELECT value FROM meta WHERE key='last_sync'").fetchone() or ["never"])[0]; online="reachable" if health(cfg)["ok"] else "error"; return f"remote: {online}, user={cfg['user'][:8]}, device={cfg['device']['id'][:8]}, workspaces={len(cfg['workspaces'])}, epochs={len(cfg['keys'])}, lifecycle={lifecycle}, pending={pending}, lazy={lazy}, last={last}"
     except Exception as e: return f"remote: unavailable ({e})"
 @remote.command("doctor")
 def doctor_cmd(): typer.echo(doctor_status())
