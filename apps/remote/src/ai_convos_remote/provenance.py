@@ -89,7 +89,7 @@ def capture(core, graph, device):
         for path in set(cp["paths"])-touched.get(rid,set()): records.append(_record("capture.gap",digest({"checkpoint":cp["id"],"path":path}),{"repository":rid,"checkpoint":cp["id"],"path":path,"relation":"unobserved_change"},observed_at))
     graph.commit(); return records
 
-def project(db,value,workspace):
+def project(db,value,workspace,commit=True):
     p,k=value["payload"],value["kind"]; db.execute("INSERT OR IGNORE INTO raw_events VALUES (?,?,?,?,?,?,?,?)",(value["id"],workspace,k,value["entity"],value["author"],value["seq"],value["observed_at"],json.dumps(p)))
     if k=="repository.observed": db.execute("INSERT OR REPLACE INTO repositories VALUES (?,?,?,?,?,?)",(p["id"],p.get("lineage"),json.dumps(p["roots"]),json.dumps(p["remotes"]),p["head"],value["observed_at"]))
     elif k=="changeset.observed": db.execute("INSERT OR IGNORE INTO changesets VALUES (?,?,?,?,?)",(p["id"],p["conversation"],p["turn"],p.get("prompt"),p["observed_at"]))
@@ -102,7 +102,7 @@ def project(db,value,workspace):
     elif k=="identity.assertion": db.execute("INSERT OR IGNORE INTO assertions VALUES (?,?,?,?,?,?,?)",(p["id"],p["left"],p["relation"],p["right"],p["evidence"],p.get("status","active"),p["observed_at"]))
     elif k=="capture.gap": db.execute("INSERT OR IGNORE INTO gaps VALUES (?,?,?,?,?,?)",(value["entity"],p["repository"],p["checkpoint"],p["path"],p["relation"],p.get("observed_at",value["observed_at"])))
     elif k=="changeset.boundary": db.execute("INSERT OR IGNORE INTO boundaries VALUES (?,?,?,?)",(value["entity"],workspace,p["changeset"],p["hidden_count"]))
-    db.commit(); return k in {"repository.observed","changeset.observed","file.observed","file.version","edit.observed","git.checkpoint","checkpoint.link","identity.assertion","capture.gap","changeset.boundary"}
+    commit and db.commit(); return k in {"repository.observed","changeset.observed","file.observed","file.version","edit.observed","git.checkpoint","checkpoint.link","identity.assertion","capture.gap","changeset.boundary"}
 
 def query(db,name,arg=None):
     if name=="checkpoint_diff":
