@@ -13,6 +13,11 @@ The optional remote application synchronizes signed encrypted events. The relay
 never receives conversation plaintext, file paths, repository names, embeddings,
 attachments, or workspace keys. Search and graph queries remain local.
 
+The next storage and recovery architecture is specified in
+[Remote state v2](remote-state-v2.md). It makes canonical provenance part of
+DuckDB, limits settled SQLite state to rebuildable sync metadata, and advances
+the client and relay together without an old-protocol compatibility layer.
+
 This is a security-sensitive preview. It uses established primitives through
 `cryptography` and has protocol/acceptance tests, but has not received the
 independent review required before calling it production-grade encryption.
