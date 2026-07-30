@@ -1,4 +1,4 @@
-import copy, json
+import copy, json, sqlite3
 
 import pytest
 from ai_convos_remote.control import record, sign, state_hash
@@ -20,6 +20,11 @@ def history_ws(a,previous,user):
     members={**previous["members"],user:{**previous["members"][user],"history_from":1}}; return sign(a["device"],{**{k:v for k,v in previous.items() if k not in ("signature","author")},"revision":previous["revision"]+1,"prev":state_hash(previous),"members":members,"action":"history","approval":None,"approved_at":0})
 
 
+def test_relay_v1_database_is_rejected_instead_of_mutated(tmp_path):
+    path=tmp_path/"server.db"; db=sqlite3.connect(path); db.execute("CREATE TABLE events(cursor INTEGER PRIMARY KEY)"); db.close()
+    with pytest.raises(ValueError,match="predates protocol v2"): connect(path)
+
+
 def test_personal_workspace_idempotency_and_ciphertext_only(tmp_path):
     db = connect(tmp_path/"server.db"); a = account(db,"alice"); key = bytes(range(32)); ws = "personal-alice"
     create_ws(db,a,ws,key,"personal")
@@ -27,7 +32,7 @@ def test_personal_workspace_idempotency_and_ciphertext_only(tmp_path):
     first = action(db,{"op":"upload","envelope":envelope},a["token"]); second = action(db,{"op":"upload","envelope":envelope},a["token"])
     assert first["created"] and not second["created"] and first["cursor"] == second["cursor"]
     assert "server must not see this" not in (tmp_path/"server.db").read_bytes().decode(errors="ignore")
-    assert action(db,{"op":"pull","workspace":ws,"after":0},a["token"])["events"][0]["envelope"] == envelope
+    pulled=action(db,{"op":"pull","workspace":ws,"after":0},a["token"]); assert pulled["events"][0]["envelope"]==envelope and (pulled["floor"],pulled["tail"])==(first["cursor"],first["cursor"])
     bad = copy.deepcopy(envelope); bad["ciphertext"] = bad["ciphertext"][:-1] + ("A" if bad["ciphertext"][-1] != "A" else "B")
     with pytest.raises(ValueError,match="different ciphertext"): action(db,{"op":"upload","envelope":bad},a["token"])
     same_seq = seal_event(event(a["device"],1,"message.record","m2",{"content":"different"},[],"2026-01-02T00:00:00Z"),ws,1,key)
@@ -69,7 +74,7 @@ def test_large_events_are_manifested_then_fetched(tmp_path):
 
 def test_personal_event_purge_is_idempotent_author_bound_and_blocks_resurrection(tmp_path):
     db=connect(tmp_path/"server.db"); a=account(db,"alice"); key=bytes([9])*32; personal="personal"; create_ws(db,a,personal,key,"personal"); env=seal_event(event(a["device"],1,"memory.canonical","memory:x",{"opaque":True},[],"2026-01-01T00:00:00Z"),personal,1,key); action(db,{"op":"upload","envelope":env},a["token"])
-    assert action(db,{"op":"purge","workspace":personal,"events":[env["event"]]},a["token"])=={"purged":1} and action(db,{"op":"purge","workspace":personal,"events":[env["event"]]},a["token"])=={"purged":1} and action(db,{"op":"pull","workspace":personal,"after":0},a["token"])["events"]==[]
+    assert action(db,{"op":"purge","workspace":personal,"events":[env["event"]]},a["token"])=={"purged":1} and action(db,{"op":"purge","workspace":personal,"events":[env["event"]]},a["token"])=={"purged":1}; pulled=action(db,{"op":"pull","workspace":personal,"after":0},a["token"]); assert pulled["events"]==[{"cursor":pulled["tail"],"tombstone":True,"event":env["event"],"author":env["author"],"seq":env["seq"]}] and pulled["floor"]==pulled["tail"]
     with pytest.raises(ValueError,match="purged"): action(db,{"op":"upload","envelope":env},a["token"])
     with pytest.raises(PermissionError,match="denied"): action(db,{"op":"purge","workspace":personal,"events":["unknown"]},a["token"])
     team="team"; create_ws(db,a,team,key,"team"); team_env=seal_event(event(a["device"],2,"x","x",{},[],"2026-01-02T00:00:00Z"),team,1,key); action(db,{"op":"upload","envelope":team_env},a["token"])

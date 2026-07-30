@@ -23,13 +23,21 @@ CREATE TABLE IF NOT EXISTS event_sequences(workspace TEXT,author TEXT,seq INT,ev
 CREATE TABLE IF NOT EXISTS attachment_chunks(workspace TEXT,author TEXT,blob TEXT,idx INT,total INT,attachment TEXT,sha256 TEXT,size INT,data TEXT,PRIMARY KEY(workspace,author,blob,idx));
 CREATE TABLE IF NOT EXISTS attachment_blobs(workspace TEXT,author TEXT,attachment TEXT PRIMARY KEY,path TEXT);
 CREATE TABLE IF NOT EXISTS policies(workspace TEXT,kind TEXT,value TEXT,local_root TEXT,PRIMARY KEY(workspace,kind,value));
+CREATE TABLE IF NOT EXISTS sync_states(workspace TEXT PRIMARY KEY,lifecycle TEXT NOT NULL,tail INT NOT NULL DEFAULT 0,floor INT NOT NULL DEFAULT 0,error TEXT);
 CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY,value TEXT);
 """
 TABLES={"conversation.record":"conversations","message.record":"messages","tool.record":"tool_calls","attachment.record":"attachments","artifact.record":"artifacts","file_edit.record":"file_edits"}
 COLUMNS={"conversations":["id","source","title","created_at","updated_at","model","cwd","git_branch","project_id","metadata"],"messages":["id","conversation_id","role","content","thinking","created_at","model","metadata","parent_id"],"tool_calls":["id","message_id","tool_name","input","output","status","duration_ms","created_at"],"attachments":["id","message_id","filename","mime_type","size","path","url","created_at"],"artifacts":["id","conversation_id","artifact_type","title","content","language","created_at","version"],"file_edits":["id","message_id","file_path","edit_type","content","created_at","old_content"]}
 FKS={"messages":(("conversation_id","conversations"),("parent_id","messages")),"tool_calls":(("message_id","messages"),),"attachments":(("message_id","messages"),),"artifacts":(("conversation_id","conversations"),),"file_edits":(("message_id","messages"),)}
 
-def connect(path): db=graph_connect(path); db.executescript(STATE); return db
+def connect(path):
+    existed=Path(path).exists(); db=graph_connect(path); db.executescript(STATE); version=db.execute("SELECT value FROM meta WHERE key='state_schema'").fetchone()
+    if not version:
+        if existed:
+            workspaces={r[0] for r in db.execute("SELECT workspace FROM event_log UNION SELECT workspace FROM published UNION SELECT workspace FROM cursors").fetchall()}; [db.execute("INSERT OR IGNORE INTO sync_states VALUES (?,'ready',0,0,NULL)",(ws,)) for ws in workspaces]
+        db.execute("INSERT INTO meta VALUES ('state_schema','2')"); db.commit()
+    elif version[0]!="2": raise ValueError(f"unsupported remote state schema {version[0]}")
+    return db
 @lru_cache(maxsize=1)
 def bridges():
     result=[entry.load()() for entry in entry_points(group="convos.remote")]
