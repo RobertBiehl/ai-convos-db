@@ -29,4 +29,6 @@ appear labeled `unknown` rather than being hidden.
 
 Exactness boundary: attribution is computed by replaying captured `old_content` edits;
 shell edits or missing/unmatched before-state make content *unknown* (never invented)
-until the next full write. Reads the DB read-only; no core schema changes.
+until the next full write. Core captures and writes the compact `provenance`
+schema on every ingestion path. Changegraph is a strictly read-only view over
+those facts and never duplicates prompts, messages, or file-edit bodies.

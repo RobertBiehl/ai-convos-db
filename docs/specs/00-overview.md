@@ -151,8 +151,9 @@ configure remotes, enroll devices, request credentials, or contact services.
 
 - **M1 - Foundation (core).** browser cleanup -> `--json`/`--jsonl` + `convos
   sql` -> `messages.parent_id` + plugin seam. Small, exact, unblocks every app.
-- **M2 - Change-graph.** core capture (`file_edits.old_content`) -> app package
-  `ai-convos-changegraph` (`blame` / `timeline` / `at`).
+- **M2 - Change-graph.** core capture (`file_edits.old_content` plus typed
+  provenance) -> read-only app package `ai-convos-changegraph` (`blame` /
+  `timeline` / `at`).
 - **M3 - semantic navigation.** Explore ships related-conversation and
   exact-turn trail navigation locally.
 - **M4 - encrypted remote.** Protocol/server -> personal multi-device -> Git
@@ -173,9 +174,10 @@ configure remotes, enroll devices, request credentials, or contact services.
 The June sharing deferral is superseded by [spec 04](04-remote-sync.md). The
 reasoning that kept it out of core still stands. The feature has exactly two
 installable packages: the remote client and the remote server. Protocol,
-projection, provenance, hooks, and worker code are internal client modules.
-Core remains a server-free local archive. Existing ids are origin ids, not
-assumed to be universal team identities.
+transport projection, hooks, and worker code are internal client modules; core
+alone performs DuckDB projection and provenance capture. Core remains a
+server-free local archive. Existing ids are origin ids, not assumed to be
+universal team identities.
 
 ## Open questions
 

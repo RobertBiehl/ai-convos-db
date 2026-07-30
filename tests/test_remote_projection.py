@@ -7,7 +7,7 @@ from ai_convos.cli import init_schema
 import ai_convos_remote.projection as projection_module
 from ai_convos_remote import publish
 from ai_convos_remote.projection import bridges, connect, project, project_many, rebuild, scan, sequence
-from ai_convos_remote.protocol import b64, event, identity, seal_history
+from ai_convos_remote.protocol import b64, digest, event, identity, seal_history
 
 
 def git(path,*args): return subprocess.run(("git","-C",str(path),*args),check=True,capture_output=True).stdout.decode().strip()
@@ -17,26 +17,28 @@ def source(tmp_path):
 
 
 def test_personal_scan_strips_local_roots_and_rebuilds_duckdb(tmp_path):
-    repo,core=source(tmp_path); state=connect(tmp_path/"state.db"); records=scan(core,state,"source-device"); raw=json.dumps(records)
+    repo,core=source(tmp_path); state=connect(tmp_path/"state.db"); records=scan(core,state); raw=json.dumps(records)
     assert str(repo) not in raw and len(records)>3
     remote=identity("remote"); events=[event(remote,i+1,r["kind"],r["entity"],r["payload"],[],f"2026-01-01T00:00:{i:02d}Z") for i,r in enumerate(records)]
     for i,value in enumerate(events): state.execute("INSERT INTO event_log VALUES (?,?,?,?,?,?)",("personal",value["id"],i,"in",json.dumps(value),"{}")); project(tmp_path/"target.db",state,value,"personal","other-device")
-    target=duckdb.connect(str(tmp_path/"target.db"),read_only=True); assert target.execute("SELECT title,cwd FROM conversations").fetchone()==("title",None); assert target.execute("SELECT content FROM messages WHERE role='user'").fetchone()[0]=="change it"; assert target.execute("SELECT file_path FROM file_edits").fetchone()[0]=="a.py"; target.close()
-    before=state.execute("SELECT COUNT(*) FROM edits").fetchone()[0]; (tmp_path/"target.db").unlink(); assert rebuild(tmp_path/"target.db",state)==len(events); assert duckdb.connect(str(tmp_path/"target.db"),read_only=True).execute("SELECT COUNT(*) FROM messages").fetchone()[0]==2 and state.execute("SELECT COUNT(*) FROM edits").fetchone()[0]==before
+    target=duckdb.connect(str(tmp_path/"target.db"),read_only=True); assert target.execute("SELECT title,cwd FROM conversations").fetchone()==("title",None); assert target.execute("SELECT content FROM messages WHERE role='user'").fetchone()[0]=="change it"; assert target.execute("SELECT file_path FROM file_edits").fetchone()[0]=="a.py"; before=target.execute("SELECT COUNT(*) FROM provenance.file_edit_files").fetchone()[0]; assert target.execute("SELECT x.file_edit_id=fe.id FROM provenance.file_edit_files x JOIN file_edits fe ON fe.id=x.file_edit_id").fetchone()[0]; assert target.execute("SELECT COUNT(*) FROM remote.row_origins").fetchone()[0]==sum(e["kind"] in projection_module.TABLES for e in events); target.close()
+    fresh=connect(tmp_path/"fresh-state.db"); imported=duckdb.connect(str(tmp_path/"target.db"),read_only=True); assert scan(imported,fresh)==[]; imported.close(); fresh.close()
+    old={"raw_events","repositories","files","file_versions","changesets","edits","changeset_repositories","checkpoints","checkpoint_changesets","assertions","gaps","boundaries"}; assert not old&{r[0] for r in state.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+    (tmp_path/"target.db").unlink(); assert rebuild(tmp_path/"target.db",state)==len(events); rebuilt=duckdb.connect(str(tmp_path/"target.db"),read_only=True); assert rebuilt.execute("SELECT COUNT(*) FROM messages").fetchone()[0]==2 and rebuilt.execute("SELECT COUNT(*) FROM provenance.file_edit_files").fetchone()[0]==before; rebuilt.close()
 
 
 def test_unchanged_provenance_does_not_republish_but_file_change_does(tmp_path):
     repo,core=source(tmp_path); state=connect(tmp_path/"state.db"); device=identity(); ws="personal"; cfg={"device":device,"workspaces":{ws:{"kind":"personal","epoch":1}},"keys":{f"{ws}:1":b64(bytes(range(32)))}}; known=set()
-    first=scan(core,state,device["id"]); timed=[r for r in first if r["kind"] in ("git.checkpoint","file.version","capture.gap")]; assert timed and all("observed_at" in r and "observed_at" not in r["payload"] for r in timed)
+    first=scan(core,state); timed=[r for r in first if r["kind"] in ("git.checkpoint","file.version","capture.gap")]; assert timed and all("observed_at" in r and "observed_at" not in r["payload"] for r in timed)
     assert all(publish(cfg,state,ws,r,tmp_path/"client",True,known) for r in first); baseline=state.execute("SELECT COUNT(*) FROM event_log").fetchone()[0]
-    assert not any(publish(cfg,state,ws,r,tmp_path/"client",True,known) for r in scan(core,state,device["id"])) and state.execute("SELECT COUNT(*) FROM event_log").fetchone()[0]==baseline
-    (repo/"a.py").write_text("changed\n"); emitted={r["kind"] for r in scan(core,state,device["id"]) if publish(cfg,state,ws,r,tmp_path/"client",True,known)}
+    assert not any(publish(cfg,state,ws,r,tmp_path/"client",True,known) for r in scan(core,state)) and state.execute("SELECT COUNT(*) FROM event_log").fetchone()[0]==baseline
+    (repo/"a.py").write_text("changed\n"); emitted={r["kind"] for r in scan(core,state) if publish(cfg,state,ws,r,tmp_path/"client",True,known)}
     assert emitted=={"git.checkpoint","file.version"} and state.execute("SELECT COUNT(*) FROM event_log").fetchone()[0]==baseline+2
 
 
-def test_provenance_projection_accepts_legacy_payload_timestamp(tmp_path):
-    state=connect(tmp_path/"state.db"); device=identity(); payload={"id":"v","file":"f","content_hash":"h","observed_at":"2025-01-01T00:00:00Z"}; project(tmp_path/"db",state,event(device,1,"file.version","v",payload,[],"2026-01-01T00:00:00Z"),"w")
-    assert state.execute("SELECT observed_at FROM file_versions WHERE id='v'").fetchone()[0]=="2025-01-01T00:00:00Z"
+def test_provenance_projection_uses_signed_event_timestamp(tmp_path):
+    state=connect(tmp_path/"state.db"); device=identity(); vid=digest({"file":"f","content":"h"}); payload={"id":vid,"file":"f","content_hash":"h"}; project(tmp_path/"db",state,event(device,1,"file.version",vid,payload,[],"2026-01-01T00:00:00Z"),"w")
+    db=duckdb.connect(str(tmp_path/"db"),read_only=True); assert str(db.execute("SELECT observed_at FROM provenance.file_versions WHERE id=?",(vid,)).fetchone()[0])=="2026-01-01 00:00:00"; db.close()
 
 
 def test_optional_projection_bridge_contract_fails_closed(monkeypatch):
@@ -59,7 +61,7 @@ def test_projection_batch_rolls_back_duckdb_and_state_together(tmp_path):
     state=connect(tmp_path/"state.db"); device=identity(); cols=["id","source","title","created_at","updated_at","model","cwd","git_branch","project_id","metadata"]; payload={"table":"conversations","columns":cols,"row":["c","codex","valid","2026-01-01","2026-01-01",None,None,None,None,"{}"]}
     good=event(device,1,"conversation.record","conversations:c",payload,[],"2026-01-01T00:00:00Z"); bad=event(device,2,"conversation.record","conversations:wrong",{**payload,"row":["bad",*payload["row"][1:]]},[good["id"]],"2026-01-01T00:00:01Z")
     with pytest.raises(ValueError,match="schema"): project_many(tmp_path/"db",state,[("w",good),("w",bad)],"other")
-    db=duckdb.connect(str(tmp_path/"db"),read_only=True); assert db.execute("SELECT COUNT(*) FROM conversations").fetchone()[0]==0; db.close(); assert not state.execute("SELECT * FROM heads").fetchall() and not state.execute("SELECT * FROM imported_rows").fetchall()
+    db=duckdb.connect(str(tmp_path/"db"),read_only=True); assert db.execute("SELECT COUNT(*) FROM conversations").fetchone()[0]==0 and db.execute("SELECT COUNT(*) FROM remote.row_origins").fetchone()[0]==0; db.close(); assert not state.execute("SELECT * FROM heads").fetchall() and not state.execute("SELECT * FROM imported_rows").fetchall()
 
 
 def test_rebuild_unwraps_republished_history(tmp_path):
@@ -70,34 +72,34 @@ def test_rebuild_unwraps_republished_history(tmp_path):
 
 def test_record_schema_is_fixed_and_same_origin_ids_from_authors_do_not_collide(tmp_path):
     state=connect(tmp_path/"state.db"); a,b=identity("a"),identity("b"); cols=["id","source","title","created_at","updated_at","model","cwd","git_branch","project_id","metadata"]
-    for i,device in enumerate((a,b)): value=event(device,1,"conversation.record","conversations:c",{"table":"conversations","columns":cols,"row":["c","codex",device["name"],"2026-01-01","2026-01-01",None,None,None,None,"{}"]},[],f"2026-01-0{i+1}T00:00:00Z"); assert project(tmp_path/"db",state,value,"w","other")
-    assert {r[0] for r in duckdb.connect(str(tmp_path/"db"),read_only=True).execute("SELECT title FROM conversations").fetchall()}=={"a","b"}
+    for i,device in enumerate((a,b)): value=event(device,1,"conversation.record","conversations:c",{"table":"conversations","columns":cols,"row":["c","codex",device["name"],"2026-01-01","2026-01-01",None,None,None,None,"{}"]},[],f"2026-01-0{i+1}T00:00:00Z"); assert project(tmp_path/"db",state,value,"w","other",authors={device["id"]:f"user-{i}"})
+    db=duckdb.connect(str(tmp_path/"db"),read_only=True); assert {r[0] for r in db.execute("SELECT title FROM conversations").fetchall()}=={"a","b"} and {r[0] for r in db.execute("SELECT author_user_id FROM remote.row_origins").fetchall()}=={"user-0","user-1"}; db.close()
     bad=event(a,2,"conversation.record","conversations:x",{"table":"conversations","columns":["id); DROP TABLE conversations; --"],"row":["x"]},[],"2026-01-03T00:00:00Z")
     import pytest
     with pytest.raises(ValueError,match="schema"): project(tmp_path/"db",state,bad,"w","other")
 
 
 def test_team_scope_includes_prompt_turn_and_linked_repo_only(tmp_path):
-    repo,core=source(tmp_path); state=connect(tmp_path/"state.db"); personal=scan(core,state,"d"); rid=next(r["payload"]["id"] for r in personal if r["kind"]=="repository.observed"); team=scan(core,state,"d","team",[rid],[])
-    kinds=[r["kind"] for r in team]; assert kinds.count("conversation.record")==1 and kinds.count("message.record")==2 and "file_edit.record" in kinds and "changeset.observed" in kinds
+    repo,core=source(tmp_path); state=connect(tmp_path/"state.db"); personal=scan(core,state); rid=next(r["payload"]["id"] for r in personal if r["kind"]=="repository.observed"); team=scan(core,state,"team",[rid],[])
+    kinds=[r["kind"] for r in team]; assert kinds.count("conversation.record")==1 and kinds.count("message.record")==2 and "file_edit.record" in kinds and "edit.observed" in kinds and "changeset.observed" not in kinds
 
 
 def test_team_projection_never_reads_attachment_bodies(tmp_path,monkeypatch):
-    repo,core=source(tmp_path); body=tmp_path/"secret.bin"; body.write_bytes(b"secret"); core.execute("INSERT INTO attachments (id,message_id,filename,path) VALUES ('a','m','secret.bin',?)",[str(body)]); state=connect(tmp_path/"state.db"); personal=scan(core,state,"d"); rid=next(r["payload"]["id"] for r in personal if r["kind"]=="repository.observed")
+    repo,core=source(tmp_path); body=tmp_path/"secret.bin"; body.write_bytes(b"secret"); core.execute("INSERT INTO attachments (id,message_id,filename,path) VALUES ('a','m','secret.bin',?)",[str(body)]); state=connect(tmp_path/"state.db"); personal=scan(core,state); rid=next(r["payload"]["id"] for r in personal if r["kind"]=="repository.observed")
     original=Path.read_bytes; monkeypatch.setattr(Path,"read_bytes",lambda path:pytest.fail("team projection read attachment body") if path==body else original(path))
-    records=scan(core,state,"d","team",[rid],[])
+    records=scan(core,state,"team",[rid],[])
     assert any(r["kind"]=="attachment.record" for r in records) and not any(r["kind"]=="attachment.chunk" for r in records)
 
 
 def test_cross_repo_changeset_is_sliced_per_edit_with_opaque_boundary(tmp_path):
-    first,core=source(tmp_path); second=tmp_path/"second"; second.mkdir(); git(second,"init","-q"); git(second,"config","user.email","a@b.c"); git(second,"config","user.name","A"); (second/"private.py").write_text("private\n"); git(second,"add","."); git(second,"commit","-qm","init"); core.execute("INSERT INTO file_edits VALUES ('private','m',?,'write','private\n','2026-01-01 00:00:01',NULL)",[str(second/'private.py')]); state=connect(tmp_path/"state.db"); all_records=scan(core,state,"d"); repos={r["payload"]["remotes"][0] if r["payload"]["remotes"] else r["payload"]["id"]:r["payload"]["id"] for r in all_records if r["kind"]=="repository.observed"}; first_id=next(r["payload"]["id"] for r in all_records if r["kind"]=="repository.observed" and r["payload"]["head"]==git(first,"rev-parse","HEAD"))
-    sliced=scan(core,state,"d","team",[first_id],[]); assert sum(r["kind"]=="file_edit.record" for r in sliced)==1 and sum(r["kind"]=="edit.observed" for r in sliced)==1; boundary=next(r for r in sliced if r["kind"]=="changeset.boundary"); assert boundary["payload"]["hidden_count"]==1 and "private.py" not in json.dumps(sliced)
-    both=scan(core,state,"d","team",[r["payload"]["id"] for r in all_records if r["kind"]=="repository.observed"],[]); assert sum(r["kind"]=="edit.observed" for r in both)==2 and not any(r["kind"]=="changeset.boundary" for r in both)
+    first,core=source(tmp_path); second=tmp_path/"second"; second.mkdir(); git(second,"init","-q"); git(second,"config","user.email","a@b.c"); git(second,"config","user.name","A"); (second/"private.py").write_text("private\n"); git(second,"add","."); git(second,"commit","-qm","init"); core.execute("INSERT INTO file_edits VALUES ('private','m',?,'write','private\n','2026-01-01 00:00:01',NULL)",[str(second/'private.py')]); state=connect(tmp_path/"state.db"); all_records=scan(core,state); repos={r["payload"]["remotes"][0] if r["payload"]["remotes"] else r["payload"]["id"]:r["payload"]["id"] for r in all_records if r["kind"]=="repository.observed"}; first_id=next(r["payload"]["id"] for r in all_records if r["kind"]=="repository.observed" and r["payload"]["head"]==git(first,"rev-parse","HEAD"))
+    sliced=scan(core,state,"team",[first_id],[]); assert sum(r["kind"]=="file_edit.record" for r in sliced)==1 and sum(r["kind"]=="edit.observed" for r in sliced)==1; boundary=next(r for r in sliced if r["kind"]=="turn.boundary"); assert boundary["payload"]["hidden_count"]==1 and "private.py" not in json.dumps(sliced)
+    both=scan(core,state,"team",[r["payload"]["id"] for r in all_records if r["kind"]=="repository.observed"],[]); assert sum(r["kind"]=="edit.observed" for r in both)==2 and not any(r["kind"]=="turn.boundary" for r in both)
 
 
 def test_path_policy_uses_path_boundary_not_string_prefix(tmp_path):
     allowed,private=tmp_path/"project",tmp_path/"project-private"; allowed.mkdir(); private.mkdir(); (allowed/"a.py").write_text("a"); (private/"b.py").write_text("b"); core=duckdb.connect(str(tmp_path/"core.db")); init_schema(core); core.execute("INSERT INTO conversations VALUES ('c','codex','paths','2026-01-01','2026-01-01','m',?,NULL,NULL,'{}')",[str(tmp_path)]); core.execute("INSERT INTO messages VALUES ('m','c','assistant','done',NULL,'2026-01-01','m','{}',NULL,NULL)"); core.execute("INSERT INTO file_edits VALUES ('a','m',?,'write','a','2026-01-01',NULL),('b','m',?,'write','b','2026-01-01',NULL)",[str(allowed/'a.py'),str(private/'b.py')]); state=connect(tmp_path/"state.db")
-    records=scan(core,state,"d","team",[],[str(allowed)]); assert sum(r["kind"]=="file_edit.record" for r in records)==1 and "project-private" not in json.dumps(records)
+    records=scan(core,state,"team",[],[str(allowed)]); assert sum(r["kind"]=="file_edit.record" for r in records)==1 and "project-private" not in json.dumps(records)
 
 
 def test_per_workspace_device_chain_accepts_reorder_and_rejects_replay_or_bad_parent(tmp_path):

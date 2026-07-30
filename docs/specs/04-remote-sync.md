@@ -130,8 +130,12 @@ Required initial kinds:
 - `conversation.record`, `message.record`, `tool.record`, `attachment.record`,
   `artifact.record`, `file_edit.record`
 - `repository.observed`, `git.checkpoint`, `file.version`, `edit.observed`
-- `changeset.observed`, `changeset.member`, `identity.assertion`
+- `checkpoint.link`, `identity.assertion`
 - `capture.gap`, `workspace.policy`, `workspace.membership`
+
+Provenance events carry semantic references, not copied content: edit identity
+is `file_edits.id`, changeset identity is the existing message/turn, and prompt
+text is resolved from `messages` after projection.
 
 ## Envelopes and idempotency
 

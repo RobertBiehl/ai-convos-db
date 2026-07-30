@@ -53,7 +53,7 @@ convos remote graph conversation_changes --arg CONVERSATION_ID
 convos remote graph commit_conversations --arg GIT_COMMIT
 convos remote graph checkpoint_diff --arg CHECKPOINT_A..CHECKPOINT_B
 convos remote graph current_activity --arg /path/to/checkout
-convos remote graph team_activity --arg WORKSPACE_ID\|/path/to/checkout
+convos remote graph repository_activity --arg REPOSITORY_ID
 ```
 
 These views remain local and operate without server availability.

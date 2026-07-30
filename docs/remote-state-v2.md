@@ -36,6 +36,8 @@ DuckDB owns user-visible canonical content:
 - file versions and exact edit-to-file relationships;
 - Git checkpoints and checkpoint-to-edit evidence;
 - identity assertions and capture gaps.
+- durable `remote.row_origins` attribution for every remotely projected archive
+  row, written atomically with that row.
 
 Canonical provenance uses existing archive identities. It does not duplicate
 prompt text, message content, changesets, or file edits. Prompts are resolved
@@ -43,18 +45,19 @@ from `messages`; changesets reference the existing message or turn; provenance
 edges reference `file_edits.id`.
 
 DuckDB never stores remote cursors, retry state, workspace policy, event
-envelopes, publication receipts, or imported-row attribution whose only
-consumer is synchronization.
+envelopes, or publication receipts. Row origin is the narrow exception because
+it determines authorship and whether an archive row may ever be published.
 
 ### Changegraph
 
-The changegraph product owns Git enrichment, provenance capture, exact graph
-queries, blame, timelines, and presentation. It writes the core-owned
-provenance contract in DuckDB and does not maintain another durable graph
-database.
+Core captures Git enrichment during every ingestion path and writes the
+canonical provenance contract independently of installed applications.
+Changegraph is strictly read-only: it owns exact graph queries, blame,
+timelines, and presentation, and does not maintain another graph database.
 
-The remote product reuses the same canonical projector for verified incoming
-provenance facts. Remote event shapes do not become core API.
+The remote product submits verified typed archive rows, origins, and provenance
+facts through core projectors. Remote event shapes do not become core API and
+Remote contains no DuckDB mutation SQL.
 
 ### Remote state
 
@@ -62,7 +65,6 @@ Long-lived `state.db` rows contain only:
 
 - lifecycle and schema version;
 - workspace cursors and advertised relay tail;
-- `(table_name, row_id) -> event_id` imported attribution;
 - `(workspace, entity, revision) -> event_id` publication receipts;
 - current per-author entity heads;
 - exact `(workspace, author, sequence) -> event_id` sequence identity;
@@ -101,6 +103,11 @@ Core initializes a `provenance` DuckDB schema with these relations:
 - `checkpoint_edits`
 - `assertions`
 - `capture_gaps`
+
+Core also initializes `remote.row_origins`, a compact canonical attribution
+relation containing the physical row, source row, workspace, author user and
+device, signed source event, logical content key, and observation time. It
+contains identifiers only, never event bodies or duplicated archive content.
 
 Local absolute checkout paths are local-only and are never serialized to a
 remote canonical event. Remote workspace boundaries and device activity remain
@@ -151,7 +158,7 @@ A ready synchronization cycle:
 1. Acquire the process lock and refresh signed control state.
 2. Retry already committed encrypted outbox entries.
 3. Pull and project to the relay's advertised tail.
-4. Capture and reconcile local canonical changes.
+4. Read core-captured local canonical changes and reconcile them.
 5. Atomically enqueue new signed encrypted events and publication receipts.
 6. Upload the outbox.
 7. Pull once more if upload or concurrent writers advanced the tail.
@@ -250,7 +257,10 @@ Migration is side by side, resumable, and never mutates the only usable state:
 3. Create a new state database beside the old one.
 4. Populate compact metadata from the old ledger and verify it against relay
    tail where available.
-5. Populate canonical DuckDB provenance in one transaction.
+5. Create a staging `provenance` schema in the existing core DuckDB, populate
+   it from `file_edits` plus the old local provenance ledger, validate it, and
+   publish it in one DuckDB transaction. Existing archive tables are never
+   rewritten; a failure rolls back the new schema population.
 6. Validate row attribution, publication revisions, heads, sequence identity,
    cursors, projection counts, and hashes.
 7. Atomically replace state only after every validation succeeds.

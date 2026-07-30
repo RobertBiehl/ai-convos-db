@@ -1,11 +1,11 @@
-import copy, json, os, sqlite3
+import copy, json, os, sqlite3, subprocess
 
 import duckdb
 import pytest
 import ai_convos_memory as memory_module
 import ai_convos_remote as remote_client
 from cryptography.exceptions import InvalidSignature
-from ai_convos.cli import init_schema
+from ai_convos.cli import capture_provenance, init_schema
 from ai_convos_remote import (_upload_batches, add_member, approve_device, approve_history, connect, control_body, create, fetch_lazy, grant_all, grant_selected, key, load, pull, publish, refresh, remove_device,
                               request_device, request_history, setup_client, sync_once, upload, workspace)
 from ai_convos_remote.control import sign as control_sign, vote as device_vote
@@ -28,11 +28,18 @@ def test_upload_batches_bound_count_and_wire_size():
     assert [len(x) for x in _upload_batches([row(1)]*501,1000)]==[500,1] and [len(x) for x in _upload_batches([row(6)]*2,10)]==[1,1]
 
 
+def test_remote_scan_is_read_only_and_does_not_self_trigger(tmp_path,monkeypatch):
+    server=server_connect(tmp_path/"server.db"); monkeypatch.setattr("ai_convos_remote.request",transport(server)); monkeypatch.setattr("ai_convos_remote.drain_hooks",lambda:None); root=tmp_path/"client"; setup_client("http://server","alice",root=root); repo=root/"repo"; repo.mkdir(parents=True); subprocess.run(("git","-C",str(repo),"init","-q"),check=True); subprocess.run(("git","-C",str(repo),"config","user.email","a@b.c"),check=True); subprocess.run(("git","-C",str(repo),"config","user.name","A"),check=True); (repo/"a.py").write_text("one\n"); subprocess.run(("git","-C",str(repo),"add","."),check=True); subprocess.run(("git","-C",str(repo),"commit","-qm","initial"),check=True)
+    path=root/"data/convos.db"; path.parent.mkdir(); db=duckdb.connect(str(path)); init_schema(db); db.execute("INSERT INTO conversations VALUES ('c','codex','provenance','2026-01-01','2026-01-01',NULL,?,NULL,NULL,'{}')",[str(repo)]); db.execute("INSERT INTO messages VALUES ('m','c','assistant','done',NULL,'2026-01-01',NULL,'{}',NULL,NULL)"); db.execute("INSERT INTO file_edits VALUES ('e','m',?,'write','one\n','2026-01-01',NULL)",[str(repo/"a.py")]); capture_provenance(db); db.close(); sync_once(root,True)
+    state=connect(root/"remote/state.db"); ws=workspace(load(root),"Personal"); stamp=int(state.execute("SELECT value FROM meta WHERE key=?",(f"core_mtime:{ws}",)).fetchone()[0]); state.close(); db=duckdb.connect(str(path),read_only=True); observed=db.execute("SELECT observed_at FROM provenance.repositories").fetchone()[0]; db.close(); count=server.execute("SELECT COUNT(*) FROM events").fetchone()[0]; assert stamp==path.stat().st_mtime_ns
+    sync_once(root); db=duckdb.connect(str(path),read_only=True); assert db.execute("SELECT observed_at FROM provenance.repositories").fetchone()[0]==observed; db.close(); assert server.execute("SELECT COUNT(*) FROM events").fetchone()[0]==count
+
+
 def test_personal_recovery_multidevice_delivery_and_replay(tmp_path,monkeypatch):
     server=server_connect(tmp_path/"server.db"); monkeypatch.setattr("ai_convos_remote.request",transport(server)); a,b=tmp_path/"a",tmp_path/"b"
     alice,recovery=setup_client("http://server","alice","laptop",root=a); ws=workspace(alice,"Personal"); state_a=connect(a/"remote/state.db"); publish(alice,state_a,ws,conversation(),a); upload(alice,state_a,a)
     desktop,_=setup_client("http://server","alice","desktop",recovery,root=b); state_b=connect(b/"remote/state.db"); pull(desktop,state_b,b); pull(desktop,state_b,b)
-    db=duckdb.connect(str(b/"data/convos.db"),read_only=True); assert db.execute("SELECT title FROM conversations").fetchall()==[("shared",)]; db.close()
+    db=duckdb.connect(str(b/"data/convos.db"),read_only=True); assert db.execute("SELECT title FROM conversations").fetchall()==[("shared",)] and db.execute("SELECT author_user_id FROM remote.row_origins").fetchone()[0]==alice["user"]; db.close()
     assert len(load(b)["keys"])==2 and server.execute("SELECT epoch FROM workspaces WHERE id=?",(ws,)).fetchone()[0]==2
     assert os.stat(a/"remote").st_mode&0o777==0o700 and os.stat(a/"remote/config.json").st_mode&0o777==0o600 and os.stat(a/"remote/state.db").st_mode&0o777==0o600
 
@@ -157,7 +164,7 @@ def test_lazy_fetch_rejects_swapped_envelope(tmp_path,monkeypatch):
 
 def test_attachment_bytes_are_redacted_lazy_and_reassembled(tmp_path,monkeypatch):
     server=server_connect(tmp_path/"server.db"); monkeypatch.setattr("ai_convos_remote.request",transport(server)); a,b=tmp_path/"a",tmp_path/"b"; alice,recovery=setup_client("http://server","alice",root=a); desktop,_=setup_client("http://server","alice","desktop",recovery,root=b); alice=load(a); ws=workspace(alice,"Personal"); state_a,state_b=connect(a/"remote/state.db"),connect(b/"remote/state.db")
-    payload=bytes(range(256))*800; source=tmp_path/"private"/"evidence.bin"; source.parent.mkdir(); source.write_bytes(payload); (a/"data").mkdir(); core=duckdb.connect(str(a/"data/convos.db")); init_schema(core); core.execute("INSERT INTO conversations VALUES ('c','codex','attachment','2026-01-01','2026-01-01',NULL,NULL,NULL,NULL,'{}')"); core.execute("INSERT INTO messages VALUES ('m','c','user','see file',NULL,'2026-01-01',NULL,'{}',NULL,NULL)"); core.execute("INSERT INTO attachments VALUES ('a','m','evidence.bin','application/octet-stream',?,?,NULL,'2026-01-01')",(len(payload),str(source))); records=scan(core,state_a,alice["device"]["id"]); core.close()
+    payload=bytes(range(256))*800; source=tmp_path/"private"/"evidence.bin"; source.parent.mkdir(); source.write_bytes(payload); (a/"data").mkdir(); core=duckdb.connect(str(a/"data/convos.db")); init_schema(core); core.execute("INSERT INTO conversations VALUES ('c','codex','attachment','2026-01-01','2026-01-01',NULL,NULL,NULL,NULL,'{}')"); core.execute("INSERT INTO messages VALUES ('m','c','user','see file',NULL,'2026-01-01',NULL,'{}',NULL,NULL)"); core.execute("INSERT INTO attachments VALUES ('a','m','evidence.bin','application/octet-stream',?,?,NULL,'2026-01-01')",(len(payload),str(source))); records=scan(core,state_a); core.close()
     assert str(source) not in json.dumps(records) and sum(r["kind"]=="attachment.chunk" for r in records)>1; [publish(alice,state_a,ws,r,a) for r in records]; upload(alice,state_a,a); pull(desktop,state_b,b); path=duckdb.connect(str(b/"data/convos.db"),read_only=True).execute("SELECT path FROM attachments").fetchone()[0]; assert open(path,"rb").read()==payload and os.stat(path).st_mode&0o777==0o600 and state_b.execute("SELECT COUNT(*) FROM lazy_events").fetchone()[0]==state_b.execute("SELECT COUNT(*) FROM attachment_chunks").fetchone()[0]==0
 
 
