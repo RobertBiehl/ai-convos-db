@@ -117,10 +117,10 @@ def apply_record(db_path,state,value,workspace,local_device=None,db=None):
     state.execute("INSERT OR REPLACE INTO heads VALUES (?,?,?,?)",(workspace,head,sort,value["id"])); state.execute("INSERT OR REPLACE INTO imported_rows VALUES (?,?,?)",(table,values[0],value["id"]));
     if own: state.commit()
     return True
-def project(db_path,state,value,workspace,local_device=None,db=None,root=None):
+def project(db_path,state,value,workspace,local_device=None,db=None,root=None,batch=False):
     if value["kind"] in TABLES: return apply_record(db_path,state,value,workspace,local_device,db)
     if value["kind"]=="workspace.policy":
-        p=value["payload"]; state.execute("INSERT OR REPLACE INTO policies VALUES (?,?,?,COALESCE((SELECT local_root FROM policies WHERE workspace=? AND kind=? AND value=?),NULL))",(workspace,p["kind"],p["value"],workspace,p["kind"],p["value"])); state.commit(); return True
+        p=value["payload"]; state.execute("INSERT OR REPLACE INTO policies VALUES (?,?,?,COALESCE((SELECT local_root FROM policies WHERE workspace=? AND kind=? AND value=?),NULL))",(workspace,p["kind"],p["value"],workspace,p["kind"],p["value"])); batch or state.commit(); return True
     if value["kind"]=="attachment.chunk":
         if value["author"]==local_device: return False
         p=value["payload"]; data=base64.b64decode(p["data"],validate=True); encoded=base64.b64encode(data).decode(); expected=f"attachment:{p['attachment']}:{p['blob']}:{p['index']}"
@@ -134,18 +134,26 @@ def project(db_path,state,value,workspace,local_device=None,db=None,root=None):
             if len(content)!=p["size"] or hashlib.sha256(content).hexdigest()!=p["sha256"]: raise ValueError("attachment hash mismatch")
             path=Path(db_path).parent.parent/"remote/attachments"/workspace/p["blob"]; path.parent.mkdir(parents=True,exist_ok=True); tmp=path.with_name(f".{path.name}.{os.getpid()}"); tmp.write_bytes(content); os.chmod(tmp,0o600); os.replace(tmp,path); state.execute("INSERT OR REPLACE INTO attachment_blobs VALUES (?,?,?,?)",(workspace,value["author"],p["attachment"],str(path))); state.execute("DELETE FROM attachment_chunks WHERE workspace=? AND author=? AND blob=?",(workspace,value["author"],p["blob"])); target=foreign_id(workspace,value["author"],"attachments",p["attachment"]); target_db=db or (duckdb.connect(str(db_path)) if Path(db_path).exists() else None)
             if target_db: target_db.execute("UPDATE attachments SET path=? WHERE id=?",(str(path),target)); db or target_db.close()
-        state.commit(); return True
+        batch or state.commit(); return True
     if root is not None:
         for bridge in bridges():
             if (result:=bridge["project"](root,state,value,workspace,local_device)) is not None: return result
-    return project_graph(state,value,workspace)
-def project_many(db_path,state,items,local_device=None,root=None):
+    return project_graph(state,value,workspace,not batch)
+def project_many(db_path,state,items,local_device=None,root=None,commit=True):
     records=any(v["kind"] in TABLES and v["author"]!=local_device for _,v in items); db=None
     if records: Path(db_path).parent.mkdir(parents=True,exist_ok=True); db=duckdb.connect(str(db_path)); init_schema(db)
-    try: [project(db_path,state,v,ws,local_device,db,root) for ws,v in items]
+    committed=False
+    try:
+        if db: db.execute("BEGIN")
+        [project(db_path,state,v,ws,local_device,db,root,True) for ws,v in items]
+        if db: db.execute("COMMIT"); committed=True
+        commit and state.commit()
+    except BaseException:
+        if db and not committed: db.execute("ROLLBACK")
+        state.rollback(); raise
     finally:
         if db: db.close()
-    state.commit(); return len(items)
+    return len(items)
 def rebuild(db_path,state,local_device=None,device=None):
     path=Path(db_path); path.unlink(missing_ok=True); [state.execute(f"DELETE FROM {table}") for table in ("raw_events","repositories","files","file_versions","changesets","edits","changeset_repositories","checkpoints","checkpoint_changesets","assertions","gaps","boundaries","heads","imported_rows","attachment_chunks","attachment_blobs")]; rows=state.execute("SELECT workspace,event_json FROM event_log ORDER BY json_extract(event_json,'$.observed_at'),event").fetchall()
     project_many(path,state,[(workspace,value) for workspace,raw in rows if (value:=material_event(json.loads(raw),device=device))]); return len(rows)
