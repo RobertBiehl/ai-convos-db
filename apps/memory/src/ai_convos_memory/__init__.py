@@ -318,21 +318,26 @@ def remote_records(root,state,workspace,kind):
         EXISTS(SELECT 1 FROM links l JOIN sources s ON s.id=l.source WHERE l.canonical=c.id AND s.provider<>'remote') local_origin,
         EXISTS(SELECT 1 FROM links l JOIN sources s ON s.id=l.source WHERE l.canonical=c.id AND s.provider='remote' AND s.hash=c.hash) remote_exact
         FROM canonicals c ORDER BY c.id""")]; repositories = {r["scope"]:dict(x) for r in rows if (x := db.execute("SELECT repository,lineage FROM repository_scopes WHERE scope=? ORDER BY checkout LIKE 'remote:%',checkout LIMIT 1",(r["scope"],)).fetchone())}; db.close(); published = {}
-    for raw, in state.execute("SELECT e.event_json FROM published p JOIN event_log e ON e.event=p.event WHERE p.workspace=? AND json_extract(e.event_json,'$.kind')='memory.canonical' ORDER BY json_extract(e.event_json,'$.seq')",(workspace,)): payload=json.loads(raw)["payload"]; published[f"memory:{payload['scope']}:{payload['canonical']}"] = payload
+    for entity,status,seq in state.execute("SELECT r.entity,r.status,r.seq FROM published p JOIN receipts r ON r.workspace=p.workspace AND r.event=p.event WHERE p.workspace=? AND r.kind='memory.canonical' ORDER BY r.seq",(workspace,)): published[entity.rsplit(":part:",1)[0]] = status
     records, seen = [], set()
     for row in rows:
         repo = repositories.get(row["scope"]); scope = repo["repository"] if repo else "global" if row["scope"] == "global" else "scope_"+_hash(row["scope"])[:20]; entity = f"memory:{scope}:{row['id']}"; seen.add(entity)
         if row["local_origin"] or not row["remote_exact"] or entity in published:
-            data=row["content"].encode(); chunks=[data[i:i+24576] for i in range(0,len(data),24576)] or [b""]; common=dict(v=2,canonical=row["id"],scope=scope,repository=repo["repository"] if repo else None,lineage=repo["lineage"] if repo else None,status="active",hash=row["hash"],total=len(chunks))
+            data=row["content"].encode(); chunks=[data[i:i+24576] for i in range(0,len(data),24576)] or [b""]; common=dict(v=3,canonical=row["id"],scope=scope,repository=repo["repository"] if repo else None,lineage=repo["lineage"] if repo else None,status="active",hash=row["hash"],total=len(chunks))
             records += [dict(kind="memory.canonical",entity=f"{entity}:part:{i}",payload={**common,"part":i,"content":base64.b64encode(chunk).decode()}) for i,chunk in enumerate(chunks)]
-    records += [dict(kind="memory.canonical",entity=entity,payload={**{k:v for k,v in payload.items() if k not in ("content","part","total")},"v":2,"status":"deleted"}) for entity,payload in published.items() if entity not in seen and payload["status"] == "active"]
+    records += [dict(kind="memory.canonical",entity=entity,payload={"v":3,"canonical":entity.split(":",2)[2],"scope":entity.split(":",2)[1],"status":"deleted"}) for entity,status in published.items() if entity not in seen and status=="active"]
     return records
 def _remote_apply(db,root,workspace,author,entity,p,content,observed_at):
-    scopes=[r[0] for r in db.execute("SELECT DISTINCT scope FROM repository_scopes WHERE repository=? ORDER BY scope",(p["repository"],))] if p["repository"] else []
-    if len(scopes)>1: raise ValueError("Remote repository maps to multiple memory scopes")
-    target=scopes[0] if scopes else "global" if p["scope"]=="global" else "remote:"+p["scope"]
-    if p["repository"] and not scopes: db.execute("INSERT OR IGNORE INTO repository_scopes VALUES (?,?,?,?,?)",(p["repository"],p["lineage"],target,"remote:"+p["repository"],observed_at))
-    locator=f"{workspace}/{author}/{entity}"; found=db.execute("SELECT id,scope FROM sources WHERE provider='remote' AND locator=?",(locator,)).fetchone(); sid=found["id"] if found else _hash("\0".join(("remote",target,locator)))[:20]; target=found["scope"] if found else target
+    locator=f"{workspace}/{author}/{entity}"; found=db.execute("SELECT id,scope FROM sources WHERE provider='remote' AND locator=?",(locator,)).fetchone()
+    if content is None:
+        if not found: return
+        sid,target=found["id"],found["scope"]
+    else:
+        scopes=[r[0] for r in db.execute("SELECT DISTINCT scope FROM repository_scopes WHERE repository=? ORDER BY scope",(p["repository"],))] if p["repository"] else []
+        if len(scopes)>1: raise ValueError("Remote repository maps to multiple memory scopes")
+        target=scopes[0] if scopes else "global" if p["scope"]=="global" else "remote:"+p["scope"]
+        if p["repository"] and not scopes: db.execute("INSERT OR IGNORE INTO repository_scopes VALUES (?,?,?,?,?)",(p["repository"],p["lineage"],target,"remote:"+p["repository"],observed_at))
+        sid=found["id"] if found else _hash("\0".join(("remote",target,locator)))[:20]; target=found["scope"] if found else target
     if content is not None:
         digest=p["hash"]; link=db.execute("SELECT l.canonical,l.applied_hash,c.hash FROM links l JOIN canonicals c ON c.id=l.canonical WHERE l.source=?",(sid,)).fetchone(); db.execute("""INSERT INTO sources VALUES (?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET hash=excluded.hash,content=excluded.content,active=1,observed_at=excluded.observed_at""",(sid,"remote",target,locator,str(Path(root)/"remote/state.db"),digest,content,1,observed_at)); db.execute("INSERT OR IGNORE INTO revisions VALUES (?,?,?,?)",(sid,digest,content,observed_at))
         blocked=link and db.execute("SELECT 1 FROM links l JOIN sources s ON s.id=l.source WHERE l.canonical=? AND s.id<>? AND (NOT s.active OR s.hash<>l.applied_hash) LIMIT 1",(link["canonical"],sid)).fetchone()
@@ -347,26 +352,25 @@ def _remote_apply(db,root,workspace,author,entity,p,content,observed_at):
 def remote_project(root,state,value,workspace,local_device):
     if value["kind"] != "memory.canonical": return None
     if value["author"] == local_device: return False
-    p=value["payload"]; active=p.get("status")=="active"; common={"v","canonical","scope","repository","lineage","status","hash"}; required=common|({"content"} if active and p.get("v")==1 else {"content","part","total"} if active else set()); entity=f"memory:{p.get('scope')}:{p.get('canonical')}"
-    if set(p)!=required or p.get("v") not in (1,2) or isinstance(p.get("v"),bool) or not all(isinstance(p.get(k),str) and p[k] for k in ("canonical","scope","status","hash")) or not re.fullmatch(r"[0-9a-f]{64}",p["hash"]) or p["repository"] is not None and not isinstance(p["repository"],str) or p["lineage"] is not None and not isinstance(p["lineage"],str) or p["repository"] is None and p["lineage"] is not None or p["status"] not in ("active","deleted") or not isinstance(value.get("observed_at"),str) or not isinstance(value.get("seq"),int) or isinstance(value["seq"],bool) or value["seq"]<1: raise ValueError("Malformed remote memory event")
-    if active and p["v"]==1:
-        if not isinstance(p["content"],str) or _hash(p["content"])!=p["hash"] or value["entity"]!=entity: raise ValueError("Malformed remote memory event")
-        content=p["content"]
-    elif active:
+    p=value["payload"]; active=p.get("status")=="active"; required={"v","canonical","scope","status"}|({"repository","lineage","hash","content","part","total"} if active else set()); entity=f"memory:{p.get('scope')}:{p.get('canonical')}"
+    if set(p)!=required or p.get("v")!=3 or isinstance(p.get("v"),bool) or not all(isinstance(p.get(k),str) and p[k] for k in ("canonical","scope","status")) or active and (not isinstance(p["hash"],str) or not re.fullmatch(r"[0-9a-f]{64}",p["hash"]) or p["repository"] is not None and not isinstance(p["repository"],str) or p["lineage"] is not None and not isinstance(p["lineage"],str) or p["repository"] is None and p["lineage"] is not None) or p["status"] not in ("active","deleted") or not isinstance(value.get("observed_at"),str) or not isinstance(value.get("seq"),int) or isinstance(value["seq"],bool) or value["seq"]<1: raise ValueError("Malformed remote memory event")
+    if active:
         if not isinstance(p["part"],int) or isinstance(p["part"],bool) or not isinstance(p["total"],int) or isinstance(p["total"],bool) or not 0<=p["part"]<p["total"]<=4096 or not isinstance(p["content"],str) or len(p["content"])>32768 or value["entity"]!=f"{entity}:part:{p['part']}": raise ValueError("Malformed remote memory event")
         try: part=base64.b64decode(p["content"],validate=True)
         except (ValueError,TypeError) as e: raise ValueError("Malformed remote memory event") from e
         if len(part)>24576: raise ValueError("Malformed remote memory event")
         content=None
-    elif value["entity"]!=entity: raise ValueError("Malformed remote memory event")
+    else:
+        content=None
+        if value["entity"]!=entity: raise ValueError("Malformed remote memory event")
+    if not active: state.execute("DELETE FROM receipts WHERE workspace=? AND author=? AND kind='memory.canonical' AND status='active' AND (entity=? OR entity LIKE ?)",(workspace,value["author"],entity,entity+":part:%"))
     db=connect(root); head=db.execute("SELECT seq,event FROM remote_heads WHERE workspace=? AND author=? AND entity=?",(workspace,value["author"],value["entity"])).fetchone()
     if head and (head["seq"] > value["seq"] or head["seq"] == value["seq"] and head["event"] == value["id"]):
-        if not active: state.execute("DELETE FROM event_log WHERE workspace=? AND event<>? AND json_extract(event_json,'$.author')=? AND json_extract(event_json,'$.kind')='memory.canonical' AND json_extract(event_json,'$.payload.scope')=? AND json_extract(event_json,'$.payload.canonical')=?",(workspace,value["id"],value["author"],p["scope"],p["canonical"]))
         db.close(); return False
     if head and head["seq"] == value["seq"]: db.close(); raise ValueError("Remote memory sequence replay")
     try:
         db.execute("BEGIN IMMEDIATE")
-        if active and p["v"]==2:
+        if active:
             old=db.execute("SELECT total,content FROM remote_parts WHERE workspace=? AND author=? AND entity=? AND hash=? AND idx=?",(workspace,value["author"],entity,p["hash"],p["part"])).fetchone()
             if old and (old["total"]!=p["total"] or old["content"]!=part): raise ValueError("Remote memory chunk conflict")
             db.execute("INSERT OR IGNORE INTO remote_parts VALUES (?,?,?,?,?,?,?,?,?,?)",(workspace,value["author"],entity,p["hash"],p["part"],p["total"],part,value["observed_at"],value["seq"],value["id"])); db.execute("INSERT OR REPLACE INTO remote_heads VALUES (?,?,?,?,?)",(workspace,value["author"],value["entity"],value["seq"],value["id"])); parts=db.execute("SELECT idx,total,content,observed_at,seq,event FROM remote_parts WHERE workspace=? AND author=? AND entity=? AND hash=? ORDER BY idx",(workspace,value["author"],entity,p["hash"])).fetchall()
@@ -379,16 +383,15 @@ def remote_project(root,state,value,workspace,local_device):
                 db.execute("DELETE FROM remote_parts WHERE workspace=? AND author=? AND entity=?",(workspace,value["author"],entity))
         else:
             _remote_apply(db,root,workspace,value["author"],entity,p,content if active else None,value["observed_at"]); db.execute("DELETE FROM remote_parts WHERE workspace=? AND author=? AND entity=?",(workspace,value["author"],entity)); db.execute("INSERT OR REPLACE INTO remote_heads VALUES (?,?,?,?,?)",(workspace,value["author"],entity,value["seq"],value["id"]))
-            if not active: state.execute("DELETE FROM event_log WHERE workspace=? AND event<>? AND json_extract(event_json,'$.author')=? AND json_extract(event_json,'$.kind')='memory.canonical' AND json_extract(event_json,'$.payload.scope')=? AND json_extract(event_json,'$.payload.canonical')=?",(workspace,value["id"],value["author"],p["scope"],p["canonical"]))
         db.commit()
     except BaseException: db.rollback(); db.close(); raise
     db.close(); return True
 def remote_purges(root,state,workspace,kind):
     if kind!="personal": return []
     groups={}
-    for event,cursor,raw in state.execute("SELECT e.event,e.cursor,e.event_json FROM published p JOIN event_log e ON e.event=p.event WHERE p.workspace=? AND e.direction='out' AND json_extract(e.event_json,'$.kind')='memory.canonical' ORDER BY json_extract(e.event_json,'$.seq')",(workspace,)):
-        p=json.loads(raw)["payload"]; group=groups.setdefault(f"{p['scope']}:{p['canonical']}",dict(active=[])); group["latest"]=(p["status"],cursor); p["status"]=="active" and group["active"].append(event)
-    return [event for group in groups.values() if group["latest"][0]=="deleted" and group["latest"][1]>0 for event in group["active"]]
+    for event,cursor,entity,status in state.execute("SELECT r.event,r.cursor,r.entity,r.status FROM published p JOIN receipts r ON r.workspace=p.workspace AND r.event=p.event WHERE p.workspace=? AND r.kind='memory.canonical' ORDER BY r.seq",(workspace,)):
+        group=groups.setdefault(entity.rsplit(":part:",1)[0],dict(active=[])); group["latest"]=(status,cursor); status=="active" and group["active"].append(event)
+    return [event for group in groups.values() if group["latest"][0]=="deleted" for event in group["active"]]
 def remote_bridge(): return dict(v=2,records=remote_records,project=remote_project,purges=remote_purges)
 def _skill_source():
     rel = Path("skills")/"agent-convos"/"SKILL.md"; root = Path(os.environ.get("CONVOS_PROJECT_ROOT", Path.home()/".convos")).expanduser()

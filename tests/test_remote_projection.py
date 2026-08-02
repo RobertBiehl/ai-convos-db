@@ -1,4 +1,4 @@
-import json, subprocess
+import json, os, subprocess
 from pathlib import Path
 
 import duckdb
@@ -6,8 +6,8 @@ import pytest
 from ai_convos.cli import init_schema
 import ai_convos_remote.projection as projection_module
 from ai_convos_remote import publish
-from ai_convos_remote.projection import bridges, connect, project, project_many, rebuild, scan, sequence
-from ai_convos_remote.protocol import b64, digest, event, identity, seal_history
+from ai_convos_remote.projection import bridges, connect, project, project_many, scan, sequence
+from ai_convos_remote.protocol import b64, digest, event, identity
 
 
 def git(path,*args): return subprocess.run(("git","-C",str(path),*args),check=True,capture_output=True).stdout.decode().strip()
@@ -16,24 +16,30 @@ def source(tmp_path):
     db=duckdb.connect(str(tmp_path/"source.db")); init_schema(db); db.execute("INSERT INTO conversations VALUES ('c','codex','title','2026-01-01','2026-01-01','m',?,NULL,NULL,'{}')",[str(repo)]); db.execute("INSERT INTO messages VALUES ('u','c','user','change it',NULL,'2026-01-01 00:00:00','m','{}',NULL,NULL),('m','c','assistant','done',NULL,'2026-01-01 00:00:01','m','{}',NULL,NULL)"); db.execute("INSERT INTO file_edits VALUES ('e','m',?,'write','new\n','2026-01-01 00:00:01',NULL)",[str(repo/'a.py')]); return repo,db
 
 
-def test_personal_scan_strips_local_roots_and_rebuilds_duckdb(tmp_path):
+def test_personal_scan_strips_local_roots_and_projects_duckdb(tmp_path):
     repo,core=source(tmp_path); state=connect(tmp_path/"state.db"); records=scan(core,state); raw=json.dumps(records)
     assert str(repo) not in raw and len(records)>3
     remote=identity("remote"); events=[event(remote,i+1,r["kind"],r["entity"],r["payload"],[],f"2026-01-01T00:00:{i:02d}Z") for i,r in enumerate(records)]
-    for i,value in enumerate(events): state.execute("INSERT INTO event_log VALUES (?,?,?,?,?,?)",("personal",value["id"],i,"in",json.dumps(value),"{}")); project(tmp_path/"target.db",state,value,"personal","other-device")
+    for value in events: project(tmp_path/"target.db",state,value,"personal","other-device")
     target=duckdb.connect(str(tmp_path/"target.db"),read_only=True); assert target.execute("SELECT title,cwd FROM conversations").fetchone()==("title",None); assert target.execute("SELECT content FROM messages WHERE role='user'").fetchone()[0]=="change it"; assert target.execute("SELECT file_path FROM file_edits").fetchone()[0]=="a.py"; before=target.execute("SELECT COUNT(*) FROM provenance.file_edit_files").fetchone()[0]; assert target.execute("SELECT x.file_edit_id=fe.id FROM provenance.file_edit_files x JOIN file_edits fe ON fe.id=x.file_edit_id").fetchone()[0]; assert target.execute("SELECT COUNT(*) FROM remote.row_origins").fetchone()[0]==sum(e["kind"] in projection_module.TABLES for e in events); target.close()
     fresh=connect(tmp_path/"fresh-state.db"); imported=duckdb.connect(str(tmp_path/"target.db"),read_only=True); assert scan(imported,fresh)==[]; imported.close(); fresh.close()
     old={"raw_events","repositories","files","file_versions","changesets","edits","changeset_repositories","checkpoints","checkpoint_changesets","assertions","gaps","boundaries"}; assert not old&{r[0] for r in state.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
-    (tmp_path/"target.db").unlink(); assert rebuild(tmp_path/"target.db",state)==len(events); rebuilt=duckdb.connect(str(tmp_path/"target.db"),read_only=True); assert rebuilt.execute("SELECT COUNT(*) FROM messages").fetchone()[0]==2 and rebuilt.execute("SELECT COUNT(*) FROM provenance.file_edit_files").fetchone()[0]==before; rebuilt.close()
+    assert not {"event_log","history_material","history_outbox","attachment_chunks","imported_rows"}&{r[0] for r in state.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+
+
+def test_old_state_is_rejected_before_new_schema_is_written(tmp_path):
+    path=tmp_path/"state.db"; db=__import__("sqlite3").connect(path); db.execute("CREATE TABLE meta(key TEXT PRIMARY KEY,value TEXT)"); db.execute("INSERT INTO meta VALUES ('state_schema','2')"); db.commit(); db.close()
+    with pytest.raises(ValueError,match="migration required"): connect(path)
+    db=__import__("sqlite3").connect(path); assert not db.execute("SELECT 1 FROM sqlite_master WHERE name='outbox'").fetchone(); db.close()
 
 
 def test_unchanged_provenance_does_not_republish_but_file_change_does(tmp_path):
     repo,core=source(tmp_path); state=connect(tmp_path/"state.db"); device=identity(); ws="personal"; cfg={"device":device,"workspaces":{ws:{"kind":"personal","epoch":1}},"keys":{f"{ws}:1":b64(bytes(range(32)))}}; known=set()
     first=scan(core,state); timed=[r for r in first if r["kind"] in ("git.checkpoint","file.version","capture.gap")]; assert timed and all("observed_at" in r and "observed_at" not in r["payload"] for r in timed)
-    assert all(publish(cfg,state,ws,r,tmp_path/"client",True,known) for r in first); baseline=state.execute("SELECT COUNT(*) FROM event_log").fetchone()[0]
-    assert not any(publish(cfg,state,ws,r,tmp_path/"client",True,known) for r in scan(core,state)) and state.execute("SELECT COUNT(*) FROM event_log").fetchone()[0]==baseline
+    assert all(publish(cfg,state,ws,r,tmp_path/"client",True,known) for r in first); baseline=state.execute("SELECT COUNT(*) FROM outbox").fetchone()[0]
+    assert not any(publish(cfg,state,ws,r,tmp_path/"client",True,known) for r in scan(core,state)) and state.execute("SELECT COUNT(*) FROM outbox").fetchone()[0]==baseline
     (repo/"a.py").write_text("changed\n"); emitted={r["kind"] for r in scan(core,state) if publish(cfg,state,ws,r,tmp_path/"client",True,known)}
-    assert emitted=={"git.checkpoint","file.version"} and state.execute("SELECT COUNT(*) FROM event_log").fetchone()[0]==baseline+2
+    assert emitted=={"git.checkpoint","file.version"} and state.execute("SELECT COUNT(*) FROM outbox").fetchone()[0]==baseline+2
 
 
 def test_provenance_projection_uses_signed_event_timestamp(tmp_path):
@@ -61,13 +67,7 @@ def test_projection_batch_rolls_back_duckdb_and_state_together(tmp_path):
     state=connect(tmp_path/"state.db"); device=identity(); cols=["id","source","title","created_at","updated_at","model","cwd","git_branch","project_id","metadata"]; payload={"table":"conversations","columns":cols,"row":["c","codex","valid","2026-01-01","2026-01-01",None,None,None,None,"{}"]}
     good=event(device,1,"conversation.record","conversations:c",payload,[],"2026-01-01T00:00:00Z"); bad=event(device,2,"conversation.record","conversations:wrong",{**payload,"row":["bad",*payload["row"][1:]]},[good["id"]],"2026-01-01T00:00:01Z")
     with pytest.raises(ValueError,match="schema"): project_many(tmp_path/"db",state,[("w",good),("w",bad)],"other")
-    db=duckdb.connect(str(tmp_path/"db"),read_only=True); assert db.execute("SELECT COUNT(*) FROM conversations").fetchone()[0]==0 and db.execute("SELECT COUNT(*) FROM remote.row_origins").fetchone()[0]==0; db.close(); assert not state.execute("SELECT * FROM heads").fetchall() and not state.execute("SELECT * FROM imported_rows").fetchall()
-
-
-def test_rebuild_unwraps_republished_history(tmp_path):
-    state=connect(tmp_path/"state.db"); source_device,admin,recipient=identity("source"),identity("admin"),identity("recipient"); cols=["id","source","title","created_at","updated_at","model","cwd","git_branch","project_id","metadata"]; inner=event(source_device,1,"conversation.record","conversations:c",{"table":"conversations","columns":cols,"row":["c","codex","granted","2026-01-01","2026-01-01",None,None,None,None,"{}"]}); entity="history:c"; outer=event(admin,1,"history.republish",entity,{"target":"recipient","sealed":seal_history(inner,[recipient],entity)})
-    state.execute("INSERT INTO event_log VALUES (?,?,?,?,?,?)",("team",outer["id"],1,"in",json.dumps(outer),None)); assert rebuild(tmp_path/"rebuilt.db",state,device=recipient)==1
-    assert duckdb.connect(str(tmp_path/"rebuilt.db"),read_only=True).execute("SELECT title FROM conversations").fetchone()[0]=="granted"
+    db=duckdb.connect(str(tmp_path/"db"),read_only=True); assert db.execute("SELECT COUNT(*) FROM conversations").fetchone()[0]==0 and db.execute("SELECT COUNT(*) FROM remote.row_origins").fetchone()[0]==0; db.close(); assert not state.execute("SELECT * FROM heads").fetchall()
 
 
 def test_record_schema_is_fixed_and_same_origin_ids_from_authors_do_not_collide(tmp_path):
@@ -104,6 +104,7 @@ def test_path_policy_uses_path_boundary_not_string_prefix(tmp_path):
 
 def test_per_workspace_device_chain_accepts_reorder_and_rejects_replay_or_bad_parent(tmp_path):
     state=connect(tmp_path/"state.db"); device=identity(); first=event(device,1,"x","1",{},[],"2026-01-01T00:00:00Z"); second=event(device,2,"x","2",{},[first["id"]],"2026-01-01T00:00:01Z"); assert sequence(state,"team",second) and sequence(state,"team",first)
+    assert state.execute("SELECT COUNT(*) FROM event_sequences").fetchone()[0]==2 and state.execute("SELECT COUNT(*) FROM sequence_gaps").fetchone()[0]==0
     bad=event(device,3,"x","3",{},["wrong"],"2026-01-01T00:00:02Z")
     import pytest
     with pytest.raises(ValueError,match="chain"): sequence(state,"team",bad)
@@ -114,6 +115,7 @@ def test_per_workspace_device_chain_accepts_reorder_and_rejects_replay_or_bad_pa
 
 def test_attachment_chunk_conflicts_are_rejected(tmp_path):
     state=connect(tmp_path/"state.db"); device=identity(); data="eA=="; payload={"attachment":"a","blob":"2d711642b726b04401627ca9fbac32f5da7e5c8530fb1903cc4db02258717921","index":0,"total":2,"sha256":"2d711642b726b04401627ca9fbac32f5da7e5c8530fb1903cc4db02258717921","size":2,"data":data}; one=event(device,1,"attachment.chunk",f"attachment:a:{payload['blob']}:0",payload,[],"2026-01-01T00:00:00Z"); assert project(tmp_path/"db",state,one,"w","other")
+    path=Path(state.execute("SELECT path FROM attachment_parts").fetchone()[0]); assert path.read_bytes()==b"x" and os.stat(path).st_mode&0o777==0o600 and "data" not in {r[1] for r in state.execute("PRAGMA table_info(attachment_parts)")}
     import pytest
     changed={**payload,"total":3}; conflict=event(device,2,"attachment.chunk",f"attachment:a:{payload['blob']}:0",changed,[one["id"]],"2026-01-01T00:00:01Z")
     with pytest.raises(ValueError,match="conflict"): project(tmp_path/"db",state,conflict,"w","other")

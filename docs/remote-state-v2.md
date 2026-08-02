@@ -15,8 +15,8 @@ Remote state v2 keeps the existing DuckDB plus SQLite design, but removes
 overlapping authority:
 
 - DuckDB is the canonical archive, including canonical provenance facts.
-- `state.db` is a rebuildable synchronization index and pending ciphertext
-  outbox.
+- `state.db` is a rebuildable synchronization index. Pending ciphertext lives
+  in mode-0600 outbox files referenced by metadata rows.
 - The relay is the durable encrypted signed-event ledger.
 - Losing `state.db` never turns imported rows into local rows and never permits
   publication until exact attribution has been rebuilt.
@@ -69,13 +69,14 @@ Long-lived `state.db` rows contain only:
 - current per-author entity heads;
 - exact `(workspace, author, sequence) -> event_id` sequence identity;
 - compact parent data only for unresolved out-of-order gaps;
+- selected-history event IDs and content-free original-to-carrier mappings;
 - lazy/deferred event manifests, policies, retries, and last failure;
 - content-free acknowledged event receipts.
 
-The only content-bearing state permitted is an unacknowledged encrypted
-envelope. Plaintext event JSON, acknowledged envelopes, selected-history
-material, attachment chunk bodies, raw provenance JSON, prompts, and other
-derived content are forbidden.
+The only content-bearing remote working state permitted is an unacknowledged
+encrypted outbox file. Plaintext event JSON, acknowledged envelopes,
+selected-history material, attachment chunk bodies in SQLite, raw provenance
+JSON, prompts, and other derived content are forbidden.
 
 ### Relay
 
@@ -140,8 +141,8 @@ An absent, incompatible, or incomplete state with configured workspaces enters
 3. Pulls every authorized event from the earliest required cursor.
 4. Decrypts, authenticates, validates sequence identity, and materializes each
    event.
-5. Rebuilds imported attribution, published revisions, heads, exact sequences,
-   cursors, and canonical DuckDB projection.
+5. Rebuilds publication receipts, heads, exact sequences, and cursors while
+   projecting archive rows and their canonical DuckDB origins.
 6. Verifies that the advertised tail was reached without an unresolved event
    required by the installed protocol.
 7. Commits `READY`.
@@ -175,7 +176,7 @@ Incoming batches:
 
 1. Decrypt and verify in bounded memory.
 2. Apply idempotent DuckDB projection in one transaction.
-3. Commit SQLite attribution, heads, sequences, and cursor in one transaction.
+3. Commit SQLite heads, receipts, sequences, and cursor in one transaction.
 
 The cursor is always committed last. A crash after DuckDB commit replays the
 same batch; deterministic upserts make the retry harmless. The cursor can lag
@@ -184,10 +185,13 @@ the projection but cannot lead it.
 Outgoing events:
 
 1. Sign and seal the event.
-2. Commit its encrypted envelope, exact sequence identity, and publication
-   receipt atomically in SQLite.
-3. Upload idempotently by event ID.
-4. Replace the outbox row with a content-free receipt after acknowledgement.
+2. Atomically write its encrypted envelope to a mode-0600 file.
+3. Commit the file reference, exact sequence identity, and publication receipt
+   atomically in SQLite. A crash before this commit can leave only an
+   unreferenced encrypted file; a committed row always has its file.
+4. Upload idempotently by event ID.
+5. Replace the outbox row with a content-free receipt, commit, and remove the
+   encrypted file after acknowledgement.
 
 ## Content lifecycle
 

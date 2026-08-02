@@ -57,14 +57,14 @@ def seal_history(value,devices,context): key,nonce=os.urandom(32),os.urandom(12)
 def open_history(value,device,context): return json.loads(AESGCM(open_key(value["keys"][device["id"]],device["box_private"],context)).decrypt(unb64(value["nonce"]),unb64(value["ciphertext"]),context.encode()))
 
 def seal_event(value, workspace, epoch, key):
-    nonce = os.urandom(12); header = dict(v=V, workspace=workspace, epoch=epoch, event=value["id"], author=value["author"], seq=value["seq"], nonce=b64(nonce))
+    nonce = os.urandom(12); header = dict(v=V, workspace=workspace, epoch=epoch, event=value["id"], author=value["author"], seq=value["seq"], parents=value["parents"], nonce=b64(nonce))
     return {**header, "ciphertext":b64(AESGCM(key).encrypt(nonce, canon(value), canon(header)))}
 
 def open_event(envelope, key, sign_public):
     if envelope["v"] != V: raise ValueError(f"Unsupported envelope version {envelope['v']}")
-    header = {k:envelope[k] for k in ("v", "workspace", "epoch", "event", "author", "seq", "nonce")}; value = json.loads(AESGCM(key).decrypt(unb64(header["nonce"]), unb64(envelope["ciphertext"]), canon(header)))
+    header = {k:envelope[k] for k in ("v", "workspace", "epoch", "event", "author", "seq", "parents", "nonce")}; value = json.loads(AESGCM(key).decrypt(unb64(header["nonce"]), unb64(envelope["ciphertext"]), canon(header)))
     verify_event(value, sign_public)
-    if (value["id"], value["author"], value["seq"]) != (header["event"], header["author"], header["seq"]): raise ValueError("Envelope header mismatch")
+    if (value["id"], value["author"], value["seq"], value["parents"]) != (header["event"], header["author"], header["seq"], header["parents"]): raise ValueError("Envelope header mismatch")
     return value
 
 def _wrap_key(shared, context): return HKDF(algorithm=hashes.SHA256(), length=32, salt=None, info=b"convos-key-v1:" + context.encode()).derive(shared)

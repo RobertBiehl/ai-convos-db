@@ -77,14 +77,14 @@ def message(content,mid="m"):
 def test_every_team_publish_is_scrubbed_before_encryption_and_personal_is_lossless(tmp_path):
     cfg,keys=config(); state=connect(tmp_path/"remote/state.db"); secret="ghp_"+"A"*36
     publish(cfg,state,"team",message(secret),tmp_path); publish(cfg,state,"personal",message(secret,"p"),tmp_path)
-    team_raw,team_envelope=state.execute("SELECT event_json,envelope FROM event_log WHERE workspace='team'").fetchone(); team=json.loads(team_raw); personal=json.loads(state.execute("SELECT event_json FROM event_log WHERE workspace='personal'").fetchone()[0]); opened=open_event(json.loads(team_envelope),keys["team"],cfg["device"]["sign_public"])
-    assert secret not in json.dumps(team) and secret not in json.dumps(opened) and team["payload"]["row"][3]==opened["payload"]["row"][3]=="[REDACTED:github_token]" and personal["payload"]["row"][3]==secret
+    team_path=Path(state.execute("SELECT path FROM outbox WHERE workspace='team'").fetchone()[0]); personal_path=Path(state.execute("SELECT path FROM outbox WHERE workspace='personal'").fetchone()[0]); team=open_event(json.loads(team_path.read_text()),keys["team"],cfg["device"]["sign_public"]); personal=open_event(json.loads(personal_path.read_text()),keys["personal"],cfg["device"]["sign_public"])
+    assert secret not in json.dumps(team) and team["payload"]["row"][3]=="[REDACTED:github_token]" and personal["payload"]["row"][3]==secret and secret.encode() not in (tmp_path/"remote/state.db").read_bytes()
     audit=redact.audit_data(tmp_path); assert audit["status"]=="redacted" and audit["total"]==1 and secret not in json.dumps(audit) and not secret.encode() in (tmp_path/"redact/audit.db").read_bytes()
 
 
 def test_team_attachments_are_omitted_and_audited_without_reading_body(tmp_path):
     cfg,_=config(); state=connect(tmp_path/"remote/state.db"); record={"kind":"attachment.record","entity":"attachments:a","payload":{"body":"secret"}}
-    assert publish(cfg,state,"team",record,tmp_path) is None and state.execute("SELECT COUNT(*) FROM event_log WHERE workspace='team'").fetchone()[0]==0
+    assert publish(cfg,state,"team",record,tmp_path) is None and state.execute("SELECT COUNT(*) FROM outbox WHERE workspace='team'").fetchone()[0]==0
     assert redact.audit_data(tmp_path)["by_kind"]=={"attachment_omitted":1}
 
 
