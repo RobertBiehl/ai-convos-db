@@ -30,7 +30,7 @@ exist in the DB -- this feature is largely *queries over data you already store*
    path (cli.py ~:546) and the stored content is the command, not the change. So
    shell-driven edits are often invisible or unattributable.
 
-## CORE change (capture only -- the one thing core owns here)
+## CORE capture
 
 Add `old_content TEXT` (nullable) to `file_edits`, populated from tool input we
 already parse:
@@ -40,13 +40,18 @@ already parse:
   `file_edits.content` for that path.
 - **shell:** `NULL` (unknown).
 
-This is the only core change: it is ingest-time and **unreconstructable later**,
-so it qualifies under the boundary rule. ~3-4 LoC + an `ALTER` migration + a
-parser test. Everything below is the application.
+Core captures `old_content` plus repository/file identity, versions, exact
+edit edges, Git checkpoints, assertions, and explicit gaps. Capture runs after
+conversation ingestion in a separate transaction, so Git failure can be
+retried without losing the conversation archive. This happens for hooks and
+ordinary sync whether or not Changegraph or Remote is installed.
 
-## APPLICATION: `ai-convos-changegraph` (separate package, ~100 LoC)
+## APPLICATION: `ai-convos-changegraph`
 
-Installs via the plugin seam (see [00](00-overview.md)); reads the DB only.
+Installs via the plugin seam (see [00](00-overview.md)). Core initializes and
+writes the compact `provenance` schema because it is a stable archive contract.
+Changegraph is strictly read-only and presents those facts with content from
+the existing core relations. It does not keep a second graph database.
 Commands (registered under the `convos` CLI):
 
 - `convos blame <file> [--line N] [--at <conv|ts>]` -- per-line attribution:

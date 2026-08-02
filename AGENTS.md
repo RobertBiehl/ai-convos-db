@@ -24,12 +24,19 @@ There is no backward compatibility unless explicitly requested or covered by tes
 Line Budget
 -----------
 
-Stay below 1000 lines of code total (tinygrad-style constraint, enforced by `tests/test_budget.py` via a token-aware count). Any new feature must fit in the remaining budget, so design for minimal line growth and high density. Prefer no new dependencies when possible.
+Stay below the explicit 1150-line core budget (tinygrad-style constraint, enforced by `tests/test_budget.py` via a token-aware count). The increase from 1000 keeps canonical provenance capture and every DuckDB writer in the cohesive core instead of hiding them behind an optional product. Any new feature must fit in the remaining budget, so design for minimal line growth and high density. Prefer no new dependencies when possible.
 
 Package boundaries must represent user-installable products, not internal
 modules or a way to evade line budgets. A cohesive product may declare one
 explicit larger budget in `test_budget.py`; keep its implementation compact
 inside that boundary.
+
+Canonical Write Boundary
+------------------------
+
+Core owns schema initialization, ingestion, hooks, provenance capture, migrations, validation, and every DuckDB mutation. Optional products submit typed records through core writer functions and may keep only settings, disposable caches, and working state. Changegraph is strictly read-only. A future plugin write API must be core-managed, transactional, and replayable; no optional writer may create historical gaps when the product is absent.
+
+Conversation ingestion and Git provenance enrichment are separate transactions. A Git inspection failure may delay provenance and cost a retry, but must never roll back or erase imported conversations.
 
 **Do:**
 - Pack meaning into each line - comprehensions over loops with append

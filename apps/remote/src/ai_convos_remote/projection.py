@@ -6,8 +6,8 @@ from importlib.metadata import entry_points
 from pathlib import Path
 
 import duckdb
-from ai_convos.cli import init_schema
-from .provenance import capture as capture_graph, connect as graph_connect, project as project_graph, query as graph_query
+from ai_convos.cli import ARCHIVE_COLUMNS as COLUMNS, PROVENANCE_KINDS as PROVENANCE, init_schema, observe_provenance, project_archive_row, project_provenance, set_attachment_path
+from ai_convos_changegraph.provenance import query as graph_query
 from .protocol import digest, material_event
 
 STATE = """
@@ -23,15 +23,15 @@ CREATE TABLE IF NOT EXISTS event_sequences(workspace TEXT,author TEXT,seq INT,ev
 CREATE TABLE IF NOT EXISTS attachment_chunks(workspace TEXT,author TEXT,blob TEXT,idx INT,total INT,attachment TEXT,sha256 TEXT,size INT,data TEXT,PRIMARY KEY(workspace,author,blob,idx));
 CREATE TABLE IF NOT EXISTS attachment_blobs(workspace TEXT,author TEXT,attachment TEXT PRIMARY KEY,path TEXT);
 CREATE TABLE IF NOT EXISTS policies(workspace TEXT,kind TEXT,value TEXT,local_root TEXT,PRIMARY KEY(workspace,kind,value));
+CREATE TABLE IF NOT EXISTS sharing_boundaries(id TEXT PRIMARY KEY,workspace TEXT,turn_id TEXT,hidden_count INT);
 CREATE TABLE IF NOT EXISTS sync_states(workspace TEXT PRIMARY KEY,lifecycle TEXT NOT NULL,tail INT NOT NULL DEFAULT 0,floor INT NOT NULL DEFAULT 0,error TEXT);
 CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY,value TEXT);
 """
 TABLES={"conversation.record":"conversations","message.record":"messages","tool.record":"tool_calls","attachment.record":"attachments","artifact.record":"artifacts","file_edit.record":"file_edits"}
-COLUMNS={"conversations":["id","source","title","created_at","updated_at","model","cwd","git_branch","project_id","metadata"],"messages":["id","conversation_id","role","content","thinking","created_at","model","metadata","parent_id"],"tool_calls":["id","message_id","tool_name","input","output","status","duration_ms","created_at"],"attachments":["id","message_id","filename","mime_type","size","path","url","created_at"],"artifacts":["id","conversation_id","artifact_type","title","content","language","created_at","version"],"file_edits":["id","message_id","file_path","edit_type","content","created_at","old_content"]}
 FKS={"messages":(("conversation_id","conversations"),("parent_id","messages")),"tool_calls":(("message_id","messages"),),"attachments":(("message_id","messages"),),"artifacts":(("conversation_id","conversations"),),"file_edits":(("message_id","messages"),)}
 
 def connect(path):
-    existed=Path(path).exists(); db=graph_connect(path); db.executescript(STATE); version=db.execute("SELECT value FROM meta WHERE key='state_schema'").fetchone()
+    path=Path(path); existed=path.exists(); path.parent.mkdir(parents=True,exist_ok=True); db=sqlite3.connect(path); os.chmod(path,0o600); db.row_factory=sqlite3.Row; db.executescript("PRAGMA journal_mode=WAL;"+STATE); version=db.execute("SELECT value FROM meta WHERE key='state_schema'").fetchone()
     if not version:
         if existed:
             workspaces={r[0] for r in db.execute("SELECT workspace FROM event_log UNION SELECT workspace FROM published UNION SELECT workspace FROM cursors").fetchall()}; [db.execute("INSERT OR IGNORE INTO sync_states VALUES (?,'ready',0,0,NULL)",(ws,)) for ws in workspaces]
@@ -51,7 +51,7 @@ def clean(v):
     if isinstance(v,(list,tuple)): return [clean(x) for x in v]
     return v
 def _records(core,state,blobs=True):
-    out=[]; imported={(r[0],r[1]) for r in state.execute("SELECT table_name,row_id FROM imported_rows").fetchall()}
+    out=[]; imported=set(core.execute("SELECT table_name,physical_row_id FROM remote.row_origins").fetchall())
     for kind,table in TABLES.items():
         cur=core.execute(f"SELECT * EXCLUDE (embedding) FROM {table}" if table=="messages" else f"SELECT * FROM {table}"); cols=[d[0] for d in cur.description]
         for values in cur.fetchall():
@@ -62,23 +62,23 @@ def _records(core,state,blobs=True):
                 out += [dict(kind="attachment.chunk",entity=f"attachment:{row['id']}:{blob}:{i}",payload={"attachment":row["id"],"blob":blob,"index":i,"total":len(chunks),"sha256":blob,"size":len(data),"data":base64.b64encode(chunk).decode()}) for i,chunk in enumerate(chunks)]
     return out
 def _team_scope(core,provenance,repositories,roots):
-    origins={r["payload"]["origin"] for r in provenance if r["kind"]=="edit.observed" and r["payload"]["repository"] in repositories}
-    for eid,path,mid,cid,cwd in core.execute("SELECT fe.id,fe.file_path,m.id,m.conversation_id,c.cwd FROM file_edits fe JOIN messages m ON m.id=fe.message_id JOIN conversations c ON c.id=m.conversation_id").fetchall():
+    origins={r["payload"]["id"] for r in provenance if r["kind"]=="edit.observed" and r["payload"]["repository"] in repositories}; rows=core.execute("SELECT fe.id,fe.file_path,m.id,m.conversation_id,c.cwd FROM file_edits fe JOIN messages m ON m.id=fe.message_id JOIN conversations c ON c.id=m.conversation_id").fetchall()
+    for eid,path,mid,cid,cwd in rows:
         p=Path(path); p=(Path(cwd)/p if not p.is_absolute() and cwd else p).expanduser().resolve()
         if any(p.is_relative_to(Path(root).expanduser().resolve()) for root in roots): origins.add(eid)
-    cs={r["payload"]["changeset"] for r in provenance if r["kind"]=="edit.observed" and r["payload"]["origin"] in origins}; turns={r["payload"]["turn"] for r in provenance if r["kind"]=="changeset.observed" and r["payload"]["id"] in cs}; convs={r["payload"]["conversation"] for r in provenance if r["kind"]=="changeset.observed" and r["payload"]["id"] in cs}
+    turns={mid for eid,path,mid,cid,cwd in rows if eid in origins}; convs={cid for eid,path,mid,cid,cwd in rows if eid in origins}
     users=set()
     for turn in turns:
         if row:=core.execute("SELECT conversation_id FROM messages WHERE id=?",(turn,)).fetchone():
             if prompt:=core.execute("SELECT id FROM messages WHERE conversation_id=? AND role='user' AND created_at<=(SELECT created_at FROM messages WHERE id=?) ORDER BY created_at DESC LIMIT 1",(row[0],turn)).fetchone(): users.add(prompt[0])
-    return convs,turns|users,cs,origins
-def scan(core,graph,device,kind="personal",repositories=(),roots=()):
-    provenance=capture_graph(core,graph,device); records=_records(core,graph,kind=="personal"); imported={r[0] for r in graph.execute("SELECT row_id FROM imported_rows WHERE table_name='file_edits'").fetchall()}; blocked={r["payload"]["changeset"] for r in provenance if r["kind"]=="edit.observed" and r["payload"]["origin"] in imported}; provenance=[r for r in provenance if not (r["kind"]=="edit.observed" and r["payload"]["origin"] in imported or r["kind"] in ("changeset.observed","checkpoint.link") and r["payload"].get("id",r["payload"].get("changeset")) in blocked)]
-    edit_paths={r["payload"]["origin"]:r["payload"]["file"] for r in provenance if r["kind"]=="edit.observed"}; file_paths={r["payload"]["id"]:r["payload"]["path"] for r in provenance if r["kind"]=="file.observed"}
+    return convs,turns|users,origins
+def scan(core,graph,kind="personal",repositories=(),roots=()):
+    provenance=observe_provenance(core); records=_records(core,graph,kind=="personal")
+    edit_paths={r["payload"]["id"]:r["payload"]["file"] for r in provenance if r["kind"]=="edit.observed"}; file_paths={r["payload"]["id"]:r["payload"]["path"] for r in provenance if r["kind"]=="file.observed"}
     for r in records:
         if r["kind"]=="file_edit.record" and (fid:=edit_paths.get(r["payload"]["row"][0])): r["payload"]["row"][2]=file_paths[fid]
     if kind=="personal": return records+provenance
-    convs,msgs,changesets,origins=_team_scope(core,provenance,set(repositories),roots); keep=[]
+    convs,msgs,origins=_team_scope(core,provenance,set(repositories),roots); keep=[]
     allowed_attachments=set()
     for r in records:
         if r["kind"]=="attachment.chunk":
@@ -86,13 +86,13 @@ def scan(core,graph,device,kind="personal",repositories=(),roots=()):
             continue
         table,row=r["payload"]["table"],r["payload"]["row"]
         if table=="conversations" and row[0] in convs or table=="messages" and row[0] in msgs or table in ("tool_calls","attachments") and row[1] in msgs or table=="file_edits" and row[0] in origins or table=="artifacts" and row[1] in convs: keep.append(r); table=="attachments" and allowed_attachments.add(row[0])
-    allowed_files={r["payload"]["file"] for r in provenance if r["kind"]=="edit.observed" and r["payload"]["origin"] in origins}; allowed_repos=set(repositories)
+    allowed_files={r["payload"]["file"] for r in provenance if r["kind"]=="edit.observed" and r["payload"]["id"] in origins}; allowed_repos=set(repositories)
     for r in provenance:
         p,k=r["payload"],r["kind"]
-        if k=="changeset.observed" and p["id"] in changesets or k=="edit.observed" and p["origin"] in origins or k=="file.observed" and p["id"] in allowed_files or k=="file.version" and p["file"] in allowed_files or k in ("repository.observed","git.checkpoint","capture.gap") and p.get("repository",p.get("id")) in allowed_repos or k=="checkpoint.link" and p["changeset"] in changesets: keep.append(r)
-    for cs in changesets:
-        total=sum(r["kind"]=="edit.observed" and r["payload"]["changeset"]==cs for r in provenance); visible=sum(r["kind"]=="edit.observed" and r["payload"]["changeset"]==cs and r["payload"]["origin"] in origins for r in provenance)
-        if total>visible: keep.append(dict(kind="changeset.boundary",entity=digest({"changeset":cs,"visible":sorted(origins)}),payload={"changeset":cs,"hidden_count":total-visible}))
+        if k=="edit.observed" and p["id"] in origins or k=="file.observed" and p["id"] in allowed_files or k=="file.version" and p["file"] in allowed_files or k in ("repository.observed","git.checkpoint","capture.gap") and p.get("repository",p.get("id")) in allowed_repos or k=="checkpoint.link" and p["edit"] in origins: keep.append(r)
+    for turn in {r["payload"]["turn"] for r in provenance if r["kind"]=="edit.observed"}:
+        total=sum(r["kind"]=="edit.observed" and r["payload"]["turn"]==turn for r in provenance); visible=sum(r["kind"]=="edit.observed" and r["payload"]["turn"]==turn and r["payload"]["id"] in origins for r in provenance)
+        if total>visible: keep.append(dict(kind="turn.boundary",entity=digest({"turn":turn,"visible":sorted(origins)}),payload={"turn":turn,"hidden_count":total-visible}))
     return keep
 def foreign_id(workspace,author,table,old): return digest(f"{workspace}:{author}:{table}:{old}")[:16] if old else old
 def sequence(state,workspace,value):
@@ -102,7 +102,7 @@ def sequence(state,workspace,value):
     if before and before[0] not in value["parents"] or after and value["id"] not in json.loads(after[1]): raise ValueError("device event chain mismatch")
     state.execute("INSERT OR IGNORE INTO event_sequences VALUES (?,?,?,?,?)",(workspace,value["author"],value["seq"],value["id"],json.dumps(value["parents"])))
     return True
-def apply_record(db_path,state,value,workspace,local_device=None,db=None):
+def apply_record(db_path,state,value,workspace,local_device=None,db=None,authors=None):
     table=TABLES[value["kind"]]; p=value["payload"]; head=f"{value['author']}:{value['entity']}"; sort=f"{value['observed_at']}:{value['id']}"; old=state.execute("SELECT sort_key FROM heads WHERE workspace=? AND entity=?",(workspace,head)).fetchone()
     if value["entity"] != f"{table}:{p['row'][0]}" or p["table"] != table or p["columns"]!=COLUMNS[table] or len(p["row"])!=len(p["columns"]): raise ValueError("record schema/entity mismatch")
     if old and old[0]>=sort: return False
@@ -110,17 +110,25 @@ def apply_record(db_path,state,value,workspace,local_device=None,db=None):
     values=list(p["row"]); values[0]=foreign_id(workspace,value["author"],table,values[0])
     for column,parent in FKS.get(table,()): idx=p["columns"].index(column); values[idx]=foreign_id(workspace,value["author"],parent,values[idx])
     own=db is None
-    if own: Path(db_path).parent.mkdir(parents=True,exist_ok=True); db=duckdb.connect(str(db_path)); init_schema(db)
-    cols=p["columns"]; db.execute(f"INSERT OR REPLACE INTO {table} ({','.join(cols)}) VALUES ({','.join('?'*len(cols))})",values)
-    if table=="attachments" and (blob:=state.execute("SELECT path FROM attachment_blobs WHERE workspace=? AND author=? AND attachment=?",(workspace,value["author"],p["row"][0])).fetchone()): db.execute("UPDATE attachments SET path=? WHERE id=?",(blob[0],values[0]))
-    if own: db.close()
+    if own: Path(db_path).parent.mkdir(parents=True,exist_ok=True); db=duckdb.connect(str(db_path)); init_schema(db); db.execute("BEGIN")
+    try:
+        project_archive_row(db,table,p["columns"],values,{"workspace_id":workspace,"author_user_id":(authors or {}).get(value["author"]),"author_device_id":value["author"],"source_row_id":p["row"][0],"source_event_id":value["id"],"content_key":value["entity"],"observed_at":value["observed_at"]})
+        if table=="attachments" and (blob:=state.execute("SELECT path FROM attachment_blobs WHERE workspace=? AND author=? AND attachment=?",(workspace,value["author"],p["row"][0])).fetchone()): set_attachment_path(db,values[0],blob[0])
+        if own: db.execute("COMMIT")
+    except BaseException:
+        if own: db.execute("ROLLBACK")
+        raise
+    finally:
+        if own: db.close()
     state.execute("INSERT OR REPLACE INTO heads VALUES (?,?,?,?)",(workspace,head,sort,value["id"])); state.execute("INSERT OR REPLACE INTO imported_rows VALUES (?,?,?)",(table,values[0],value["id"]));
     if own: state.commit()
     return True
-def project(db_path,state,value,workspace,local_device=None,db=None,root=None,batch=False):
-    if value["kind"] in TABLES: return apply_record(db_path,state,value,workspace,local_device,db)
+def project(db_path,state,value,workspace,local_device=None,db=None,root=None,batch=False,authors=None):
+    if value["kind"] in TABLES: return apply_record(db_path,state,value,workspace,local_device,db,authors)
     if value["kind"]=="workspace.policy":
         p=value["payload"]; state.execute("INSERT OR REPLACE INTO policies VALUES (?,?,?,COALESCE((SELECT local_root FROM policies WHERE workspace=? AND kind=? AND value=?),NULL))",(workspace,p["kind"],p["value"],workspace,p["kind"],p["value"])); batch or state.commit(); return True
+    if value["kind"]=="turn.boundary":
+        p=value["payload"]; state.execute("INSERT OR IGNORE INTO sharing_boundaries VALUES (?,?,?,?)",(value["entity"],workspace,foreign_id(workspace,value["author"],"messages",p["turn"]),p["hidden_count"])); batch or state.commit(); return True
     if value["kind"]=="attachment.chunk":
         if value["author"]==local_device: return False
         p=value["payload"]; data=base64.b64decode(p["data"],validate=True); encoded=base64.b64encode(data).decode(); expected=f"attachment:{p['attachment']}:{p['blob']}:{p['index']}"
@@ -133,19 +141,25 @@ def project(db_path,state,value,workspace,local_device=None,db=None,root=None,ba
             content=b"".join(base64.b64decode(r[1]) for r in rows)
             if len(content)!=p["size"] or hashlib.sha256(content).hexdigest()!=p["sha256"]: raise ValueError("attachment hash mismatch")
             path=Path(db_path).parent.parent/"remote/attachments"/workspace/p["blob"]; path.parent.mkdir(parents=True,exist_ok=True); tmp=path.with_name(f".{path.name}.{os.getpid()}"); tmp.write_bytes(content); os.chmod(tmp,0o600); os.replace(tmp,path); state.execute("INSERT OR REPLACE INTO attachment_blobs VALUES (?,?,?,?)",(workspace,value["author"],p["attachment"],str(path))); state.execute("DELETE FROM attachment_chunks WHERE workspace=? AND author=? AND blob=?",(workspace,value["author"],p["blob"])); target=foreign_id(workspace,value["author"],"attachments",p["attachment"]); target_db=db or (duckdb.connect(str(db_path)) if Path(db_path).exists() else None)
-            if target_db: target_db.execute("UPDATE attachments SET path=? WHERE id=?",(str(path),target)); db or target_db.close()
+            if target_db: set_attachment_path(target_db,target,path); db or target_db.close()
         batch or state.commit(); return True
     if root is not None:
         for bridge in bridges():
             if (result:=bridge["project"](root,state,value,workspace,local_device)) is not None: return result
-    return project_graph(state,value,workspace,not batch)
-def project_many(db_path,state,items,local_device=None,root=None,commit=True):
-    records=any(v["kind"] in TABLES and v["author"]!=local_device for _,v in items); db=None
+    if value["kind"] not in PROVENANCE: return False
+    if value["author"]==local_device: return True
+    own=db is None
+    if own: Path(db_path).parent.mkdir(parents=True,exist_ok=True); db=duckdb.connect(str(db_path)); init_schema(db)
+    try: return project_provenance(db,value,lambda table,old:foreign_id(workspace,value["author"],table,old))
+    finally:
+        if own: db.close()
+def project_many(db_path,state,items,local_device=None,root=None,commit=True,authors=None):
+    records=any(v["kind"] in set(TABLES)|PROVENANCE and v["author"]!=local_device for _,v in items); db=None
     if records: Path(db_path).parent.mkdir(parents=True,exist_ok=True); db=duckdb.connect(str(db_path)); init_schema(db)
     committed=False
     try:
         if db: db.execute("BEGIN")
-        [project(db_path,state,v,ws,local_device,db,root,True) for ws,v in items]
+        [project(db_path,state,v,ws,local_device,db,root,True,authors) for ws,v in items]
         if db: db.execute("COMMIT"); committed=True
         commit and state.commit()
     except BaseException:
@@ -155,6 +169,9 @@ def project_many(db_path,state,items,local_device=None,root=None,commit=True):
         if db: db.close()
     return len(items)
 def rebuild(db_path,state,local_device=None,device=None):
-    path=Path(db_path); path.unlink(missing_ok=True); [state.execute(f"DELETE FROM {table}") for table in ("raw_events","repositories","files","file_versions","changesets","edits","changeset_repositories","checkpoints","checkpoint_changesets","assertions","gaps","boundaries","heads","imported_rows","attachment_chunks","attachment_blobs")]; rows=state.execute("SELECT workspace,event_json FROM event_log ORDER BY json_extract(event_json,'$.observed_at'),event").fetchall()
+    path=Path(db_path); path.unlink(missing_ok=True); [state.execute(f"DELETE FROM {table}") for table in ("sharing_boundaries","heads","imported_rows","attachment_chunks","attachment_blobs")]; rows=state.execute("SELECT workspace,event_json FROM event_log ORDER BY json_extract(event_json,'$.observed_at'),event").fetchall()
     project_many(path,state,[(workspace,value) for workspace,raw in rows if (value:=material_event(json.loads(raw),device=device))]); return len(rows)
-def query(state,name,arg=None): return graph_query(state,name,arg)
+def query(db_path,name,arg=None):
+    db=duckdb.connect(str(db_path),read_only=True)
+    try: return graph_query(db,name,arg)
+    finally: db.close()

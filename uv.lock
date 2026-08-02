@@ -141,6 +141,7 @@ name = "ai-convos-remote"
 version = "0.7.0"
 source = { editable = "apps/remote" }
 dependencies = [
+    { name = "ai-convos-changegraph" },
     { name = "ai-convos-db" },
     { name = "ai-convos-redact" },
     { name = "cryptography" },
@@ -149,6 +150,7 @@ dependencies = [
 
 [package.metadata]
 requires-dist = [
+    { name = "ai-convos-changegraph", editable = "apps/changegraph" },
     { name = "ai-convos-db", editable = "." },
     { name = "ai-convos-redact", editable = "apps/redact" },
     { name = "cryptography", specifier = ">=42.0.0" },
