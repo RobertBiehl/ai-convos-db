@@ -1,5 +1,5 @@
 """Portable record/event projection. The immutable relay ledger can rebuild every local view."""
-import base64, hashlib, json, os, shutil, sqlite3
+import base64, hashlib, json, os, shutil, sqlite3, time
 from datetime import date, datetime
 from functools import lru_cache
 from importlib.metadata import entry_points
@@ -29,17 +29,61 @@ CREATE TABLE IF NOT EXISTS sharing_boundaries(id TEXT PRIMARY KEY,workspace TEXT
 CREATE TABLE IF NOT EXISTS sync_states(workspace TEXT PRIMARY KEY,lifecycle TEXT NOT NULL,tail INT NOT NULL DEFAULT 0,floor INT NOT NULL DEFAULT 0,error TEXT) WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY,value TEXT) WITHOUT ROWID;
 """
+STATE_TABLES={"outbox","receipts","history_sources","history_queue","published","cursors","heads","lazy_events","event_sequences","sequence_gaps","attachment_parts","attachment_blobs","policies","sharing_boundaries","sync_states","meta"}
+STATE_FORBIDDEN={"event_log","history_material","history_outbox","attachment_chunks","imported_rows","raw_events","repositories","files","file_versions","changesets","edits","checkpoints","assertions","gaps","boundaries"}
 TABLES={"conversation.record":"conversations","message.record":"messages","tool.record":"tool_calls","attachment.record":"attachments","artifact.record":"artifacts","file_edit.record":"file_edits"}
 FKS={"messages":(("conversation_id","conversations"),("parent_id","messages")),"tool_calls":(("message_id","messages"),),"attachments":(("message_id","messages"),),"artifacts":(("conversation_id","conversations"),),"file_edits":(("message_id","messages"),)}
 
+def _connect(path,journal="WAL"):
+    path=Path(path); path.parent.mkdir(parents=True,exist_ok=True); db=sqlite3.connect(path); os.chmod(path,0o600); db.row_factory=sqlite3.Row; db.executescript(f"PRAGMA journal_mode={journal};PRAGMA secure_delete=ON;"+STATE); return db
+def _fsync(path):
+    fd=os.open(path,os.O_RDONLY)
+    try: os.fsync(fd)
+    finally: os.close(fd)
+def inspect_state(path,verify=False):
+    path=Path(path); base={"path":str(path),"bytes":path.stat().st_size if path.exists() and path.is_file() else 0,"version":None}
+    if not path.exists(): return base|{"status":"absent"}
+    if path.is_symlink() or not path.is_file(): return base|{"status":"invalid","error":"state path is not a regular file"}
+    db=None
+    try:
+        db=sqlite3.connect(path.resolve().as_uri()+"?mode=ro",uri=True); db.execute("PRAGMA query_only=ON"); integrity=db.execute("PRAGMA quick_check").fetchone()[0] if verify else "ok"; tables={r[0] for r in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        try: version=(db.execute("SELECT value FROM meta WHERE key='state_schema'").fetchone() or [None])[0]
+        except sqlite3.Error: version=None
+        status="current" if version=="3" and STATE_TABLES<=tables and not STATE_FORBIDDEN&tables and integrity=="ok" else "invalid" if version=="3" or integrity!="ok" else "incompatible"
+        return base|{"status":status,"version":version,"error":None if status!="invalid" else "schema or integrity check failed"}
+    except sqlite3.Error as e: return base|{"status":"invalid","error":str(e)}
+    finally:
+        if db: db.close()
+def read_state(path):
+    info=inspect_state(path)
+    if info["status"]!="current": raise ValueError(f"remote state is {info['status']}")
+    db=sqlite3.connect(Path(path).resolve().as_uri()+"?mode=ro",uri=True); db.row_factory=sqlite3.Row; db.execute("PRAGMA query_only=ON"); return db
+def cutover_state(path):
+    path=Path(path); info=inspect_state(path,True)
+    if info["status"] not in ("incompatible","invalid") or path.is_symlink() or not path.is_file(): raise ValueError(f"remote state cannot be rebuilt ({info['status']})")
+    backups=path.parent/"backups"
+    if backups.is_symlink(): raise ValueError("remote state backup directory must not be a symlink")
+    backups.mkdir(parents=True,exist_ok=True); os.chmod(backups,0o700); name=f"state-{info['version'] or 'legacy'}-{time.time_ns()}"; stage=backups/f".{name}.{os.getpid()}"; target=backups/name; fresh=path.with_name(f".{path.name}.v3.{os.getpid()}.{time.time_ns()}"); stage.mkdir(mode=0o700); files=[p for p in (path,Path(str(path)+"-wal"),Path(str(path)+"-shm")) if p.exists()]; saved={}
+    try:
+        for source in files:
+            if source.is_symlink() or not source.is_file(): raise ValueError("remote state backup source must be a regular file")
+            copy=stage/source.name; shutil.copyfile(source,copy); os.chmod(copy,0o600)
+            saved[source.name]={"bytes":copy.stat().st_size,"sha256":file_hash(copy)}
+            if file_hash(source)!=saved[source.name]["sha256"]: raise ValueError("remote state backup verification failed")
+        report={"from":info["version"] or "legacy","to":3,"backup":str(target),"files":saved}; manifest=stage/"manifest.json"; manifest.write_text(json.dumps(report,sort_keys=True,indent=2)); os.chmod(manifest,0o600); [_fsync(p) for p in [*(stage/p.name for p in files),manifest]]; _fsync(stage)
+        new=_connect(fresh,"DELETE")
+        try: new.execute("INSERT INTO meta VALUES ('state_schema','3'),('state_cutover',?)",(json.dumps(report,sort_keys=True),)); new.commit(); valid=new.execute("PRAGMA integrity_check").fetchone()[0]=="ok"
+        finally: new.close()
+        if not valid: raise ValueError("fresh remote state validation failed")
+        os.replace(stage,target); _fsync(backups); [p.unlink(missing_ok=True) for p in (Path(str(path)+"-wal"),Path(str(path)+"-shm"))]; os.replace(fresh,path); os.chmod(path,0o600); _fsync(path); _fsync(path.parent); return report
+    except BaseException:
+        fresh.unlink(missing_ok=True); Path(str(fresh)+"-journal").unlink(missing_ok=True); stage.exists() and shutil.rmtree(stage); raise
 def connect(path):
-    path=Path(path); existed=path.exists() and path.stat().st_size>0; path.parent.mkdir(parents=True,exist_ok=True); db=sqlite3.connect(path); os.chmod(path,0o600); db.row_factory=sqlite3.Row
-    if existed:
-        try: version=db.execute("SELECT value FROM meta WHERE key='state_schema'").fetchone()
-        except sqlite3.OperationalError: version=None
-        if not version or version[0]!="3": db.close(); raise ValueError(f"remote state migration required ({version[0] if version else 'legacy'} -> 3)")
-    db.executescript("PRAGMA journal_mode=WAL;PRAGMA secure_delete=ON;"+STATE)
-    if not existed: db.execute("INSERT INTO meta VALUES ('state_schema','3')"); db.commit()
+    path=Path(path); info=inspect_state(path)
+    if info["status"]=="incompatible": raise ValueError(f"remote state rebuild required ({info['version'] or 'legacy'} -> 3); run `convos remote sync`")
+    if info["status"]=="invalid": raise ValueError(f"invalid remote state: {info['error']}")
+    db=_connect(path)
+    if info["status"]=="absent": db.execute("INSERT INTO meta VALUES ('state_schema','3')"); db.commit()
     return db
 @lru_cache(maxsize=1)
 def bridges():
