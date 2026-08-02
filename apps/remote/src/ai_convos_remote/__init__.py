@@ -9,7 +9,7 @@ _pending=[]
 def register(app): _pending.append(app) if "remote" not in globals() else app.add_typer(remote,name="remote")
 from ai_convos.cli import PROJECT_ROOT, drain_hooks, install_hooks, repository
 from .control import approved, electorate, proposal as device_proposal, record as control_record, sign as control_sign, state_hash, verify_proposal, verify_state, vote as device_vote
-from .projection import bridge_purges, bridge_records, connect, project, project_many, query as graph_query, scan, sequence
+from .projection import bridge_purges, bridge_records, connect, cutover_state, inspect_state, project, project_many, query as graph_query, read_state, scan, sequence
 from .protocol import (b64, certificate, digest, event, identity, material_event, open_event, open_key, public, public_id, recover,
                        recovery_bundle, seal_event, seal_history, seal_key, sign_control, signer, unb64, verify_certificate)
 from .service import edit_hooks, enable
@@ -208,7 +208,9 @@ def fetch_lazy(cfg,state,event_id=None,root=None):
 def sync_once(root=None,force=False):
     root=local_root(root)
     with sync_lock(root):
-        cfg=load(root); _,_,state_path=paths(root); state=connect(state_path)
+        cfg=load(root); _,_,state_path=paths(root); info=inspect_state(state_path,force); cutover=None
+        if info["status"] in ("incompatible","invalid"): refresh(cfg,root); cutover=cutover_state(state_path)
+        state=connect(state_path)
         try:
             drain_hooks(); refresh(cfg,root); ready={r[0] for r in state.execute("SELECT workspace FROM sync_states WHERE lifecycle='ready'").fetchall()}; upload(cfg,state,root,ready); pull(cfg,state,root); ready={r[0] for r in state.execute("SELECT workspace FROM sync_states WHERE lifecycle='ready'").fetchall()}; flush_selected(cfg,state,root,ready); path=core_path(root); stamp=path.stat().st_mtime_ns if path.exists() else 0; active={w["id"] for w in cfg["server_state"]["workspaces"]}; scans=[(ws,meta) for ws,meta in cfg["workspaces"].items() if ws in ready and ws in active and f"{ws}:{meta['epoch']}" in cfg["keys"] and (force or stamp!=int((state.execute("SELECT value FROM meta WHERE key=?",(f"core_mtime:{ws}",)).fetchone() or ["0"])[0]))] if path.is_file() else []
             if scans:
@@ -222,6 +224,7 @@ def sync_once(root=None,force=False):
                 if ws in ready and ws in active and meta["kind"]=="personal": purge_events(cfg,state,ws,bridge_purges(root,state,ws,meta["kind"]))
             pull(cfg,state,root); state.execute("INSERT OR REPLACE INTO meta VALUES ('last_sync',?)",(str(time.time()),)); state.commit()
         finally: state.close()
+        return cutover
 def add_member(cfg,ws,user,remove=False,root=None):
     refresh(cfg,root); members={u:m["role"] for u,m in cfg["controls"][ws]["members"].items()}; devices=[]
     if remove:
@@ -328,7 +331,7 @@ def link_cmd(path:Path,space:str):
     cfg=load(); ws=workspace(cfg,space); state=connect(paths()[2]); repo=repository(path.resolve()); kind,value=("repository",repo["id"]) if repo else ("path",digest(os.urandom(32))[:32]); state.execute("INSERT OR REPLACE INTO policies VALUES (?,?,?,?)",(ws,kind,value,str(path.resolve()))); state.execute("DELETE FROM meta WHERE key LIKE 'core_mtime:%'"); state.commit()
     publish(cfg,state,ws,{"kind":"workspace.policy","entity":f"policy:{kind}:{value}","payload":{"kind":kind,"value":value}}); upload(cfg,state); typer.echo(f"{kind} {value} -> {cfg['workspaces'][ws]['name']}")
 @remote.command("sync")
-def sync_cmd(): sync_once(force=True); typer.echo("Remote synchronized")
+def sync_cmd(): result=sync_once(force=True); typer.echo("Remote synchronized"+(f"; previous state preserved at {result['backup']}" if result else ""))
 @remote.command("fetch")
 def fetch_cmd(event_id:Optional[str]=None): typer.echo(f"Fetched {fetch_lazy(load(),connect(paths()[2]),event_id)} lazy events")
 @remote.command("watch")
@@ -341,7 +344,14 @@ def watch(interval:int=typer.Option(2,"--interval")):
 def enable_cmd(remove:bool=typer.Option(False,"--remove")): not remove and install_hooks(False,False); typer.echo(enable(paths()[0],remove))
 def doctor_status():
     try:
-        cfg=load(); state=connect(paths()[2]); pending=state.execute("SELECT COUNT(*) FROM outbox").fetchone()[0]; lazy=state.execute("SELECT COUNT(*) FROM lazy_events").fetchone()[0]; lifecycle=",".join(f"{r[0][:8]}:{r[1]}" for r in state.execute("SELECT workspace,lifecycle FROM sync_states ORDER BY workspace").fetchall()) or "uninitialized"; last=(state.execute("SELECT value FROM meta WHERE key='last_sync'").fetchone() or ["never"])[0]; online="reachable" if health(cfg)["ok"] else "error"; return f"remote: {online}, user={cfg['user'][:8]}, device={cfg['device']['id'][:8]}, workspaces={len(cfg['workspaces'])}, epochs={len(cfg['keys'])}, lifecycle={lifecycle}, pending={pending}, lazy={lazy}, last={last}"
+        cfg=load(); info=inspect_state(paths()[2],True)
+        try: online="reachable" if health(cfg)["ok"] else "error"
+        except Exception: online="error"
+        if info["status"]!="current": return f"remote: {online}, state={info['status']}, schema={info['version'] or 'unknown'}, next_sync={'backup+rebaseline' if info['status'] in ('incompatible','invalid') else 'initialize'}"
+        state=read_state(paths()[2])
+        try: pending=state.execute("SELECT COUNT(*) FROM outbox").fetchone()[0]; lazy=state.execute("SELECT COUNT(*) FROM lazy_events").fetchone()[0]; lifecycle=",".join(f"{r[0][:8]}:{r[1]}" for r in state.execute("SELECT workspace,lifecycle FROM sync_states ORDER BY workspace").fetchall()) or "uninitialized"; last=(state.execute("SELECT value FROM meta WHERE key='last_sync'").fetchone() or ["never"])[0]; backup=(state.execute("SELECT value FROM meta WHERE key='state_cutover'").fetchone() or [None])[0]
+        finally: state.close()
+        return f"remote: {online}, user={cfg['user'][:8]}, device={cfg['device']['id'][:8]}, workspaces={len(cfg['workspaces'])}, epochs={len(cfg['keys'])}, lifecycle={lifecycle}, pending={pending}, lazy={lazy}, last={last}"+(f", backup={json.loads(backup)['backup']}" if backup else "")
     except Exception as e: return f"remote: unavailable ({e})"
 @remote.command("doctor")
 def doctor_cmd(): typer.echo(doctor_status())

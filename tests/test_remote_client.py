@@ -1,4 +1,5 @@
 import copy, json, os, sqlite3, subprocess
+from pathlib import Path
 
 import duckdb
 import pytest
@@ -6,10 +7,10 @@ import ai_convos_memory as memory_module
 import ai_convos_remote as remote_client
 from cryptography.exceptions import InvalidSignature
 from ai_convos.cli import capture_provenance, init_schema
-from ai_convos_remote import (_upload_batches, add_member, approve_device, approve_history, connect, control_body, create, fetch_lazy, grant_all, grant_selected, key, load, pull, publish, refresh, remove_device,
+from ai_convos_remote import (_upload_batches, add_member, approve_device, approve_history, connect, control_body, create, doctor_status, fetch_lazy, grant_all, grant_selected, key, load, pull, publish, refresh, remove_device,
                               request_device, request_history, setup_client, sync_once, upload, workspace)
 from ai_convos_remote.control import sign as control_sign, vote as device_vote
-from ai_convos_remote.projection import scan
+from ai_convos_remote.projection import inspect_state, scan
 from ai_convos_remote.protocol import certificate, event, identity, seal_history, seal_key, sign_control, unb64
 from ai_convos_remote_server import action, connect as server_connect
 
@@ -177,15 +178,21 @@ def test_attachment_bytes_are_redacted_lazy_and_reassembled(tmp_path,monkeypatch
 
 def test_deleted_state_rebaselines_before_publishing_existing_archive(tmp_path,monkeypatch):
     server=server_connect(tmp_path/"server.db"); direct=transport(server); monkeypatch.setattr("ai_convos_remote.request",direct); monkeypatch.setattr("ai_convos_remote.drain_hooks",lambda:None); a,b=tmp_path/"a",tmp_path/"b"; alice,recovery=setup_client("http://server","alice","laptop",root=a); setup_client("http://server","alice","desktop",recovery,root=b); alice=load(a); ws=workspace(alice,"Personal"); sa=connect(a/"remote/state.db"); publish(alice,sa,ws,conversation("remote","remote"),a); upload(alice,sa,a); sa.close(); sync_once(b,True); core=duckdb.connect(str(b/"data/convos.db"),read_only=True); imported=core.execute("SELECT table_name,physical_row_id,source_event_id FROM remote.row_origins").fetchall(); core.close(); assert imported
-    before=server.execute("SELECT COUNT(*) FROM events").fetchone()[0]; (b/"remote/state.db").unlink(); db=duckdb.connect(str(b/"data/convos.db")); db.execute("INSERT INTO conversations VALUES ('local','codex','new local','2026-01-02','2026-01-02',NULL,NULL,NULL,NULL,'{}')"); db.close()
+    before=server.execute("SELECT COUNT(*) FROM events").fetchone()[0]; state_path=b/"remote/state.db"; [Path(str(state_path)+suffix).unlink(missing_ok=True) for suffix in ("-wal","-shm")]; state_path.unlink(); legacy=sqlite3.connect(state_path); legacy.execute("CREATE TABLE meta(key TEXT PRIMARY KEY,value TEXT)"); legacy.execute("CREATE TABLE legacy_payload(value TEXT)"); legacy.execute("INSERT INTO meta VALUES ('state_schema','2')"); legacy.execute("INSERT INTO legacy_payload VALUES ('preserve me')"); legacy.commit(); legacy.close(); db=duckdb.connect(str(b/"data/convos.db")); db.execute("INSERT INTO conversations VALUES ('local','codex','new local','2026-01-02','2026-01-02',NULL,NULL,NULL,NULL,'{}')"); db.close()
     def offline(cfg,body,auth=True):
         if body["op"]=="pull": raise ConnectionError("relay unavailable")
         return direct(cfg,body,auth)
     monkeypatch.setattr("ai_convos_remote.request",offline)
     with pytest.raises(ConnectionError,match="unavailable"): sync_once(b,True)
-    assert server.execute("SELECT COUNT(*) FROM events").fetchone()[0]==before
+    state=connect(state_path); report=json.loads(state.execute("SELECT value FROM meta WHERE key='state_cutover'").fetchone()[0]); state.close(); assert server.execute("SELECT COUNT(*) FROM events").fetchone()[0]==before and inspect_state(state_path)["status"]=="current" and Path(report["backup"]).is_dir(); backup=sqlite3.connect(Path(report["backup"])/"state.db"); assert backup.execute("SELECT value FROM legacy_payload").fetchone()[0]=="preserve me"; backup.close()
     monkeypatch.setattr("ai_convos_remote.request",direct); sync_once(b,True); assert server.execute("SELECT COUNT(*) FROM events").fetchone()[0]==before+1
     state=connect(b/"remote/state.db"); assert state.execute("SELECT lifecycle FROM sync_states WHERE workspace=?",(ws,)).fetchone()[0]=="ready" and not state.execute("SELECT 1 FROM sqlite_master WHERE name='imported_rows'").fetchone(); state.close(); core=duckdb.connect(str(b/"data/convos.db"),read_only=True); assert core.execute("SELECT table_name,physical_row_id,source_event_id FROM remote.row_origins").fetchall()==imported; core.close()
+
+
+def test_doctor_reports_legacy_state_without_modifying_it(tmp_path,monkeypatch):
+    root=tmp_path/"client"; remote=root/"remote"; remote.mkdir(parents=True); (remote/"config.json").write_text(json.dumps({"url":"http://server","user":"user","device":{"id":"device"},"workspaces":{},"keys":{}})); path=remote/"state.db"; db=sqlite3.connect(path); db.execute("CREATE TABLE meta(key TEXT PRIMARY KEY,value TEXT)"); db.execute("INSERT INTO meta VALUES ('state_schema','2')"); db.commit(); db.close(); before=(path.read_bytes(),path.stat().st_mtime_ns,{p.name for p in remote.iterdir()}); monkeypatch.setenv("CONVOS_PROJECT_ROOT",str(root)); monkeypatch.setattr("ai_convos_remote.health",lambda cfg:{"ok":True})
+    assert "state=incompatible" in doctor_status() and "backup+rebaseline" in doctor_status()
+    assert (path.read_bytes(),path.stat().st_mtime_ns,{p.name for p in remote.iterdir()})==before
 
 
 def test_pull_converges_past_relay_batch_limit(tmp_path,monkeypatch):

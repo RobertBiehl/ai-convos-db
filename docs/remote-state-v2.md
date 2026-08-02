@@ -19,11 +19,11 @@ overlapping authority:
   in mode-0600 outbox files referenced by metadata rows.
 - The relay is the durable encrypted signed-event ledger.
 - Losing `state.db` never turns imported rows into local rows and never permits
-  publication until exact attribution has been rebuilt.
+  publication until relay metadata has been rebuilt to the advertised tail.
 
 The client and relay advance together. There is no compatibility layer,
-negotiation, or fallback for the old relay protocol. Local DuckDB and
-`state.db` migration remains safe and explicit.
+negotiation, or fallback for the old relay protocol. Core DuckDB upgrades are
+additive and automatic. Remote state is replaced and rebaselined, not migrated.
 
 ## Responsibilities
 
@@ -249,27 +249,36 @@ tail replay; it is an accelerator, never authority.
   persistent metadata.
 - Synthetic plaintext cannot be found in settled SQLite database or WAL files.
 - The old raw-event and duplicate provenance stores are removed.
-- Migration reports exact old/new file bytes, row counts, and validation
-  results rather than estimated savings.
+- State cutover records exact backup file bytes and hashes.
 
-## Migration
+## Schema lifecycle
 
-Migration is side by side, resumable, and never mutates the only usable state:
+Core owns its DuckDB schema lifecycle. Every mutating core entry point runs the
+idempotent schema initializer, which adds the provenance and origin relations
+to an existing archive without rewriting its conversation tables. This is the
+frictionless user-data migration path and is covered by a preservation test.
 
-1. Stop the worker and acquire its lock.
-2. Checkpoint the old SQLite WAL.
-3. Create a new state database beside the old one.
-4. Populate compact metadata from the old ledger and verify it against relay
-   tail where available.
-5. Create a staging `provenance` schema in the existing core DuckDB, populate
-   it from `file_edits` plus the old local provenance ledger, validate it, and
-   publish it in one DuckDB transaction. Existing archive tables are never
-   rewritten; a failure rolls back the new schema population.
-6. Validate row attribution, publication revisions, heads, sequence identity,
-   cursors, projection counts, and hashes.
-7. Atomically replace state only after every validation succeeds.
-8. Keep an encrypted rollback artifact for the documented retention window;
-   never leave an automatic plaintext backup.
+Remote state has no compatibility transform in this pre-stability release.
+Inspection and doctor are side-effect-free. An absent state is initialized as
+empty metadata. A mutating sync handles an incompatible or damaged regular
+state under the normal exclusive sync lock:
+
+1. Verify that signed relay control state is reachable; if not, leave the old
+   state untouched.
+2. Copy the exact SQLite database, WAL, and shared-memory files into a private
+   backup bundle and verify every copy by SHA-256.
+3. Write a manifest with exact sizes and hashes, then finalize the bundle.
+4. Create and integrity-check a fresh current state beside the old file.
+5. Atomically install the fresh state and retain the backup indefinitely.
+6. Pull, authenticate, and project the relay through its advertised tail.
+7. Enter `READY` before scanning or publishing any local revision.
+
+The backup is deliberately restorable rather than a bespoke encrypted format.
+It retains the old file's sensitivity, may contain legacy plaintext, is mode
+`0600` inside a mode-`0700` directory, and is never deleted automatically.
+Historical canonical facts stranded in a legacy state remain recoverable from
+that bundle; this cutover does not make Remote or Changegraph parse the old
+schema.
 
 The relay protocol itself is not migrated. Client and server v2 are deployed
 together after old workers are stopped.
@@ -280,8 +289,9 @@ together after old workers are stopped.
 at its advertised tail with no required deferred event. It emits exact counts,
 not guessed percentages or time estimates.
 
-`convos doctor` and its JSON form report lifecycle, cursor/tail, outbox,
-deferred and lazy counts, state bytes, last successful sync, and last failure.
+`convos remote doctor` reports lifecycle, pending and lazy counts, last
+successful sync, and any retained cutover backup. For an old state it reports
+the pending backup/rebaseline without opening it for writes.
 A normal user never runs SQL, manually reseeds imported rows, fetches lazy
 events, or vacuums SQLite.
 
@@ -294,7 +304,7 @@ Implementation lands as reviewable one-commit pull requests:
 3. Add batched crash-safe projection and full convergence.
 4. Move canonical provenance to DuckDB and unify changegraph.
 5. Introduce metadata-only state and relay-backed history/chunk handling.
-6. Add safe local migration, diagnostics, benchmarks, and release evidence.
+6. Add safe state cutover, diagnostics, benchmarks, and release evidence.
 
 Each pull request targets the branch immediately below it. No pull request
 contains merge commits or fixup commits.

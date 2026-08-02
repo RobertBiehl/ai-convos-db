@@ -6,7 +6,7 @@ import pytest
 from ai_convos.cli import init_schema
 import ai_convos_remote.projection as projection_module
 from ai_convos_remote import publish
-from ai_convos_remote.projection import bridges, connect, project, project_many, scan, sequence
+from ai_convos_remote.projection import bridges, connect, cutover_state, inspect_state, project, project_many, scan, sequence
 from ai_convos_remote.protocol import b64, digest, event, identity
 
 
@@ -27,10 +27,31 @@ def test_personal_scan_strips_local_roots_and_projects_duckdb(tmp_path):
     assert not {"event_log","history_material","history_outbox","attachment_chunks","imported_rows"}&{r[0] for r in state.execute("SELECT name FROM sqlite_master WHERE type='table'")}
 
 
-def test_old_state_is_rejected_before_new_schema_is_written(tmp_path):
-    path=tmp_path/"state.db"; db=__import__("sqlite3").connect(path); db.execute("CREATE TABLE meta(key TEXT PRIMARY KEY,value TEXT)"); db.execute("INSERT INTO meta VALUES ('state_schema','2')"); db.commit(); db.close()
-    with pytest.raises(ValueError,match="migration required"): connect(path)
-    db=__import__("sqlite3").connect(path); assert not db.execute("SELECT 1 FROM sqlite_master WHERE name='outbox'").fetchone(); db.close()
+def test_old_state_inspection_is_read_only_and_cutover_preserves_exact_backup(tmp_path):
+    path=tmp_path/"state.db"; db=__import__("sqlite3").connect(path); db.execute("CREATE TABLE meta(key TEXT PRIMARY KEY,value TEXT)"); db.execute("CREATE TABLE legacy_payload(value TEXT)"); db.execute("INSERT INTO meta VALUES ('state_schema','2')"); db.execute("INSERT INTO legacy_payload VALUES ('only in old state')"); db.commit(); db.close(); before=(path.read_bytes(),path.stat().st_mtime_ns,{p.name for p in tmp_path.iterdir()})
+    assert inspect_state(path)["status"]=="incompatible"
+    with pytest.raises(ValueError,match="rebuild required"): connect(path)
+    assert (path.read_bytes(),path.stat().st_mtime_ns,{p.name for p in tmp_path.iterdir()})==before
+    report=cutover_state(path); backup=Path(report["backup"]); old=__import__("sqlite3").connect(backup/"state.db"); assert old.execute("SELECT value FROM legacy_payload").fetchone()[0]=="only in old state"; old.close()
+    state=connect(path); assert state.execute("SELECT value FROM meta WHERE key='state_schema'").fetchone()[0]=="3" and json.loads(state.execute("SELECT value FROM meta WHERE key='state_cutover'").fetchone()[0])["backup"]==str(backup); state.close(); assert inspect_state(path)["status"]=="current" and os.stat(backup).st_mode&0o777==0o700 and os.stat(backup/"state.db").st_mode&0o777==0o600
+
+
+def test_cutover_recovers_corrupt_regular_state_but_refuses_symlink(tmp_path):
+    path=tmp_path/"state.db"; path.write_bytes(b"corrupt but preserved"); report=cutover_state(path); assert (Path(report["backup"])/"state.db").read_bytes()==b"corrupt but preserved" and inspect_state(path)["status"]=="current"
+    target=tmp_path/"target.db"; target.write_bytes(b"do not touch"); link=tmp_path/"link.db"; link.symlink_to(target)
+    with pytest.raises(ValueError,match="cannot be rebuilt"): cutover_state(link)
+    assert target.read_bytes()==b"do not touch"
+
+
+def test_cutover_install_failure_keeps_old_state_and_verified_backup(tmp_path,monkeypatch):
+    path=tmp_path/"state.db"; db=__import__("sqlite3").connect(path); db.execute("CREATE TABLE legacy(value TEXT)"); db.execute("INSERT INTO legacy VALUES ('still here')"); db.commit(); db.close(); original=projection_module.os.replace; failed=[False]
+    def replace(source,target):
+        if Path(target)==path and not failed[0]: failed[0]=True; raise OSError("install failed")
+        return original(source,target)
+    monkeypatch.setattr(projection_module.os,"replace",replace)
+    with pytest.raises(OSError,match="install failed"): cutover_state(path)
+    old=__import__("sqlite3").connect(path); assert old.execute("SELECT value FROM legacy").fetchone()[0]=="still here"; old.close(); backup=next((tmp_path/"backups").iterdir()); saved=__import__("sqlite3").connect(backup/"state.db"); assert saved.execute("SELECT value FROM legacy").fetchone()[0]=="still here"; saved.close()
+    monkeypatch.setattr(projection_module.os,"replace",original); cutover_state(path); assert inspect_state(path)["status"]=="current"
 
 
 def test_unchanged_provenance_does_not_republish_but_file_change_does(tmp_path):
