@@ -112,15 +112,16 @@ def rotate(cfg,ws,members,devices,deactivate=(),root=None):
         action,approval=("remove",None) if deactivate else ("membership",None); new_users=set(members)-set(old)
         records|={d["id"]:server_record(d) for d in devices if d["user_id"] in new_users and d["id"] not in removed and d.get("active",1) and d.get("allowed",1)}
     control=control_body(cfg,previous,new,action,meta,records,removed,approval); envs={d:seal_key(new,r["device"]["box_public"],f"workspace:{ws}:epoch:{epoch}") for d,r in records.items()}; request(cfg,sign_control(cfg["device"],{"op":"rotate","workspace":ws,"control":control,"envelopes":envs})); cfg["keys"][f"{ws}:{epoch}"]=b64(new); cfg["workspaces"][ws]["epoch"]=epoch; cfg["controls"][ws]=control; update_recovery(cfg,root); cfg["device"]["id"] in records and membership_event(cfg,ws,epoch,members,root); return epoch
-def publish(cfg,state,ws,record,root=None,defer=False,known=None):
+def publish(cfg,state,ws,record,root=None,defer=False,heads=None):
     if cfg["workspaces"][ws]["kind"]=="team" and (record:=protect_record(record,root,ws)) is None: return None
-    revision=digest(record["payload"]); old=(record["entity"],revision) in known if known is not None else state.execute("SELECT event FROM published WHERE workspace=? AND entity=? AND revision=?",(ws,record["entity"],revision)).fetchone()
-    if old: return old[0] if known is None else None
+    revision=digest(record["payload"]); old=heads.get(record["entity"]) if heads is not None else state.execute("SELECT revision,event FROM publication_heads WHERE workspace=? AND owner=? AND entity=?",(ws,cfg["user"],record["entity"])).fetchone()
+    if heads is not None and old==revision: return None
+    if heads is None and old and old["revision"]==revision: return old["event"]
     seq=int((state.execute("SELECT value FROM meta WHERE key=?",(f"seq:{ws}",)).fetchone() or ["0"])[0])+1; prev=(state.execute("SELECT value FROM meta WHERE key=?",(f"prev:{ws}",)).fetchone() or [None])[0]; value=event(cfg["device"],seq,record["kind"],record["entity"],record["payload"],[prev] if prev else (),record.get("observed_at")); epoch=cfg["workspaces"][ws]["epoch"]; env=seal_event(value,ws,epoch,key(cfg,ws,epoch)); path,size=encrypted_file(root,value["id"],env); status=record["payload"].get("status") if isinstance(record["payload"],dict) and record["payload"].get("status") in ("active","deleted") else None
-    state.execute("INSERT INTO outbox VALUES (?,?,?,?,?,?,?,?,?,?,?)",(ws,value["id"],record["entity"],revision,value["author"],seq,epoch,record["kind"],status,str(path),size)); state.execute("INSERT INTO published VALUES (?,?,?,?)",(ws,record["entity"],revision,value["id"])); state.execute("INSERT OR REPLACE INTO meta VALUES (?,?),(?,?)",(f"seq:{ws}",str(seq),f"prev:{ws}",value["id"])); sequence(state,ws,value)
+    state.execute("INSERT INTO outbox VALUES (?,?,?,?,?,?,?,?,?,?,?)",(ws,value["id"],record["entity"],revision,value["author"],seq,epoch,record["kind"],status,str(path),size)); state.execute("INSERT OR REPLACE INTO publication_heads VALUES (?,?,?,?,?)",(ws,cfg["user"],record["entity"],revision,value["id"])); state.execute("INSERT OR REPLACE INTO meta VALUES (?,?),(?,?)",(f"seq:{ws}",str(seq),f"prev:{ws}",value["id"])); sequence(state,ws,value)
     if not defer: state.commit()
-    if known is not None: known.add((record["entity"],revision))
-    project(core_path(root),state,value,ws,cfg["device"]["id"],root=root); return value["id"]
+    if heads is not None: heads[record["entity"]]=revision
+    project(core_path(root),state,value,ws,cfg["device"]["id"],root=root,authors={cfg["device"]["id"]:cfg["user"]}); return value["id"]
 def membership_event(cfg,ws,epoch,members,root=None):
     state=connect(paths(root)[2]); publish(cfg,state,ws,{"kind":"workspace.membership","entity":f"membership:{epoch}","payload":{"epoch":epoch,"members":members}},root); upload(cfg,state,root); state.close()
 def control_event(cfg,ws,action,target,root=None):
@@ -158,7 +159,7 @@ def upload(cfg,state,root=None,workspaces=None):
 def purge_events(cfg,state,ws,events):
     protected={event for member in cfg["controls"][ws]["members"].values() for event in member["selected"]}; events=[event for event in events if event not in protected]
     for i in range(0,len(events),500):
-        batch=events[i:i+500]; request(cfg,{"op":"purge","workspace":ws,"events":batch}); marks=",".join("?"*len(batch)); state.execute(f"DELETE FROM published WHERE workspace=? AND event IN ({marks})",(ws,*batch)); state.execute(f"DELETE FROM receipts WHERE workspace=? AND event IN ({marks})",(ws,*batch)); state.commit()
+        batch=events[i:i+500]; request(cfg,{"op":"purge","workspace":ws,"events":batch}); marks=",".join("?"*len(batch)); state.execute(f"DELETE FROM publication_heads WHERE workspace=? AND event IN ({marks})",(ws,*batch)); state.execute(f"DELETE FROM receipts WHERE workspace=? AND event IN ({marks})",(ws,*batch)); state.commit()
 def pull(cfg,state,root=None):
     root=local_root(root)
     server=refresh(cfg,root)
@@ -177,14 +178,15 @@ def pull(cfg,state,root=None):
                 incoming=[]
                 for item in result["events"]:
                     if item.get("tombstone"):
-                        sequence(state,sid,{"id":item["event"],"author":item["author"],"seq":item["seq"],"parents":item["parents"]}); state.execute("DELETE FROM receipts WHERE workspace=? AND event=?",(sid,item["event"])); state.execute("DELETE FROM published WHERE workspace=? AND event=?",(sid,item["event"])); state.execute("DELETE FROM history_sources WHERE workspace=? AND (event=? OR carrier=?)",(sid,item["event"],item["event"])); state.execute("DELETE FROM lazy_events WHERE workspace=? AND event=?",(sid,item["event"]))
+                        sequence(state,sid,{"id":item["event"],"author":item["author"],"seq":item["seq"],"parents":item["parents"]}); state.execute("DELETE FROM receipts WHERE workspace=? AND event=?",(sid,item["event"])); state.execute("DELETE FROM publication_heads WHERE workspace=? AND event=?",(sid,item["event"])); state.execute("DELETE FROM history_sources WHERE workspace=? AND (event=? OR carrier=?)",(sid,item["event"],item["event"])); state.execute("DELETE FROM lazy_events WHERE workspace=? AND event=?",(sid,item["event"]))
                         if item["author"]==cfg["device"]["id"] and item["seq"]>=int((state.execute("SELECT value FROM meta WHERE key=?",(f"seq:{sid}",)).fetchone() or ["0"])[0]): state.execute("INSERT OR REPLACE INTO meta VALUES (?,?),(?,?)",(f"seq:{sid}",str(item["seq"]),f"prev:{sid}",item["event"]))
                         after=max(after,item["cursor"]); continue
                     env=request(cfg,{"op":"fetch","workspace":sid,"event":item["event"]})["envelope"] if item.get("lazy") else item["envelope"]
                     if (env["workspace"],env["event"])!=(sid,item.get("event",env["event"])) or not access_from(cfg,sid)<=env["epoch"]<=cfg["controls"][sid]["epoch"]: raise ValueError("event envelope response mismatch")
                     value=open_event(env,key(cfg,sid,env["epoch"]),signer(devices,env["author"])); material=material_event(value,devices,cfg["device"]); sequence(state,sid,value); receipt(state,sid,value,item["cursor"],env["epoch"])
+                    if authors[value["author"]]==cfg["user"]:
+                        state.execute("INSERT OR REPLACE INTO publication_heads VALUES (?,?,?,?,?)",(sid,cfg["user"],value["entity"],value["revision"],value["id"]))
                     if value["author"]==cfg["device"]["id"]:
-                        state.execute("INSERT OR IGNORE INTO published VALUES (?,?,?,?)",(sid,value["entity"],digest(value["payload"]),value["id"]))
                         if value["seq"]>=int((state.execute("SELECT value FROM meta WHERE key=?",(f"seq:{sid}",)).fetchone() or ["0"])[0]): state.execute("INSERT OR REPLACE INTO meta VALUES (?,?),(?,?)",(f"seq:{sid}",str(value["seq"]),f"prev:{sid}",value["id"]))
                     if material and material["id"]!=value["id"]: state.execute("INSERT OR REPLACE INTO history_sources VALUES (?,?,?)",(sid,material["id"],value["id"]))
                     if material: incoming.append((sid,material))
@@ -216,10 +218,10 @@ def sync_once(root=None,force=False):
             if scans:
                 core=duckdb.connect(str(path),read_only=True)
                 for ws,meta in scans:
-                    pol=state.execute("SELECT kind,value,local_root FROM policies WHERE workspace=?",(ws,)).fetchall(); repos=[p[1] for p in pol if p[0]=="repository"]; roots=[p[2] for p in pol if p[0]=="path" and p[2]]; known={(r[0],r[1]) for r in state.execute("SELECT entity,revision FROM published WHERE workspace=?",(ws,)).fetchall()}; [publish(cfg,state,ws,r,root,True,known) for r in scan(core,state,meta["kind"],repos,roots)]
+                    pol=state.execute("SELECT kind,value,local_root FROM policies WHERE workspace=?",(ws,)).fetchall(); repos=[p[1] for p in pol if p[0]=="repository"]; roots=[p[2] for p in pol if p[0]=="path" and p[2]]; heads={r[0]:r[1] for r in state.execute("SELECT entity,revision FROM publication_heads WHERE workspace=? AND owner=?",(ws,cfg["user"])).fetchall()}; [publish(cfg,state,ws,r,root,True,heads) for r in scan(core,state,meta["kind"],repos,roots)]
                 core.close()
                 final=path.stat().st_mtime_ns; [state.execute("INSERT OR REPLACE INTO meta VALUES (?,?)",(f"core_mtime:{ws}",str(final))) for ws,meta in scans]
-            [publish(cfg,state,ws,r,root,True,known) for ws,meta in cfg["workspaces"].items() if ws in ready and ws in active and meta["kind"]=="personal" and f"{ws}:{meta['epoch']}" in cfg["keys"] for known in [{(r[0],r[1]) for r in state.execute("SELECT entity,revision FROM published WHERE workspace=?",(ws,)).fetchall()}] for r in bridge_records(root,state,ws,meta["kind"])]; state.commit(); upload(cfg,state,root,ready)
+            [publish(cfg,state,ws,r,root,True,heads) for ws,meta in cfg["workspaces"].items() if ws in ready and ws in active and meta["kind"]=="personal" and f"{ws}:{meta['epoch']}" in cfg["keys"] for heads in [{r[0]:r[1] for r in state.execute("SELECT entity,revision FROM publication_heads WHERE workspace=? AND owner=?",(ws,cfg["user"])).fetchall()}] for r in bridge_records(root,state,ws,meta["kind"])]; state.commit(); upload(cfg,state,root,ready)
             for ws,meta in cfg["workspaces"].items():
                 if ws in ready and ws in active and meta["kind"]=="personal": purge_events(cfg,state,ws,bridge_purges(root,state,ws,meta["kind"]))
             pull(cfg,state,root); state.execute("INSERT OR REPLACE INTO meta VALUES ('last_sync',?)",(str(time.time()),)); state.commit()

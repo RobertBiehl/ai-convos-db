@@ -67,7 +67,7 @@ def test_unchanged_database_cache_is_exact_and_value_free(tmp_path,monkeypatch):
 
 def config():
     device=identity("device"); team,personal="team","personal"; keys={team:os.urandom(32),personal:os.urandom(32)}
-    return {"device":device,"workspaces":{team:{"kind":"team","epoch":1},personal:{"kind":"personal","epoch":1}},"keys":{f"{ws}:1":b64(key) for ws,key in keys.items()}},keys
+    return {"user":"user","device":device,"workspaces":{team:{"kind":"team","epoch":1},personal:{"kind":"personal","epoch":1}},"keys":{f"{ws}:1":b64(key) for ws,key in keys.items()}},keys
 
 
 def message(content,mid="m"):
