@@ -137,7 +137,9 @@ schema.
 `remote.row_origins` is the separate identifier-only exception for remotely
 projected archive rows. Core writes it atomically with each imported row so
 deleting synchronization state cannot change authorship or make a foreign row
-publishable.
+publishable. Imported physical IDs use the verified author user plus workspace,
+table, and exact source row; the signing device remains separate provenance and
+does not change semantic row identity after device recovery.
 
 ## Full-Text Search
 

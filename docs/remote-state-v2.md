@@ -65,8 +65,10 @@ Long-lived `state.db` rows contain only:
 
 - lifecycle and schema version;
 - workspace cursors and advertised relay tail;
-- `(workspace, entity, revision) -> event_id` publication receipts;
-- current per-author entity heads;
+- `(workspace, owner user, entity) -> (current revision, event)` publication
+  heads;
+- current imported entity heads keyed by author user, with the signing device
+  retained only in event receipts and DuckDB origin attribution;
 - exact `(workspace, author, sequence) -> event_id` sequence identity;
 - compact parent data only for unresolved out-of-order gaps;
 - selected-history event IDs and content-free original-to-carrier mappings;
@@ -109,6 +111,9 @@ Core also initializes `remote.row_origins`, a compact canonical attribution
 relation containing the physical row, source row, workspace, author user and
 device, signed source event, logical content key, and observation time. It
 contains identifiers only, never event bodies or duplicated archive content.
+Imported physical IDs derive from `(workspace, author user, table, source row)`.
+The verified device certificate supplies the user; projection fails when that
+mapping is absent. Content equality is never used to infer row identity.
 
 Local absolute checkout paths are local-only and are never serialized to a
 remote canonical event. Remote workspace boundaries and device activity remain
@@ -121,6 +126,11 @@ Semantic identities are independent of the signing device:
 - file identity is repository plus normalized relative path;
 - checkpoint identity is repository plus Git head and working-tree state hash;
 - author and device belong to signed-event metadata.
+
+Revisions remain `digest(payload)`, but historical revisions are not heads.
+Publishing compares a local payload only with the current user-scoped head, so
+an exact `A -> B -> A` transition emits the final `A` while unchanged scans do
+not emit duplicates. Acknowledged event receipts remain separate history.
 
 ## Lifecycle and recovery
 
@@ -141,8 +151,9 @@ An absent, incompatible, or incomplete state with configured workspaces enters
 3. Pulls every authorized event from the earliest required cursor.
 4. Decrypts, authenticates, validates sequence identity, and materializes each
    event.
-5. Rebuilds publication receipts, heads, exact sequences, and cursors while
-   projecting archive rows and their canonical DuckDB origins.
+5. Rebuilds acknowledged receipts, publication and import heads, exact
+   sequences, and cursors while projecting archive rows and their canonical
+   DuckDB origins.
 6. Verifies that the advertised tail was reached without an unresolved event
    required by the installed protocol.
 7. Commits `READY`.
@@ -160,7 +171,7 @@ A ready synchronization cycle:
 2. Retry already committed encrypted outbox entries.
 3. Pull and project to the relay's advertised tail.
 4. Read core-captured local canonical changes and reconcile them.
-5. Atomically enqueue new signed encrypted events and publication receipts.
+5. Atomically enqueue new signed encrypted events and update publication heads.
 6. Upload the outbox.
 7. Pull once more if upload or concurrent writers advanced the tail.
 8. Report exact convergence or a nonzero partial/blocked result.
@@ -186,7 +197,7 @@ Outgoing events:
 
 1. Sign and seal the event.
 2. Atomically write its encrypted envelope to a mode-0600 file.
-3. Commit the file reference, exact sequence identity, and publication receipt
+3. Commit the file reference, exact sequence identity, and publication head
    atomically in SQLite. A crash before this commit can leave only an
    unreferenced encrypted file; a committed row always has its file.
 4. Upload idempotently by event ID.

@@ -318,7 +318,7 @@ def remote_records(root,state,workspace,kind):
         EXISTS(SELECT 1 FROM links l JOIN sources s ON s.id=l.source WHERE l.canonical=c.id AND s.provider<>'remote') local_origin,
         EXISTS(SELECT 1 FROM links l JOIN sources s ON s.id=l.source WHERE l.canonical=c.id AND s.provider='remote' AND s.hash=c.hash) remote_exact
         FROM canonicals c ORDER BY c.id""")]; repositories = {r["scope"]:dict(x) for r in rows if (x := db.execute("SELECT repository,lineage FROM repository_scopes WHERE scope=? ORDER BY checkout LIKE 'remote:%',checkout LIMIT 1",(r["scope"],)).fetchone())}; db.close(); published = {}
-    for entity,status,seq in state.execute("SELECT r.entity,r.status,r.seq FROM published p JOIN receipts r ON r.workspace=p.workspace AND r.event=p.event WHERE p.workspace=? AND r.kind='memory.canonical' ORDER BY r.seq",(workspace,)): published[entity.rsplit(":part:",1)[0]] = status
+    for entity,status,seq in state.execute("SELECT r.entity,r.status,r.seq FROM publication_heads h JOIN receipts r ON r.workspace=h.workspace AND r.event=h.event WHERE h.workspace=? AND r.kind='memory.canonical' ORDER BY r.seq",(workspace,)): published[entity.rsplit(":part:",1)[0]] = status
     records, seen = [], set()
     for row in rows:
         repo = repositories.get(row["scope"]); scope = repo["repository"] if repo else "global" if row["scope"] == "global" else "scope_"+_hash(row["scope"])[:20]; entity = f"memory:{scope}:{row['id']}"; seen.add(entity)
@@ -389,9 +389,9 @@ def remote_project(root,state,value,workspace,local_device):
 def remote_purges(root,state,workspace,kind):
     if kind!="personal": return []
     groups={}
-    for event,cursor,entity,status in state.execute("SELECT r.event,r.cursor,r.entity,r.status FROM published p JOIN receipts r ON r.workspace=p.workspace AND r.event=p.event WHERE p.workspace=? AND r.kind='memory.canonical' ORDER BY r.seq",(workspace,)):
-        group=groups.setdefault(entity.rsplit(":part:",1)[0],dict(active=[])); group["latest"]=(status,cursor); status=="active" and group["active"].append(event)
-    return [event for group in groups.values() if group["latest"][0]=="deleted" for event in group["active"]]
+    for event,cursor,entity,status,author,current in state.execute("SELECT r.event,r.cursor,r.entity,r.status,r.author,h.event IS NOT NULL FROM receipts r LEFT JOIN publication_heads h ON h.workspace=r.workspace AND h.event=r.event WHERE r.workspace=? AND r.kind='memory.canonical' ORDER BY r.seq",(workspace,)):
+        group=groups.setdefault(entity.rsplit(":part:",1)[0],dict(active=[])); current and group.update(latest=(status,cursor,author)); status=="active" and group["active"].append((event,author))
+    return [event for group in groups.values() if group.get("latest",(None,))[0]=="deleted" for event,author in group["active"] if author==group["latest"][2]]
 def remote_bridge(): return dict(v=2,records=remote_records,project=remote_project,purges=remote_purges)
 def _skill_source():
     rel = Path("skills")/"agent-convos"/"SKILL.md"; root = Path(os.environ.get("CONVOS_PROJECT_ROOT", Path.home()/".convos")).expanduser()

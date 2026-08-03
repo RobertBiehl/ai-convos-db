@@ -12,7 +12,7 @@ def roots(tmp_path, monkeypatch):
     monkeypatch.setenv("CONVOS_CODEX_MEMORY_ROOT", str(codex)); monkeypatch.setenv("CONVOS_CLAUDE_PROJECTS_ROOT", str(claude)); monkeypatch.setenv("CONVOS_MEMORY_DB", str(tmp_path/"memory.db")); monkeypatch.setenv("CODEX_HOME", str(tmp_path/"codex-home")); monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path/"claude-home"))
     return codex, claude
 def acknowledged(state,value,workspace="personal",cursor=1):
-    status=value["payload"].get("status"); state.execute("INSERT INTO receipts VALUES (?,?,?,?,?,?,?,?,?,?)",(workspace,value["id"],cursor,value["author"],value["seq"],1,value["kind"],value["entity"],value["revision"],status)); state.execute("INSERT INTO published VALUES (?,?,?,?)",(workspace,value["entity"],value["revision"],value["id"])); state.commit()
+    status=value["payload"].get("status"); state.execute("INSERT INTO receipts VALUES (?,?,?,?,?,?,?,?,?,?)",(workspace,value["id"],cursor,value["author"],value["seq"],1,value["kind"],value["entity"],value["revision"],status)); state.execute("INSERT OR REPLACE INTO publication_heads VALUES (?,?,?,?,?)",(workspace,value["author"],value["entity"],value["revision"],value["id"])); state.commit()
 
 
 def test_memory_product_import_does_not_reenter_core_plugins():
