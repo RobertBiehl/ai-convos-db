@@ -7,9 +7,9 @@ import duckdb, typer
 from ai_convos_redact import protect as protect_record
 _pending=[]
 def register(app): _pending.append(app) if "remote" not in globals() else app.add_typer(remote,name="remote")
-from ai_convos.cli import PROJECT_ROOT, drain_hooks, install_hooks, repository
+from ai_convos.cli import PROJECT_ROOT, archive_state as core_archive_state, drain_hooks, init_schema, install_hooks, repository
 from .control import approved, electorate, proposal as device_proposal, record as control_record, sign as control_sign, state_hash, verify_proposal, verify_state, vote as device_vote
-from .projection import bridge_purges, bridge_records, connect, cutover_state, inspect_state, project, project_many, query as graph_query, read_state, scan, sequence
+from .projection import bridge_purges, bridge_records, connect, cutover_state, inspect_state, project, project_many, query as graph_query, read_state, reset_history, scan, sequence, verify_history
 from .protocol import (b64, certificate, digest, event, identity, material_event, open_event, open_key, public, public_id, recover,
                        recovery_bundle, seal_event, seal_history, seal_key, sign_control, signer, unb64, verify_certificate)
 from .service import edit_hooks, enable
@@ -19,6 +19,12 @@ def local_root(root=None): return Path(root or os.environ.get("CONVOS_PROJECT_RO
 def paths(root=None):
     base=local_root(root)/"remote"; return base,base/"config.json",base/"state.db"
 def core_path(root=None): return local_root(root)/"data"/"convos.db"
+def archive_info(root=None,create=False):
+    path=core_path(root)
+    if not path.exists() and not create: return None
+    path.parent.mkdir(parents=True,exist_ok=True); db=duckdb.connect(str(path)); init_schema(db)
+    try: return core_archive_state(db)
+    finally: db.close()
 def load(root=None):
     _,path,_=paths(root)
     if not path.exists(): raise ValueError("Remote is not configured. Run `convos remote setup`.")
@@ -56,10 +62,34 @@ def trusted(devices):
     return devices
 def server_record(d,history=True): return control_record(d["user_id"],d["root_public"],d,json.loads(d["certificate"]) if isinstance(d["certificate"],str) else d["certificate"],history)
 def own_record(cfg,history=True): return control_record(cfg["user"],cfg["root"]["sign_public"],cfg["device"],certificate(cfg["root"],cfg["user"],cfg["device"]),history)
-def control_body(cfg,previous,key_,action,members=None,devices=None,removed=None,approval=None):
-    return control_sign(cfg["device"],{"v":1,"kind":"workspace.state","workspace":previous["workspace"],"scope":previous["scope"],"revision":previous["revision"]+1,"prev":state_hash(previous),"epoch":previous["epoch"]+(action not in ("history","history_activate")),"key_commitment":digest(key_),"members":members or previous["members"],"devices":devices or previous["devices"],"removed":removed if removed is not None else previous["removed"],"action":action,"approval":approval,"approved_at":time.time()})
+def control_body(cfg,previous,key_,action,members=None,devices=None,removed=None,approval=None,boundary=None):
+    advance=action not in ("history","history_activate"); boundary=(boundary or (_ for _ in ()).throw(ValueError("new workspace epoch requires a signed history boundary"))) if advance else previous["boundary"]; return control_sign(cfg["device"],{"v":1,"kind":"workspace.state","workspace":previous["workspace"],"scope":previous["scope"],"revision":previous["revision"]+1,"prev":state_hash(previous),"epoch":previous["epoch"]+advance,"boundary":boundary,"key_commitment":digest(key_),"members":members or previous["members"],"devices":devices or previous["devices"],"removed":removed if removed is not None else previous["removed"],"action":action,"approval":approval,"approved_at":time.time()})
 def access_from(cfg,ws):
     head=cfg["controls"][ws]; device=cfg["device"]["id"]; first=min(value["epoch"] for remote in cfg["server_state"]["workspaces"] if remote["id"]==ws for value in remote["controls"] if device in value["devices"]); return head["members"][cfg["user"]]["history_from"] if head["devices"][device]["history"] else first
+def sequence_heads(state,ws): return {author:{"seq":seq,"event":event} for author,seq,event in state.execute("SELECT s.author,s.seq,s.event FROM event_sequences s JOIN (SELECT author,MAX(seq) seq FROM event_sequences WHERE workspace=? GROUP BY author) h ON h.author=s.author AND h.seq=s.seq WHERE s.workspace=?",(ws,ws)).fetchall()}
+def prepare_archive(cfg,state,root=None,create=True):
+    info=archive_info(root); empty=not info or info[1:]==(0,0); cached=[(state.execute("SELECT value FROM meta WHERE key=?",(key,)).fetchone() or [None])[0] for key in ("archive_id","archive_generation")]; proofs=[p for p in (cfg.get("archive"),{"id":cached[0],"generation":int(cached[1])} if all(cached) else None) if p]; existing={r[0].split(":",1)[1]:r[1] for r in state.execute("SELECT key,value FROM meta WHERE key LIKE 'archive_mode:%'").fetchall()}; fresh=not state.execute("SELECT 1 FROM sync_states LIMIT 1").fetchone(); mode=None
+    if existing and not empty: return existing
+    if not existing and not proofs: mode="native" if empty else "adopt"
+    elif not existing and (not info or any(info[0]!=p["id"] or info[1]<p["generation"] for p in proofs)): mode="native" if empty else "import"
+    elif not existing and fresh: mode="adopt"
+    if not existing and not mode: return None
+    if create and not info: archive_info(root,True)
+    active={w["id"] for w in cfg["server_state"]["workspaces"] if w["device_authorized"]}
+    for ws in active:
+        personal=cfg["workspaces"][ws]["kind"]=="personal"; selected=existing.get(ws,"native" if personal else "adopt") if existing else mode if personal else "adopt"; selected="native" if existing and selected=="import" else selected; state.execute("INSERT OR REPLACE INTO meta VALUES (?,?)",(f"archive_mode:{ws}",selected)); state.execute("DELETE FROM meta WHERE key=?",(f"boundary:{ws}",)); state.execute("INSERT OR REPLACE INTO sync_states VALUES (?,'rebaselining',COALESCE((SELECT tail FROM sync_states WHERE workspace=?),0),COALESCE((SELECT floor FROM sync_states WHERE workspace=?),0),NULL)",(ws,ws,ws))
+    state.commit(); return existing or mode
+def remember_archive(cfg,state,root=None):
+    if info:=archive_info(root): cfg["archive"]={"id":info[0],"generation":info[1]}; save(cfg,root); state.execute("INSERT OR REPLACE INTO meta VALUES ('archive_id',?),('archive_generation',?)",(info[0],str(info[1]))); state.execute("DELETE FROM meta WHERE key LIKE 'archive_mode:%'")
+def next_boundary(cfg,ws,root=None):
+    epoch=cfg["controls"][ws]["epoch"]+1
+    if cfg["device"]["id"] in cfg["controls"][ws]["devices"]:
+        state=connect(paths(root)[2])
+        try: upload(cfg,state,root,{ws}); prepare_archive(cfg,state,root,False); pull(cfg,state,root); local=sequence_heads(state,ws); remote=request(cfg,{"op":"ledger","workspace":ws})
+        finally: state.close()
+        if local!=remote["heads"]: raise ValueError("relay ledger changed while creating history boundary")
+    else: remote=request(cfg,{"op":"ledger","workspace":ws})
+    return {"epoch":epoch,**remote}
 def directory_user(found,user): field="id" if len(user)==32 and all(c in "0123456789abcdef" for c in user) else "name"; values=[v for v in found["users"] if v[field]==user]; return values[0] if len(values)==1 and public_id(values[0]["root_public"])==values[0]["id"] else (_ for _ in ()).throw(ValueError("directory user mismatch"))
 def update_recovery(cfg,root=None):
     personal={ws for ws,v in cfg["workspaces"].items() if v["kind"]=="personal"}; keys={name:value for name,value in cfg["keys"].items() if name.rsplit(":",1)[0] in personal}; _,bundle=recovery_bundle({"root":cfg["root"],"keys":keys,"workspaces":cfg["workspaces"],"controls":{ws:v for ws,v in cfg["controls"].items() if ws in personal}},unb64(cfg["recovery"])); request(cfg,sign_control(cfg["device"],{"op":"recovery","bundle":bundle})); save(cfg,root)
@@ -89,7 +119,7 @@ def refresh(cfg,root=None):
     if changed: update_recovery(cfg,root)
     return state
 def create(cfg,name,kind="team",root=None):
-    ws,key_=digest(os.urandom(32))[:32],os.urandom(32); entry=own_record(cfg); control=control_sign(cfg["device"],{"v":1,"kind":"workspace.state","workspace":ws,"scope":kind,"revision":1,"prev":None,"epoch":1,"key_commitment":digest(key_),"members":{cfg["user"]:{"role":"admin","joined":1,"history_from":1,"selected":[]}},"devices":{cfg["device"]["id"]:entry},"removed":[],"action":"create","approval":None,"approved_at":time.time()}); env=seal_key(key_,cfg["device"]["box_public"],f"workspace:{ws}:epoch:1"); request(cfg,sign_control(cfg["device"],{"op":"create","workspace":ws,"kind":kind,"control":control,"envelopes":{cfg["device"]["id"]:env}})); cfg["workspaces"][ws]={"name":name,"kind":kind,"epoch":1}; cfg["keys"][f"{ws}:1"]=b64(key_); cfg["controls"][ws]=control; update_recovery(cfg,root); membership_event(cfg,ws,1,{cfg["user"]:"admin"},root); return ws
+    ws,key_=digest(os.urandom(32))[:32],os.urandom(32); entry=own_record(cfg); control=control_sign(cfg["device"],{"v":1,"kind":"workspace.state","workspace":ws,"scope":kind,"revision":1,"prev":None,"epoch":1,"boundary":{"epoch":1,"tail":0,"heads":{}},"key_commitment":digest(key_),"members":{cfg["user"]:{"role":"admin","joined":1,"history_from":1,"selected":[]}},"devices":{cfg["device"]["id"]:entry},"removed":[],"action":"create","approval":None,"approved_at":time.time()}); env=seal_key(key_,cfg["device"]["box_public"],f"workspace:{ws}:epoch:1"); request(cfg,sign_control(cfg["device"],{"op":"create","workspace":ws,"kind":kind,"control":control,"envelopes":{cfg["device"]["id"]:env}})); cfg["workspaces"][ws]={"name":name,"kind":kind,"epoch":1}; cfg["keys"][f"{ws}:1"]=b64(key_); cfg["controls"][ws]=control; update_recovery(cfg,root); membership_event(cfg,ws,1,{cfg["user"]:"admin"},root); return ws
 def setup_client(url,user,device="computer",recovery=None,root=None):
     if recovery:
         bundle=request({"url":url},{"op":"recovery_fetch","user":user},False)["bundle"]; recovered=recover(bundle,recovery); root_id=recovered["root"]; keys,workspaces,controls=recovered["keys"],recovered["workspaces"],recovered.get("controls",{})
@@ -105,13 +135,13 @@ def setup_client(url,user,device="computer",recovery=None,root=None):
             rotate(cfg,ws["id"],{u:m["role"] for u,m in cfg["controls"][ws["id"]]["members"].items()},[],root=root); grant_all(cfg,ws["id"],uid,root)
     return cfg,recovery
 def rotate(cfg,ws,members,devices,deactivate=(),root=None):
-    state=refresh(cfg,root); previous=cfg["controls"][ws]; epoch=previous["epoch"]+1; new=os.urandom(32); devices=trusted(devices); old=previous["members"]; meta={u:old.get(u,{"joined":epoch,"history_from":epoch,"selected":[]})|{"role":role} for u,role in members.items()}; removed=sorted(set(previous["removed"])|set(deactivate)|{d for d,r in previous["devices"].items() if r["user"] not in members}); records={d:r for d,r in previous["devices"].items() if r["user"] in members and d not in deactivate}
+    state=refresh(cfg,root); previous=cfg["controls"][ws]; epoch=previous["epoch"]+1; boundary=next_boundary(cfg,ws,root); new=os.urandom(32); devices=trusted(devices); old=previous["members"]; meta={u:old.get(u,{"joined":epoch,"history_from":epoch,"selected":[]})|{"role":role} for u,role in members.items()}; removed=sorted(set(previous["removed"])|set(deactivate)|{d for d,r in previous["devices"].items() if r["user"] not in members}); records={d:r for d,r in previous["devices"].items() if r["user"] in members and d not in deactivate}
     if cfg["device"]["id"] not in previous["devices"] and previous["scope"]=="personal":
         entry=own_record(cfg); req=device_proposal(cfg["device"],ws,previous,{**entry,"history":True},time.time()+300); records|={cfg["device"]["id"]:{**entry,"history":True}}; action,approval="personal_recover",{"proposal":req,"votes":[]}
     else:
         action,approval=("remove",None) if deactivate else ("membership",None); new_users=set(members)-set(old)
         records|={d["id"]:server_record(d) for d in devices if d["user_id"] in new_users and d["id"] not in removed and d.get("active",1) and d.get("allowed",1)}
-    control=control_body(cfg,previous,new,action,meta,records,removed,approval); envs={d:seal_key(new,r["device"]["box_public"],f"workspace:{ws}:epoch:{epoch}") for d,r in records.items()}; request(cfg,sign_control(cfg["device"],{"op":"rotate","workspace":ws,"control":control,"envelopes":envs})); cfg["keys"][f"{ws}:{epoch}"]=b64(new); cfg["workspaces"][ws]["epoch"]=epoch; cfg["controls"][ws]=control; update_recovery(cfg,root); cfg["device"]["id"] in records and membership_event(cfg,ws,epoch,members,root); return epoch
+    control=control_body(cfg,previous,new,action,meta,records,removed,approval,boundary); envs={d:seal_key(new,r["device"]["box_public"],f"workspace:{ws}:epoch:{epoch}") for d,r in records.items()}; request(cfg,sign_control(cfg["device"],{"op":"rotate","workspace":ws,"control":control,"envelopes":envs})); cfg["keys"][f"{ws}:{epoch}"]=b64(new); cfg["workspaces"][ws]["epoch"]=epoch; cfg["controls"][ws]=control; update_recovery(cfg,root); cfg["device"]["id"] in records and membership_event(cfg,ws,epoch,members,root); return epoch
 def publish(cfg,state,ws,record,root=None,defer=False,heads=None):
     if cfg["workspaces"][ws]["kind"]=="team" and (record:=protect_record(record,root,ws)) is None: return None
     revision=digest(record["payload"]); old=heads.get(record["entity"]) if heads is not None else state.execute("SELECT revision,event FROM publication_heads WHERE workspace=? AND owner=? AND entity=?",(ws,cfg["user"],record["entity"])).fetchone()
@@ -168,8 +198,8 @@ def pull(cfg,state,root=None):
         if not ws["device_authorized"]: continue
         sid=ws["id"]; current=state.execute("SELECT lifecycle FROM sync_states WHERE workspace=?",(sid,)).fetchone(); lifecycle=current[0] if current else "rebaselining"; state.execute("INSERT OR REPLACE INTO sync_states VALUES (?,?,COALESCE((SELECT tail FROM sync_states WHERE workspace=?),0),COALESCE((SELECT floor FROM sync_states WHERE workspace=?),0),NULL)",(sid,lifecycle,sid,sid)); state.commit()
         records={r["device"]["id"]:r for control in ws["controls"] for r in control["devices"].values()}; devices={device:r["device"] for device,r in records.items()}; authors={device:r["user"] for device,r in records.items()}
-        after=(state.execute("SELECT cursor FROM cursors WHERE workspace=?",(sid,)).fetchone() or [0])[0]; seen=(state.execute("SELECT value FROM meta WHERE key=?",(f"history_from:{sid}",)).fetchone() or [str(ws["history_from"])])[0]; earliest=min([k["epoch"] for k in ws["keys"]],default=ws["epoch"]); old_key=int((state.execute("SELECT value FROM meta WHERE key=?",(f"key_from:{sid}",)).fetchone() or [earliest])[0])
-        if ws["history_from"]<int(seen) or earliest<old_key: after=0
+        after=(state.execute("SELECT cursor FROM cursors WHERE workspace=?",(sid,)).fetchone() or [0])[0]; seen=(state.execute("SELECT value FROM meta WHERE key=?",(f"history_from:{sid}",)).fetchone() or [str(ws["history_from"])])[0]; earliest=min([k["epoch"] for k in ws["keys"]],default=ws["epoch"]); old_key=int((state.execute("SELECT value FROM meta WHERE key=?",(f"key_from:{sid}",)).fetchone() or [earliest])[0]); start=access_from(cfg,sid); candidates=[control["boundary"] for control in ws["controls"] if control["boundary"]["epoch"]==start]; boundary=candidates[0] if candidates and all(value==candidates[0] for value in candidates) else (_ for _ in ()).throw(ValueError("signed history boundary is ambiguous")); proof=digest(boundary); old_proof=(state.execute("SELECT value FROM meta WHERE key=?",(f"boundary:{sid}",)).fetchone() or [None])[0]; mode=(state.execute("SELECT value FROM meta WHERE key=?",(f"archive_mode:{sid}",)).fetchone() or [None])[0]; recover=mode if mode=="adopt" or ws["kind"]=="personal" and mode in ("native","import") else None
+        if not current or ws["history_from"]<int(seen) or earliest<old_key or proof!=old_proof: after=0; reset_history(state,sid,boundary); state.execute("INSERT OR REPLACE INTO meta VALUES (?,?)",(f"boundary:{sid}",proof)); state.commit()
         try:
             total=0
             while True:
@@ -191,9 +221,11 @@ def pull(cfg,state,root=None):
                     if material and material["id"]!=value["id"]: state.execute("INSERT OR REPLACE INTO history_sources VALUES (?,?,?)",(sid,material["id"],value["id"]))
                     if material: incoming.append((sid,material))
                     after=max(after,item["cursor"])
-                project_many(core_path(root),state,incoming,cfg["device"]["id"],root,False,authors); total+=len(result["events"]); state.execute("INSERT OR REPLACE INTO cursors VALUES (?,?)",(sid,after)); state.execute("INSERT OR REPLACE INTO meta VALUES (?,?),(?,?)",(f"history_from:{sid}",str(ws["history_from"]),f"key_from:{sid}",str(earliest))); state.commit()
+                project_many(core_path(root),state,incoming,cfg["device"]["id"],root,False,authors,recover,cfg["user"]); total+=len(result["events"]); state.execute("INSERT OR REPLACE INTO cursors VALUES (?,?)",(sid,after)); state.execute("INSERT OR REPLACE INTO meta VALUES (?,?),(?,?)",(f"history_from:{sid}",str(ws["history_from"]),f"key_from:{sid}",str(earliest))); state.commit()
                 if after>=tail: break
                 if not result["events"]: raise ValueError("relay tail cannot be reached")
+            verify_history(state,sid,ws["controls"],start)
+            if mode=="import": raise ValueError("archive rollback or replacement recovered additively; publication remains blocked")
             state.execute("INSERT OR REPLACE INTO sync_states VALUES (?,'ready',?,?,NULL)",(sid,tail,floor)); state.commit(); summary[sid]={"events":total,"cursor":after,"tail":tail,"floor":floor}
         except Exception as e:
             state.rollback(); state.execute("INSERT OR REPLACE INTO sync_states VALUES (?,'blocked',COALESCE((SELECT tail FROM sync_states WHERE workspace=?),0),COALESCE((SELECT floor FROM sync_states WHERE workspace=?),0),?)",(sid,sid,sid,str(e))); state.commit(); raise
@@ -214,7 +246,7 @@ def sync_once(root=None,force=False):
         if info["status"] in ("incompatible","invalid"): refresh(cfg,root); cutover=cutover_state(state_path)
         state=connect(state_path)
         try:
-            drain_hooks(); refresh(cfg,root); ready={r[0] for r in state.execute("SELECT workspace FROM sync_states WHERE lifecycle='ready'").fetchall()}; upload(cfg,state,root,ready); pull(cfg,state,root); ready={r[0] for r in state.execute("SELECT workspace FROM sync_states WHERE lifecycle='ready'").fetchall()}; flush_selected(cfg,state,root,ready); path=core_path(root); stamp=path.stat().st_mtime_ns if path.exists() else 0; active={w["id"] for w in cfg["server_state"]["workspaces"]}; scans=[(ws,meta) for ws,meta in cfg["workspaces"].items() if ws in ready and ws in active and f"{ws}:{meta['epoch']}" in cfg["keys"] and (force or stamp!=int((state.execute("SELECT value FROM meta WHERE key=?",(f"core_mtime:{ws}",)).fetchone() or ["0"])[0]))] if path.is_file() else []
+            drain_hooks(); refresh(cfg,root); ready={r[0] for r in state.execute("SELECT workspace FROM sync_states WHERE lifecycle='ready'").fetchall()}; upload(cfg,state,root,ready); prepare_archive(cfg,state,root); pull(cfg,state,root); ready={r[0] for r in state.execute("SELECT workspace FROM sync_states WHERE lifecycle='ready'").fetchall()}; flush_selected(cfg,state,root,ready); path=core_path(root); stamp=path.stat().st_mtime_ns if path.exists() else 0; active={w["id"] for w in cfg["server_state"]["workspaces"]}; scans=[(ws,meta) for ws,meta in cfg["workspaces"].items() if ws in ready and ws in active and f"{ws}:{meta['epoch']}" in cfg["keys"] and (force or stamp!=int((state.execute("SELECT value FROM meta WHERE key=?",(f"core_mtime:{ws}",)).fetchone() or ["0"])[0]))] if path.is_file() else []
             if scans:
                 core=duckdb.connect(str(path),read_only=True)
                 for ws,meta in scans:
@@ -224,7 +256,7 @@ def sync_once(root=None,force=False):
             [publish(cfg,state,ws,r,root,True,heads) for ws,meta in cfg["workspaces"].items() if ws in ready and ws in active and meta["kind"]=="personal" and f"{ws}:{meta['epoch']}" in cfg["keys"] for heads in [{r[0]:r[1] for r in state.execute("SELECT entity,revision FROM publication_heads WHERE workspace=? AND owner=?",(ws,cfg["user"])).fetchall()}] for r in bridge_records(root,state,ws,meta["kind"])]; state.commit(); upload(cfg,state,root,ready)
             for ws,meta in cfg["workspaces"].items():
                 if ws in ready and ws in active and meta["kind"]=="personal": purge_events(cfg,state,ws,bridge_purges(root,state,ws,meta["kind"]))
-            pull(cfg,state,root); state.execute("INSERT OR REPLACE INTO meta VALUES ('last_sync',?)",(str(time.time()),)); state.commit()
+            pull(cfg,state,root); remember_archive(cfg,state,root); state.execute("INSERT OR REPLACE INTO meta VALUES ('last_sync',?)",(str(time.time()),)); state.commit()
         finally: state.close()
         return cutover
 def add_member(cfg,ws,user,remove=False,root=None):
@@ -289,7 +321,7 @@ def approve_device(cfg,ws,device_id,approve=True,root=None):
         yes=len({v["voter"] for v in item["votes"] if v["approve"]}); needed=len(electorate(base,target["user"]))//2+1
         if not approve or yes<needed: return {"approved":False,"votes":yes,"needed":needed}
         approved(base,item["proposal"],item["votes"])
-    new=os.urandom(32); epoch=base["epoch"]+1; inherit=base["devices"][cfg["device"]["id"]]["history"] if same else False; queued=connect(paths(root)[2]); selected=selected_material(cfg,queued,ws,base["members"][target["user"]]["selected"],root) if inherit else []; queue_selected(queued,ws,device_id,[e for e,v in selected]); queued.close(); entry={**target,"history":inherit}; records={**base["devices"],device_id:entry}; action="self_approve" if same else "quorum_approve"; proof={"proposal":item["proposal"],"votes":item["votes"]}; control=control_body(cfg,base,new,action,devices=records,approval=proof); envs={d:seal_key(new,r["device"]["box_public"],f"workspace:{ws}:epoch:{epoch}") for d,r in records.items()}; start=base["members"][target["user"]]["history_from"]; history={name.rsplit(":",1)[1]:seal_key(unb64(value),entry["device"]["box_public"],f"workspace:{ws}:epoch:{name.rsplit(':',1)[1]}") for name,value in cfg["keys"].items() if inherit and name.startswith(ws+":") and int(name.rsplit(":",1)[1])>=start}
+    new=os.urandom(32); epoch=base["epoch"]+1; boundary=next_boundary(cfg,ws,root); inherit=base["devices"][cfg["device"]["id"]]["history"] if same else False; queued=connect(paths(root)[2]); selected=selected_material(cfg,queued,ws,base["members"][target["user"]]["selected"],root) if inherit else []; queue_selected(queued,ws,device_id,[e for e,v in selected]); queued.close(); entry={**target,"history":inherit}; records={**base["devices"],device_id:entry}; action="self_approve" if same else "quorum_approve"; proof={"proposal":item["proposal"],"votes":item["votes"]}; control=control_body(cfg,base,new,action,devices=records,approval=proof,boundary=boundary); envs={d:seal_key(new,r["device"]["box_public"],f"workspace:{ws}:epoch:{epoch}") for d,r in records.items()}; start=base["members"][target["user"]]["history_from"]; history={name.rsplit(":",1)[1]:seal_key(unb64(value),entry["device"]["box_public"],f"workspace:{ws}:epoch:{name.rsplit(':',1)[1]}") for name,value in cfg["keys"].items() if inherit and name.startswith(ws+":") and int(name.rsplit(":",1)[1])>=start}
     body={"op":"rotate","workspace":ws,"control":control,"envelopes":envs}; history and body.update(history_envelopes={device_id:history})
     request(cfg,sign_control(cfg["device"],body)); cfg["keys"][f"{ws}:{epoch}"]=b64(new); cfg["workspaces"][ws]["epoch"]=epoch; cfg["controls"][ws]=control; update_recovery(cfg,root); state=connect(paths(root)[2]); flush_selected(cfg,state,root); state.close(); control_event(cfg,ws,action,device_id,root); return {"approved":True,"epoch":epoch,"history":len(history),"selected":len(selected)}
 def request_history(cfg,ws,root=None,delay=3600):

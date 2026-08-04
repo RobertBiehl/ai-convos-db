@@ -9,9 +9,9 @@ from ai_convos_remote.protocol import certificate, digest, identity
 def person(name):
     root,device=identity(name+" root"),identity(name); return root,device,record(root["id"],root["sign_public"],device,certificate(root,root["id"],device))
 def genesis(root,device,entry):
-    body={"v":1,"kind":"workspace.state","workspace":"w","scope":"team","revision":1,"prev":None,"epoch":1,"key_commitment":digest(b"k1"),"members":{root["id"]:{"role":"admin","joined":1,"history_from":1,"selected":[]}},"devices":{device["id"]:entry},"removed":[],"action":"create","approval":None}; return sign(device,body)
+    body={"v":1,"kind":"workspace.state","workspace":"w","scope":"team","revision":1,"prev":None,"epoch":1,"boundary":{"epoch":1,"tail":0,"heads":{}},"key_commitment":digest(b"k1"),"members":{root["id"]:{"role":"admin","joined":1,"history_from":1,"selected":[]}},"devices":{device["id"]:entry},"removed":[],"action":"create","approval":None}; return sign(device,body)
 def successor(device,base,action,devices=None,members=None,removed=None,approval=None,epoch=None):
-    return sign(device,{"v":1,"kind":"workspace.state","workspace":"w","scope":base["scope"],"revision":base["revision"]+1,"prev":state_hash(base),"epoch":epoch if epoch is not None else base["epoch"]+1,"key_commitment":digest(f"k{base['epoch']+1}".encode()),"members":members or copy.deepcopy(base["members"]),"devices":devices or copy.deepcopy(base["devices"]),"removed":removed if removed is not None else list(base["removed"]),"action":action,"approval":approval,"approved_at":time.time()})
+    next_epoch=epoch if epoch is not None else base["epoch"]+1; boundary=copy.deepcopy(base["boundary"]); boundary["epoch"]=next_epoch; return sign(device,{"v":1,"kind":"workspace.state","workspace":"w","scope":base["scope"],"revision":base["revision"]+1,"prev":state_hash(base),"epoch":next_epoch,"boundary":boundary,"key_commitment":digest(f"k{base['epoch']+1}".encode()),"members":members or copy.deepcopy(base["members"]),"devices":devices or copy.deepcopy(base["devices"]),"removed":removed if removed is not None else list(base["removed"]),"action":action,"approval":approval,"approved_at":time.time()})
 
 
 def test_self_approval_inherits_user_state_and_rejects_cross_user_or_removed():

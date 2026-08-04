@@ -10,7 +10,7 @@ from ai_convos.cli import ARCHIVE_COLUMNS as COLUMNS, PROVENANCE_KINDS as PROVEN
 from ai_convos_changegraph.provenance import query as graph_query
 from .protocol import digest
 
-STATE_VERSION="4"
+STATE_VERSION="5"
 STATE = """
 CREATE TABLE IF NOT EXISTS outbox(workspace TEXT,event TEXT,entity TEXT,revision TEXT,author TEXT,seq INT,epoch INT,kind TEXT,status TEXT,path TEXT,size INT,PRIMARY KEY(workspace,event)) WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS receipts(workspace TEXT,event TEXT,cursor INT,author TEXT,seq INT,epoch INT,kind TEXT,entity TEXT,revision TEXT,status TEXT,PRIMARY KEY(workspace,event)) WITHOUT ROWID;
@@ -64,7 +64,7 @@ def cutover_state(path):
     if info["status"] not in ("incompatible","invalid") or path.is_symlink() or not path.is_file(): raise ValueError(f"remote state cannot be rebuilt ({info['status']})")
     backups=path.parent/"backups"
     if backups.is_symlink(): raise ValueError("remote state backup directory must not be a symlink")
-    backups.mkdir(parents=True,exist_ok=True); os.chmod(backups,0o700); name=f"state-{info['version'] or 'legacy'}-{time.time_ns()}"; stage=backups/f".{name}.{os.getpid()}"; target=backups/name; fresh=path.with_name(f".{path.name}.v3.{os.getpid()}.{time.time_ns()}"); stage.mkdir(mode=0o700); files=[p for p in (path,Path(str(path)+"-wal"),Path(str(path)+"-shm")) if p.exists()]; saved={}
+    backups.mkdir(parents=True,exist_ok=True); os.chmod(backups,0o700); name=f"state-{info['version'] or 'legacy'}-{time.time_ns()}"; stage=backups/f".{name}.{os.getpid()}"; target=backups/name; fresh=path.with_name(f".{path.name}.v{STATE_VERSION}.{os.getpid()}.{time.time_ns()}"); stage.mkdir(mode=0o700); files=[p for p in (path,Path(str(path)+"-wal"),Path(str(path)+"-shm")) if p.exists()]; saved={}
     try:
         for source in files:
             if source.is_symlink() or not source.is_file(): raise ValueError("remote state backup source must be a regular file")
@@ -146,6 +146,14 @@ def scan(core,graph,kind="personal",repositories=(),roots=()):
     return keep
 def author_user(value,authors): return (authors or {}).get(value["author"]) or (_ for _ in ()).throw(ValueError("verified author user required"))
 def foreign_id(workspace,author_user,table,old): return digest(f"{workspace}:{author_user}:{table}:{old}")[:16] if old else old
+def attachment_path(db_path,db,target,path):
+    target_db=db or (duckdb.connect(str(db_path)) if Path(db_path).exists() else None); own=target_db is not None and db is None
+    try: own and target_db.execute("BEGIN"); target_db and set_attachment_path(target_db,target,path); own and target_db.execute("COMMIT")
+    except BaseException:
+        if own: target_db.execute("ROLLBACK")
+        raise
+    finally:
+        if own: target_db.close()
 def sequence(state,workspace,value):
     old=state.execute("SELECT event FROM event_sequences WHERE workspace=? AND author=? AND seq=?",(workspace,value["author"],value["seq"])).fetchone()
     if old and old[0]!=value["id"]: raise ValueError("device sequence replay")
@@ -156,18 +164,29 @@ def sequence(state,workspace,value):
     if value["seq"]>1 and not before: state.execute("INSERT INTO sequence_gaps VALUES (?,?,?,?)",(workspace,value["author"],value["seq"],json.dumps(value["parents"])))
     if after: state.execute("DELETE FROM sequence_gaps WHERE workspace=? AND author=? AND seq=?",(workspace,value["author"],value["seq"]+1))
     return True
-def apply_record(db_path,state,value,workspace,local_device=None,db=None,authors=None):
+def reset_history(state,workspace,boundary):
+    [state.execute(f"DELETE FROM {table} WHERE workspace=?",(workspace,)) for table in ("receipts","history_sources","cursors","heads","lazy_events","event_sequences","sequence_gaps","sharing_boundaries")]; [state.execute("INSERT INTO event_sequences VALUES (?,?,?,?)",(workspace,author,head["seq"],head["event"])) for author,head in boundary["heads"].items()]
+def verify_history(state,workspace,controls,start):
+    gaps=state.execute("SELECT author,seq FROM sequence_gaps WHERE workspace=? ORDER BY author,seq LIMIT 1",(workspace,)).fetchone()
+    if gaps: raise ValueError(f"required event sequence is incomplete at {gaps[0]}:{gaps[1]}")
+    for control in controls:
+        if control["boundary"]["epoch"]>=start:
+            for author,head in control["boundary"]["heads"].items():
+                if (state.execute("SELECT event FROM event_sequences WHERE workspace=? AND author=? AND seq=?",(workspace,author,head["seq"])).fetchone() or [None])[0]!=head["event"]: raise ValueError("signed history checkpoint is incomplete")
+def apply_record(db_path,state,value,workspace,local_device=None,db=None,authors=None,recover=None,local_user=None):
     table=TABLES[value["kind"]]; p=value["payload"]
     if value["entity"] != f"{table}:{p['row'][0]}" or p["table"] != table or p["columns"]!=COLUMNS[table] or len(p["row"])!=len(p["columns"]): raise ValueError("record schema/entity mismatch")
     user=author_user(value,authors); sort=f"{value['observed_at']}:{value['id']}"; old=state.execute("SELECT sort_key FROM heads WHERE workspace=? AND author_user=? AND entity=?",(workspace,user,value["entity"])).fetchone()
     if old and old[0]>=sort: return False
-    if value["author"]==local_device: return False
-    values=list(p["row"]); values[0]=foreign_id(workspace,user,table,values[0])
-    for column,parent in FKS.get(table,()): idx=p["columns"].index(column); values[idx]=foreign_id(workspace,user,parent,values[idx])
+    owned=bool(recover and user==local_user); native=owned and recover=="native"
+    if owned and recover=="adopt": return False
+    if value["author"]==local_device and not owned: return False
+    mapped=lambda table,old:old if native else foreign_id(workspace,user,table,old); values=list(p["row"]); values[0]=mapped(table,values[0])
+    for column,parent in FKS.get(table,()): idx=p["columns"].index(column); values[idx]=mapped(parent,values[idx])
     own=db is None
     if own: Path(db_path).parent.mkdir(parents=True,exist_ok=True); db=duckdb.connect(str(db_path)); init_schema(db); db.execute("BEGIN")
     try:
-        project_archive_row(db,table,p["columns"],values,{"workspace_id":workspace,"author_user_id":user,"author_device_id":value["author"],"source_row_id":p["row"][0],"source_event_id":value["id"],"content_key":value["entity"],"observed_at":value["observed_at"]})
+        project_archive_row(db,table,p["columns"],values,None if native else {"workspace_id":workspace,"author_user_id":user,"author_device_id":value["author"],"source_row_id":p["row"][0],"source_event_id":value["id"],"content_key":value["entity"],"observed_at":value["observed_at"]})
         if table=="attachments" and (blob:=state.execute("SELECT path FROM attachment_blobs WHERE workspace=? AND author=? AND attachment=?",(workspace,value["author"],p["row"][0])).fetchone()): set_attachment_path(db,values[0],blob[0])
         if own: db.execute("COMMIT")
     except BaseException:
@@ -178,20 +197,21 @@ def apply_record(db_path,state,value,workspace,local_device=None,db=None,authors
     state.execute("INSERT OR REPLACE INTO heads VALUES (?,?,?,?,?)",(workspace,user,value["entity"],sort,value["id"]));
     if own: state.commit()
     return True
-def project(db_path,state,value,workspace,local_device=None,db=None,root=None,batch=False,authors=None):
-    if value["kind"] in TABLES: return apply_record(db_path,state,value,workspace,local_device,db,authors)
+def project(db_path,state,value,workspace,local_device=None,db=None,root=None,batch=False,authors=None,recover=None,local_user=None):
+    if value["kind"] in TABLES: return apply_record(db_path,state,value,workspace,local_device,db,authors,recover,local_user)
     if value["kind"]=="workspace.policy":
         p=value["payload"]; state.execute("INSERT OR REPLACE INTO policies VALUES (?,?,?,COALESCE((SELECT local_root FROM policies WHERE workspace=? AND kind=? AND value=?),NULL))",(workspace,p["kind"],p["value"],workspace,p["kind"],p["value"])); batch or state.commit(); return True
     if value["kind"]=="turn.boundary":
         p=value["payload"]; state.execute("INSERT OR IGNORE INTO sharing_boundaries VALUES (?,?,?,?)",(value["entity"],workspace,foreign_id(workspace,author_user(value,authors),"messages",p["turn"]),p["hidden_count"])); batch or state.commit(); return True
     if value["kind"]=="attachment.chunk":
-        if value["author"]==local_device: return False
-        p=value["payload"]; user=author_user(value,authors); data=base64.b64decode(p["data"],validate=True); expected=f"attachment:{p['attachment']}:{p['blob']}:{p['index']}"; base=Path(db_path).parent.parent/"remote/attachments"; safe=base/digest(workspace)[:32]; path=safe/p["blob"]; parts=safe/".parts"/value["author"]/p["blob"]
+        p=value["payload"]; user=author_user(value,authors); owned=bool(recover and user==local_user); native=owned and recover=="native"
+        if owned and recover=="adopt": return False
+        if value["author"]==local_device and not owned: return False
+        data=base64.b64decode(p["data"],validate=True); expected=f"attachment:{p['attachment']}:{p['blob']}:{p['index']}"; base=Path(db_path).parent.parent/"remote/attachments"; safe=base/digest(workspace)[:32]; path=safe/p["blob"]; parts=safe/".parts"/value["author"]/p["blob"]
         if value["entity"]!=expected or p["blob"]!=p["sha256"] or len(p["blob"])!=64 or any(c not in "0123456789abcdef" for c in p["blob"]) or not 0<=p["index"]<p["total"] or p["size"]<0 or len(data)>49152: raise ValueError("attachment chunk schema mismatch")
         if path.exists():
             if path.is_symlink() or path.stat().st_size!=p["size"] or file_hash(path)!=p["sha256"]: raise ValueError("attachment file conflict")
-            stale=state.execute("SELECT path FROM attachment_parts WHERE workspace=? AND author=? AND blob=?",(workspace,value["author"],p["blob"])).fetchall(); state.execute("INSERT OR REPLACE INTO attachment_blobs VALUES (?,?,?,?)",(workspace,value["author"],p["attachment"],str(path))); state.execute("DELETE FROM attachment_parts WHERE workspace=? AND author=? AND blob=?",(workspace,value["author"],p["blob"])); [Path(r[0]).unlink(missing_ok=True) for r in stale if Path(r[0]).parent==parts]; target=foreign_id(workspace,user,"attachments",p["attachment"]); target_db=db or (duckdb.connect(str(db_path)) if Path(db_path).exists() else None)
-            if target_db: set_attachment_path(target_db,target,path); db or target_db.close()
+            stale=state.execute("SELECT path FROM attachment_parts WHERE workspace=? AND author=? AND blob=?",(workspace,value["author"],p["blob"])).fetchall(); state.execute("INSERT OR REPLACE INTO attachment_blobs VALUES (?,?,?,?)",(workspace,value["author"],p["attachment"],str(path))); state.execute("DELETE FROM attachment_parts WHERE workspace=? AND author=? AND blob=?",(workspace,value["author"],p["blob"])); [Path(r[0]).unlink(missing_ok=True) for r in stale if Path(r[0]).parent==parts]; target=p["attachment"] if native else foreign_id(workspace,user,"attachments",p["attachment"]); attachment_path(db_path,db,target,path)
             batch or state.commit(); return True
         chunk_hash=hashlib.sha256(data).hexdigest(); part=parts/str(p["index"]); meta=state.execute("SELECT total,attachment,sha256,size FROM attachment_parts WHERE workspace=? AND author=? AND blob=? LIMIT 1",(workspace,value["author"],p["blob"])).fetchone(); old=state.execute("SELECT total,attachment,sha256,size,chunk_hash,path FROM attachment_parts WHERE workspace=? AND author=? AND blob=? AND idx=?",(workspace,value["author"],p["blob"],p["index"])).fetchone()
         if meta and tuple(meta)!=(p["total"],p["attachment"],p["sha256"],p["size"]) or old and tuple(old)!=(p["total"],p["attachment"],p["sha256"],p["size"],chunk_hash,str(part)): raise ValueError("attachment chunk conflict")
@@ -210,26 +230,30 @@ def project(db_path,state,value,workspace,local_device=None,db=None,root=None,ba
                 if tmp.stat().st_size!=p["size"] or file_hash(tmp)!=p["sha256"]: raise ValueError("attachment hash mismatch")
                 os.replace(tmp,path)
             except BaseException: out.close(); tmp.unlink(missing_ok=True); raise
-            state.execute("INSERT OR REPLACE INTO attachment_blobs VALUES (?,?,?,?)",(workspace,value["author"],p["attachment"],str(path))); state.execute("DELETE FROM attachment_parts WHERE workspace=? AND author=? AND blob=?",(workspace,value["author"],p["blob"])); [Path(r[1]).unlink(missing_ok=True) for r in rows]; target=foreign_id(workspace,user,"attachments",p["attachment"]); target_db=db or (duckdb.connect(str(db_path)) if Path(db_path).exists() else None)
-            if target_db: set_attachment_path(target_db,target,path); db or target_db.close()
+            state.execute("INSERT OR REPLACE INTO attachment_blobs VALUES (?,?,?,?)",(workspace,value["author"],p["attachment"],str(path))); state.execute("DELETE FROM attachment_parts WHERE workspace=? AND author=? AND blob=?",(workspace,value["author"],p["blob"])); [Path(r[1]).unlink(missing_ok=True) for r in rows]; target=p["attachment"] if native else foreign_id(workspace,user,"attachments",p["attachment"]); attachment_path(db_path,db,target,path)
         batch or state.commit(); return True
     if root is not None:
         for bridge in bridges():
             if (result:=bridge["project"](root,state,value,workspace,local_device)) is not None: return result
     if value["kind"] not in PROVENANCE: return False
-    if value["author"]==local_device: return True
+    user=author_user(value,authors); owned=bool(recover and user==local_user); native=owned and recover=="native"
+    if owned and recover=="adopt": return True
+    if value["author"]==local_device and not owned: return True
     own=db is None
-    if own: Path(db_path).parent.mkdir(parents=True,exist_ok=True); db=duckdb.connect(str(db_path)); init_schema(db)
-    try: return project_provenance(db,value,lambda table,old:foreign_id(workspace,author_user(value,authors),table,old))
+    if own: Path(db_path).parent.mkdir(parents=True,exist_ok=True); db=duckdb.connect(str(db_path)); init_schema(db); db.execute("BEGIN")
+    try: result=project_provenance(db,value,lambda table,old:old if native else foreign_id(workspace,user,table,old)); own and db.execute("COMMIT"); return result
+    except BaseException:
+        if own: db.execute("ROLLBACK")
+        raise
     finally:
         if own: db.close()
-def project_many(db_path,state,items,local_device=None,root=None,commit=True,authors=None):
-    records=any(v["kind"] in set(TABLES)|PROVENANCE and v["author"]!=local_device for _,v in items); db=None
+def project_many(db_path,state,items,local_device=None,root=None,commit=True,authors=None,recover=None,local_user=None):
+    records=any(v["kind"] in set(TABLES)|PROVENANCE and (v["author"]!=local_device or recover and author_user(v,authors)==local_user) for _,v in items); db=None
     if records: Path(db_path).parent.mkdir(parents=True,exist_ok=True); db=duckdb.connect(str(db_path)); init_schema(db)
     committed=False
     try:
         if db: db.execute("BEGIN")
-        [project(db_path,state,v,ws,local_device,db,root,True,authors) for ws,v in items]
+        [project(db_path,state,v,ws,local_device,db,root,True,authors,recover,local_user) for ws,v in items]
         if db: db.execute("COMMIT"); committed=True
         commit and state.commit()
     except BaseException:

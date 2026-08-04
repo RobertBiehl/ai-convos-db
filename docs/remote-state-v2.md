@@ -15,6 +15,8 @@ Remote state v2 keeps the existing DuckDB plus SQLite design, but removes
 overlapping authority:
 
 - DuckDB is the canonical archive, including canonical provenance facts.
+- DuckDB carries a stable archive ID and a transactional monotonic generation;
+  device config pins the last generation that completed remote convergence.
 - `state.db` is a rebuildable synchronization index. Pending ciphertext lives
   in mode-0600 outbox files referenced by metadata rows.
 - The relay is the durable encrypted signed-event ledger.
@@ -38,6 +40,8 @@ DuckDB owns user-visible canonical content:
 - identity assertions and capture gaps.
 - durable `remote.row_origins` attribution for every remotely projected archive
   row, written atomically with that row.
+- the single-row `archive_state` identity and generation used to detect file
+  replacement and rollback without hashing the archive on every sync.
 
 Canonical provenance uses existing archive identities. It does not duplicate
 prompt text, message content, changesets, or file edits. Prompts are resolved
@@ -47,6 +51,19 @@ edges reference `file_edits.id`.
 DuckDB never stores remote cursors, retry state, workspace policy, event
 envelopes, or publication receipts. Row origin is the narrow exception because
 it determines authorship and whether an archive row may ever be published.
+The archive generation is another narrow safety primitive: every core archive
+or provenance transaction advances it, and rollback advances are rolled back
+with the content transaction.
+
+### Device config
+
+`config.json` owns device keys, workspace keys, pinned signed controls, and the
+last archive ID/generation that completed an entire sync. The archive proof is
+kept here, rather than only in rebuildable `state.db`, so deleting `state.db`
+cannot erase rollback detection. A content-free copy in `state.db` provides a
+second safety anchor against a stale config write. Neither copy contains archive
+row content, and the proof is not included in a recovered device's server-side
+recovery bundle.
 
 ### Changegraph
 
@@ -64,6 +81,7 @@ Remote contains no DuckDB mutation SQL.
 Long-lived `state.db` rows contain only:
 
 - lifecycle and schema version;
+- the cached last-verified archive ID/generation;
 - workspace cursors and advertised relay tail;
 - `(workspace, owner user, entity) -> (current revision, event)` publication
   heads;
@@ -88,7 +106,9 @@ The relay owns durable opaque envelopes and encrypted blobs. It reports:
 - the earliest retained cursor available to the requesting device;
 - event envelopes or lazy manifests after a cursor;
 - exact envelope fetch by event ID;
-- signed deletion tombstones where projection-producing bodies were removed.
+- opaque replay-denial tombstones where projection-producing bodies were
+  removed. Their author sequence participates in the next signed ledger
+  boundary; the tombstone itself is not a client signature.
 
 The relay never interprets payloads. Server database and blob storage are one
 backup unit.
@@ -147,21 +167,42 @@ An absent, incompatible, or incomplete state with configured workspaces enters
 `REBASELINING`. Recovery:
 
 1. Acquires the same exclusive lock used by the worker and explicit sync.
-2. Refreshes signed control state and obtains relay tail and retention floor.
-3. Pulls every authorized event from the earliest required cursor.
+2. Refreshes the complete signed control chain. Every epoch boundary commits
+   the exact relay tail plus each author's `(sequence, event_id)` head.
+3. Starts full-history replay at genesis, or limited-history replay at the
+   signed boundary for the first entitled epoch.
 4. Decrypts, authenticates, validates sequence identity, and materializes each
    event.
 5. Rebuilds acknowledged receipts, publication and import heads, exact
    sequences, and cursors while projecting archive rows and their canonical
    DuckDB origins.
-6. Verifies that the advertised tail was reached without an unresolved event
-   required by the installed protocol.
+6. Verifies that the advertised accessible tail was reached, every applicable
+   signed author checkpoint is present, and no required sequence gap remains.
 7. Commits `READY`.
 
 An unavailable relay, missing key, sequence conflict, or incomplete retained
 history enters `BLOCKED`. Local retrieval remains available. Publication stays
 disabled until recovery succeeds or the user explicitly creates a new remote
 history.
+
+Archive recovery is deliberately asymmetric:
+
+- With an intact archive, deleting `state.db` rebuilds only sync metadata and
+  adopts the existing DuckDB rows and durable origins.
+- A missing or genuinely empty archive replays the personal ledger under the
+  original row IDs, restoring owned canonical rows without marking them as
+  imports or publishing them again.
+- A different archive ID or generation below the pinned value is never
+  overwritten. Relay rows are recovered additively under foreign IDs beside
+  the suspect native rows, and the workspace remains `BLOCKED`, so stale rows
+  cannot be published as reversions.
+
+Recovery mode remains durable across crashes until the final pull and archive
+proof commit. Retrying a blocked rollback does not replay or duplicate the
+additive copy. Resolution is recoverable and explicit: preserve the suspect
+DuckDB, replace it with a fresh empty archive, then sync to perform native
+relay restoration before reconciling any unsynchronized rows from the preserved
+copy.
 
 ## Sync order
 
@@ -225,9 +266,17 @@ path. SQLite stores only the manifest and completion metadata.
 
 Sequence safety is not approximated. State retains an exact event ID for every
 author sequence so a second signed event at an old sequence is detectable.
-Hashes and event IDs use BLOB columns. Composite metadata tables use
+Identifiers use exact content-free text columns. Composite metadata tables use
 `WITHOUT ROWID`. Parent lists are retained only for unresolved gaps; contiguous
 history retains exact sequence identity plus the current chain head.
+Epoch-advancing control records sign `{epoch, tail, heads}` and the relay accepts
+one only when it exactly matches the ledger inside the same write transaction.
+Same-epoch history controls must retain that boundary. A limited-history client
+seeds its sequence chains from the signed boundary; a full-history client starts
+at genesis. Relay retention floors are delivery hints, never completeness
+proofs. A relay can still withhold a newest suffix created after the last signed
+boundary; detecting that requires gossip or an external transparency witness
+and remains outside this release.
 
 ## Performance
 
@@ -265,11 +314,13 @@ tail replay; it is an accelerator, never authority.
 ## Schema lifecycle
 
 Core owns its DuckDB schema lifecycle. Every mutating core entry point runs the
-idempotent schema initializer, which adds the provenance and origin relations
-to an existing archive without rewriting its conversation tables. This is the
-frictionless user-data migration path and is covered by a preservation test.
+idempotent schema initializer, which adds provenance, origins, and
+`archive_state` to an existing archive without rewriting its conversation
+tables. This is the frictionless user-data migration path and is covered by a
+preservation test.
 
-Remote state has no compatibility transform in this pre-stability release.
+Remote state schema 5 has no compatibility transform in this pre-stability
+release.
 Inspection and doctor are side-effect-free. An absent state is initialized as
 empty metadata. A mutating sync handles an incompatible or damaged regular
 state under the normal exclusive sync lock:
@@ -291,8 +342,9 @@ Historical canonical facts stranded in a legacy state remain recoverable from
 that bundle; this cutover does not make Remote or Changegraph parse the old
 schema.
 
-The relay protocol itself is not migrated. Client and server v2 are deployed
-together after old workers are stopped.
+The relay protocol itself is not migrated. Client and server v2, backed by a
+fresh relay database at SQLite `user_version=4`, are deployed together after
+old workers are stopped.
 
 ## Product behavior
 
@@ -323,11 +375,18 @@ contains merge commits or fixup commits.
 ## Required acceptance
 
 - Deleting state with DuckDB intact uploads zero rows before full rebaseline.
+- Deleting state does not erase the archive rollback proof held in device
+  config.
+- Missing DuckDB recovery restores owned rows without imported attribution or
+  relay echo.
+- Non-empty DuckDB rollback recovers additively and remains blocked across
+  retries.
 - Imported rows never echo; one genuinely new local row publishes once.
 - Recovery with an unavailable or incomplete relay fails closed.
 - Crash injection at each DuckDB/SQLite/upload boundary converges exactly.
 - Duplicate delivery and out-of-order delivery are idempotent.
 - Conflicting event identities at one author sequence are rejected.
+- Missing history before a later signed author checkpoint prevents `READY`.
 - Explicit sync reaches the advertised tail in one invocation.
 - Settled state contains no synthetic plaintext.
 - State growth after acknowledgement is independent of payload size.
