@@ -60,10 +60,14 @@ CREATE TABLE IF NOT EXISTS provenance.assertions(id VARCHAR PRIMARY KEY,left_id 
 CREATE TABLE IF NOT EXISTS provenance.capture_gaps(id VARCHAR PRIMARY KEY,repository VARCHAR,checkpoint_id VARCHAR,path VARCHAR,relation VARCHAR,observed_at TIMESTAMP);
 CREATE SCHEMA IF NOT EXISTS remote;
 CREATE TABLE IF NOT EXISTS remote.row_origins(table_name VARCHAR,physical_row_id VARCHAR,workspace_id VARCHAR,author_user_id VARCHAR,author_device_id VARCHAR,source_row_id VARCHAR,source_event_id VARCHAR,content_key VARCHAR,observed_at TIMESTAMP,PRIMARY KEY(table_name,physical_row_id));
+CREATE TABLE IF NOT EXISTS archive_state(singleton BOOLEAN PRIMARY KEY,archive_id UUID NOT NULL,generation UBIGINT NOT NULL);
 """
 ARCHIVE_COLUMNS={"conversations":["id","source","title","created_at","updated_at","model","cwd","git_branch","project_id","metadata"],"messages":["id","conversation_id","role","content","thinking","created_at","model","metadata","parent_id"],"tool_calls":["id","message_id","tool_name","input","output","status","duration_ms","created_at"],"attachments":["id","message_id","filename","mime_type","size","path","url","created_at"],"artifacts":["id","conversation_id","artifact_type","title","content","language","created_at","version"],"file_edits":["id","message_id","file_path","edit_type","content","created_at","old_content"]}
 PROVENANCE_KINDS={"repository.observed","file.observed","file.version","edit.observed","git.checkpoint","checkpoint.link","identity.assertion","capture.gap"}
 def provenance_digest(v): return hashlib.sha256(v if isinstance(v,bytes) else json.dumps(v,sort_keys=True,separators=(",",":"),ensure_ascii=True,allow_nan=False).encode()).hexdigest()
+def _archive_touch(db): db.execute("UPDATE archive_state SET generation=generation+1 WHERE singleton")
+def archive_state(db):
+    archive_id,generation=db.execute("SELECT archive_id::VARCHAR,generation FROM archive_state WHERE singleton").fetchone(); local=sum(db.execute(f"SELECT COUNT(*) FROM {table} x WHERE NOT EXISTS (SELECT 1 FROM remote.row_origins o WHERE o.table_name=? AND o.physical_row_id=x.id)",(table,)).fetchone()[0] for table in ARCHIVE_COLUMNS); return archive_id,generation,local
 def _git_run(root,*args): return subprocess.run(("git","-C",str(root),*args),capture_output=True,check=True).stdout
 def _git_maybe(root,*args):
     try: return _git_run(root,*args)
@@ -135,6 +139,7 @@ def project_provenance(db,value,map_id=lambda table,value:value):
     elif k=="capture.gap":
         if value["entity"]!=provenance_digest({"checkpoint":p["checkpoint"],"path":p["path"]}): raise ValueError("provenance gap identity mismatch")
         db.execute("INSERT OR IGNORE INTO provenance.capture_gaps VALUES (?,?,?,?,?,?)",(value["entity"],p["repository"],p["checkpoint"],p["path"],p["relation"],observed))
+    _archive_touch(db)
     return True
 def capture_provenance(core,edit_ids=None):
     records,repos=_observe_provenance(core,edit_ids); core.execute("BEGIN")
@@ -147,7 +152,8 @@ def project_archive_row(db,table,columns,values,origin=None):
     if origin and set(origin)!=set(required): raise ValueError("record origin schema mismatch")
     updates=",".join(f"{c}=excluded.{c}" for c in columns[1:])+(f",embedding=CASE WHEN {table}.content IS DISTINCT FROM excluded.content THEN NULL ELSE {table}.embedding END" if table=="messages" else ""); db.execute(f"INSERT INTO {table} ({','.join(columns)}) VALUES ({','.join('?'*len(columns))}) ON CONFLICT(id) DO UPDATE SET {updates}",values)
     if origin: db.execute("INSERT OR REPLACE INTO remote.row_origins VALUES (?,?,?,?,?,?,?,?,?)",(table,values[0],*(origin[k] for k in required)))
-def set_attachment_path(db,row_id,path): db.execute("UPDATE attachments SET path=? WHERE id=?",(str(path),row_id))
+    _archive_touch(db)
+def set_attachment_path(db,row_id,path): db.execute("UPDATE attachments SET path=? WHERE id=?",(str(path),row_id)); _archive_touch(db)
 def init_schema(conn):
     conn.execute("""CREATE TABLE IF NOT EXISTS conversations (
         id VARCHAR PRIMARY KEY, source VARCHAR NOT NULL, title VARCHAR, created_at TIMESTAMP, updated_at TIMESTAMP,
@@ -172,6 +178,7 @@ def init_schema(conn):
     conn.execute("ALTER TABLE file_edits ADD COLUMN IF NOT EXISTS old_content TEXT")
     conn.execute("ALTER TABLE messages ADD COLUMN IF NOT EXISTS parent_id VARCHAR")  # thread tree; ALTER (not CREATE) keeps column order identical for fresh and migrated dbs
     conn.execute(_PROVENANCE_SCHEMA)
+    conn.execute("INSERT INTO archive_state SELECT TRUE,uuid(),0 WHERE NOT EXISTS (SELECT 1 FROM archive_state)")
     conn.execute("INSTALL fts; LOAD fts")
 
 def counts_by_source(conn):
@@ -716,6 +723,7 @@ def upsert(conn, r: ParseResult):
             if prev and payload(prev) != payload(vals): hist = list(prev); hist[0] = gen_id("history", f"{table}:{r['id']}:{json.dumps(payload(hist), default=str)}"); cur(f"INSERT INTO {table} VALUES ({','.join(['?']*len(hist))}) ON CONFLICT DO NOTHING", hist)
             cur(f"INSERT OR REPLACE INTO {table} VALUES ({','.join(['?']*len(vals))})", vals)
     [replace_preserving(t, rows) for t, rows in (("tool_calls", r.tools), ("attachments", r.attachs), ("artifacts", r.artifacts), ("file_edits", r.edits))]
+    if any((r.convs,r.msgs,r.tools,r.attachs,r.artifacts,r.edits)): _archive_touch(conn)
     return len(r.convs), len(r.msgs), len(r.tools), len(r.attachs), len(r.edits), len(new_convs), len(updated), changed_msgs
 
 def hook_root(source): return Path(os.environ.get("CLAUDE_CONFIG_DIR", Path.home()/".claude"))/"projects" if source == "claude-code" else Path(os.environ.get("CODEX_HOME", Path.home()/".codex"))/"sessions"
@@ -750,8 +758,8 @@ def drain_hooks(embed=False, local_only=False):
                 r = hook_result(e["source"], path); st2 = path.stat()
                 if snap != [st2.st_mtime_ns, st2.st_size]: retry_hook(work); continue
                 if not r.convs: done.append((work, key, snap, set())); continue
-                conn = get_db(); init_schema(conn)
-                try: changed = upsert(conn, r)[-1] | ({m["id"] for m in r.msgs} if e.get("retry") else set()); capture_provenance(conn,[x["id"] for x in r.edits])
+                conn = get_db(); init_schema(conn); conn.execute("BEGIN")
+                try: changed = upsert(conn, r)[-1] | ({m["id"] for m in r.msgs} if e.get("retry") else set()); conn.execute("COMMIT"); capture_provenance(conn,[x["id"] for x in r.edits])
                 finally: conn.close()
                 atomic_json(work, {**e, "snap":snap, "changed":sorted(changed)})
                 done.append((work, key, snap, changed))
@@ -1124,7 +1132,9 @@ def sync(watch: bool = typer.Option(False, "-w"), interval: int = typer.Option(3
                 try: out = upsert(conn, r); conn.execute("COMMIT"); known.update({c["id"]:(u.timestamp() if (u := ts_any(json.loads(c["metadata"]).get("remote_update_time"))) else None) for c in r.convs}); return out
                 except BaseException: conn.execute("ROLLBACK"); raise
                 finally: conn.close()
-        conn = get_db(); conn.execute("UPDATE conversations c SET created_at=COALESCE(c.created_at,t.first_seen),updated_at=COALESCE(c.updated_at,t.last_seen) FROM (SELECT conversation_id,MIN(created_at) first_seen,MAX(created_at) last_seen FROM messages GROUP BY conversation_id) t WHERE c.id=t.conversation_id AND c.source='chatgpt' AND (c.created_at IS NULL OR c.updated_at IS NULL)"); conn.close()
+        conn = get_db(); repair=conn.execute("SELECT 1 FROM conversations WHERE source='chatgpt' AND (created_at IS NULL OR updated_at IS NULL) LIMIT 1").fetchone()
+        if repair: conn.execute("BEGIN"); conn.execute("UPDATE conversations c SET created_at=COALESCE(c.created_at,t.first_seen),updated_at=COALESCE(c.updated_at,t.last_seen) FROM (SELECT conversation_id,MIN(created_at) first_seen,MAX(created_at) last_seen FROM messages GROUP BY conversation_id) t WHERE c.id=t.conversation_id AND c.source='chatgpt' AND (c.created_at IS NULL OR c.updated_at IS NULL)"); _archive_touch(conn); conn.execute("COMMIT")
+        conn.close()
         conn = get_db(read_only=True); cur = counts_by_source(conn); rows = conn.execute("SELECT id,updated_at,json_extract_string(metadata,'$.remote_update_time') FROM conversations WHERE source='chatgpt'").fetchall(); known = {cid:(v.timestamp() if (v := ts_any(raw)) else ts.timestamp() if ts else None) for cid, ts, raw in rows}; legacy = {cid for cid, _, raw in rows if raw is None}; conn.close(); fmt = lambda v: f"{v[0]} convs, {v[1]} msgs, {v[2]} tools, {v[3]} attachs, {v[4]} edits"
         start = lambda label, src=None: typer.echo(f"Syncing {label}" if not src else f"Syncing {label} ({fmt(cur.setdefault(src, [0]*5))})")
         if paths := [Path(p).expanduser() for p in os.environ.get("CONVOS_IMPORT_PATHS", "").split(",") if p.strip()]:
@@ -1148,8 +1158,8 @@ def sync(watch: bool = typer.Option(False, "-w"), interval: int = typer.Option(3
                     if saved := j.get("saved"):
                         c, m, t, a, e, n, u = [sum(s[i] for s in saved) for i in range(7)]; changed_ids = set()
                     elif r is not None:
-                        conn = get_db()
-                        try: c, m, t, a, e, n, u, changed_ids = upsert(conn, r)
+                        conn = get_db(); conn.execute("BEGIN")
+                        try: c, m, t, a, e, n, u, changed_ids = upsert(conn, r); conn.execute("COMMIT")
                         finally: conn.close()
                     else: continue
                     total = [total[i]+v for i, v in enumerate([c, m, t, a, e])]

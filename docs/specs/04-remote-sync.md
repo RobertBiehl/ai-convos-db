@@ -25,17 +25,19 @@ owner or boundary of a conversation, changeset, repository, or file lineage.
 ## Architecture and trust boundary
 
 ```text
-provider transcripts -> local convos DuckDB -> event projector -> encrypted outbox
-                                                        |              |
-                                                 local graph DB     HTTPS relay
-                                                                       |
-                                                               opaque event store
-                                                                       |
-                  local convos DuckDB <- event projector <- encrypted inbox
+provider transcripts -> canonical convos DuckDB -> event projector -> encrypted outbox
+                               |                                |              |
+                       typed graph views                    HTTPS relay
+                                                                  |
+                                                          opaque event store
+                                                                  |
+             canonical convos DuckDB <- event projector <- encrypted inbox
 ```
 
-- DuckDB is a rebuildable local search projection, not a wire format.
-- The local graph database is a rebuildable typed projection, not evidence.
+- DuckDB is the canonical local archive and typed provenance store, not a wire
+  format.
+- Changegraph is a read-only typed view over DuckDB; there is no second graph
+  database.
 - Signed events are durable evidence, except for the narrow personal-memory
   privacy purge defined below.
 - The server stores ciphertext, public device records, workspace ACLs, key
@@ -177,6 +179,15 @@ Workspace admins sign membership events and key-control requests. Every add or
 removal advances the epoch and creates key envelopes for every currently
 authorized device. Removed devices receive no new envelope and cannot decrypt
 future events. They retain all plaintext and old keys already obtained.
+
+Every epoch-advancing control also signs the exact relay ledger boundary:
+workspace epoch and tail plus each author's latest sequence and event ID. The
+relay verifies that snapshot atomically with the control update. Full-history
+recovery validates chains from genesis; future-only recovery starts from the
+signed boundary and requires every subsequent sequence to be contiguous.
+Missing interior events or signed checkpoints block publication. A malicious
+relay can still hide a newest suffix after the latest signed boundary because
+v1 has no gossip or transparency log.
 
 New members receive only the new epoch by default. Complete-history grant seals
 selected old epoch keys to their devices. Selected-history grant republishes

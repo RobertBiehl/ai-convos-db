@@ -32,6 +32,10 @@ not provide cross-client gossip or an external transparency log, so a malicious
 relay can still withhold updates or partition clients that have not compared
 their pinned heads.
 
+Epoch-changing controls also pin the relay history boundary: the exact tail and
+latest `(sequence, event_id)` for every author. Recovery must reach every signed
+checkpoint with no unexplained sequence gap before publication becomes ready.
+
 ## Install from this repository
 
 Install the core and client applications together:
@@ -306,7 +310,9 @@ Restore by stopping the relay, replacing its database with the snapshot, and
 starting it again. The backup contains ciphertext, ACL metadata, key envelopes,
 and delivery cursors, but no workspace key. Clients can safely retry uploads and
 pulls after rollback because event insertion and local projection are
-idempotent.
+idempotent. Signed history checkpoints detect a restored relay that is missing
+an already-bound prefix; without gossip, a newest suffix after the latest signed
+boundary can still be withheld.
 
 A backup taken before a memory forget operation still contains the older
 encrypted events and predates their event-ID tombstones. Treat relay-backup
@@ -316,13 +322,24 @@ historical ciphertext available to newly recovered clients again.
 Client recovery requires the server backup plus the user's recovery key. Loss
 of every enrolled device and the recovery key is permanent data loss.
 
+`state.db` is disposable synchronization metadata. Device `config.json` pins
+the last successfully synchronized DuckDB identity and generation, so deleting
+only `state.db` cannot erase archive rollback detection. If `convos.db` is
+missing or truly empty, sync restores personal rows from the relay under their
+native IDs without republishing them. If a non-empty archive has a different ID
+or an older generation, sync keeps it, restores relay rows additively under
+foreign IDs, and remains blocked. Preserve that suspect database, install a
+fresh empty archive, and sync again before manually reconciling any local-only
+rows from the preserved copy.
+
 ## Local files
 
 Remote client state lives under `<root>/remote/` (by default,
 `~/.convos/remote/`):
 
 - `config.json`: mode `0600`, device private keys, token, encrypted-workspace
-  keyring, and local workspace labels
+  keyring, local workspace labels, pinned controls, and the last successfully
+  synchronized DuckDB archive ID/generation
 - `state.db`: content-free receipts, cursors, heads, exact sequence metadata,
   sharing policy, and working-file manifests
 - `outbox/`: unacknowledged encrypted envelopes; removed after acknowledgement
