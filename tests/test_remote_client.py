@@ -5,13 +5,14 @@ import duckdb
 import pytest
 import ai_convos_memory as memory_module
 import ai_convos_remote as remote_client
+import ai_convos_remote.projection as projection_module
 from cryptography.exceptions import InvalidSignature
 from ai_convos.cli import ARCHIVE_COLUMNS, archive_state, capture_provenance, init_schema, project_archive_row
 from ai_convos_remote import (_upload_batches, add_member, approve_device, approve_history, connect, control_body, create, doctor_status, fetch_lazy, grant_all, grant_selected, key, load, pull, publish, refresh, remove_device,
                               request_device, request_history, setup_client, sync_once, upload, workspace)
 from ai_convos_remote.control import sign as control_sign, vote as device_vote
 from ai_convos_remote.projection import inspect_state, scan
-from ai_convos_remote.protocol import certificate, event, identity, seal_history, seal_key, sign_control, unb64
+from ai_convos_remote.protocol import certificate, event, identity, seal_event, seal_history, seal_key, sign_control, unb64
 from ai_convos_remote_server import action, connect as server_connect
 
 
@@ -25,6 +26,8 @@ def conversation(title="shared",id="c"):
     return {"kind":"conversation.record","entity":f"conversations:{id}","payload":{"table":"conversations","columns":cols,"row":[id,"codex",title,"2026-01-01","2026-01-01",None,None,None,None,"{}"]}}
 def write_archive(path,title):
     path.parent.mkdir(parents=True,exist_ok=True); db=duckdb.connect(str(path)); init_schema(db); db.execute("BEGIN"); project_archive_row(db,"conversations",ARCHIVE_COLUMNS["conversations"],["c","codex",title,"2026-01-01","2026-01-01",None,None,None,None,"{}"]); db.execute("COMMIT"); info=archive_state(db); db.close(); return info
+def inject(cfg,state,server,ws,kind,payload_v=1):
+    seq=int((state.execute("SELECT value FROM meta WHERE key=?",(f"seq:{ws}",)).fetchone() or ["0"])[0])+1; prev=(state.execute("SELECT value FROM meta WHERE key=?",(f"prev:{ws}",)).fetchone() or [None])[0]; value=event(cfg["device"],seq,kind,f"{kind}:1",{"new_field":[1,2,3]},[prev] if prev else (),payload_v=payload_v); action(server,{"op":"upload_many","envelopes":[seal_event(value,ws,cfg["workspaces"][ws]["epoch"],key(cfg,ws,cfg["workspaces"][ws]["epoch"]))]},cfg["token"]); return value
 
 def test_upload_batches_bound_count_and_wire_size():
     row=lambda size:{"size":size}
@@ -163,10 +166,17 @@ def test_team_default_selected_complete_history_and_removal(tmp_path,monkeypatch
     add_member(alice,team,"bob",True,root=a); bob=load(b); pull(bob,sb,b); assert team not in {w["id"] for w in load(b)["server_state"]["workspaces"]} and f"{team}:3" not in load(b)["keys"]
 
 
-def test_unknown_events_survive_client_projection(tmp_path,monkeypatch):
-    server=server_connect(tmp_path/"server.db"); monkeypatch.setattr("ai_convos_remote.request",transport(server)); a=tmp_path/"a"; cfg,_=setup_client("http://server","alice",root=a); ws=workspace(cfg,"Personal"); state=connect(a/"remote/state.db")
-    eid=publish(cfg,state,ws,{"kind":"future.opaque","entity":"future:1","payload":{"new_field":[1,2,3]}},a); upload(cfg,state,a)
-    assert tuple(state.execute("SELECT kind,entity FROM receipts WHERE event=?",(eid,)).fetchone())==("future.opaque","future:1") and b"new_field" not in (a/"remote/state.db").read_bytes() and action(server,{"op":"fetch","workspace":ws,"event":eid},cfg["token"])["envelope"]["event"]==eid
+def test_unknown_required_event_blocks_ready_without_storing_content(tmp_path,monkeypatch):
+    server=server_connect(tmp_path/"server.db"); monkeypatch.setattr("ai_convos_remote.request",transport(server)); a,b=tmp_path/"a",tmp_path/"b"; alice,recovery=setup_client("http://server","alice","laptop",root=a); desktop,_=setup_client("http://server","alice","desktop",recovery,root=b); ws=workspace(desktop,"Personal"); source=connect(b/"remote/state.db"); value=inject(desktop,source,server,ws,"future.opaque")
+    target=connect(a/"remote/state.db")
+    with pytest.raises(ValueError,match="required event is unsupported"): pull(load(a),target,a)
+    assert tuple(target.execute("SELECT kind,payload_v,required FROM deferred_events WHERE event=?",(value["id"],)).fetchone())==("future.opaque",1,1) and target.execute("SELECT lifecycle FROM sync_states WHERE workspace=?",(ws,)).fetchone()[0]=="blocked" and b"new_field" not in (a/"remote/state.db").read_bytes() and action(server,{"op":"fetch","workspace":ws,"event":value["id"]},desktop["token"])["envelope"]["event"]==value["id"]
+    bridge={"events":{("future.opaque",1)},"project":lambda root,state,event,workspace,device:True}; monkeypatch.setattr(projection_module,"bridges",lambda:[bridge]); result=pull(load(a),target,a); assert result[ws]["cursor"]==result[ws]["tail"] and not target.execute("SELECT 1 FROM deferred_events").fetchone() and target.execute("SELECT lifecycle FROM sync_states WHERE workspace=?",(ws,)).fetchone()[0]=="ready"
+
+
+def test_uninstalled_auxiliary_event_defers_without_blocking_core(tmp_path,monkeypatch):
+    server=server_connect(tmp_path/"server.db"); monkeypatch.setattr("ai_convos_remote.request",transport(server)); a,b=tmp_path/"a",tmp_path/"b"; alice,recovery=setup_client("http://server","alice","laptop",root=a); desktop,_=setup_client("http://server","alice","desktop",recovery,root=b); ws=workspace(desktop,"Personal"); value=inject(desktop,connect(b/"remote/state.db"),server,ws,"memory.canonical"); monkeypatch.setattr(projection_module,"bridges",lambda:[])
+    target=connect(a/"remote/state.db"); result=pull(load(a),target,a); assert result[ws]["cursor"]==result[ws]["tail"] and tuple(target.execute("SELECT kind,payload_v,required FROM deferred_events WHERE event=?",(value["id"],)).fetchone())==("memory.canonical",1,0) and target.execute("SELECT lifecycle FROM sync_states WHERE workspace=?",(ws,)).fetchone()[0]=="ready"
 
 
 def test_large_record_is_fetched_during_convergent_pull(tmp_path,monkeypatch):

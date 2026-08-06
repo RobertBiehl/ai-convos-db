@@ -392,7 +392,7 @@ def remote_purges(root,state,workspace,kind):
     for event,cursor,entity,status,author,current in state.execute("SELECT r.event,r.cursor,r.entity,r.status,r.author,h.event IS NOT NULL FROM receipts r LEFT JOIN publication_heads h ON h.workspace=r.workspace AND h.event=r.event WHERE r.workspace=? AND r.kind='memory.canonical' ORDER BY r.seq",(workspace,)):
         group=groups.setdefault(entity.rsplit(":part:",1)[0],dict(active=[])); current and group.update(latest=(status,cursor,author)); status=="active" and group["active"].append((event,author))
     return [event for group in groups.values() if group.get("latest",(None,))[0]=="deleted" for event,author in group["active"] if author==group["latest"][2]]
-def remote_bridge(): return dict(v=2,records=remote_records,project=remote_project,purges=remote_purges)
+def remote_bridge(): return dict(v=3,events={("memory.canonical",1)},records=remote_records,project=remote_project,purges=remote_purges)
 def _skill_source():
     rel = Path("skills")/"agent-convos"/"SKILL.md"; root = Path(os.environ.get("CONVOS_PROJECT_ROOT", Path.home()/".convos")).expanduser()
     roots = (root, Path(__file__).resolve().parents[4], Path(sysconfig.get_paths().get("data", ""))/"share"/"ai-convos-db", Path(site.getuserbase())/"share"/"ai-convos-db")
