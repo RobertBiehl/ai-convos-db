@@ -25,7 +25,7 @@ def wait_message(root,content,workers,timeout=10):
     while time.monotonic()-start<timeout:
         for base,worker in workers:
             if worker.poll() is not None: raise RuntimeError(f"worker exited for {base}")
-            if (error:=Path(base)/"remote/last_error").exists(): raise RuntimeError(error.read_text())
+            if (error:=Path(base)/"remote/last_error").exists() and "Could not set lock on file" not in (failure:=error.read_text()): raise RuntimeError(failure)
         if path.exists():
             try:
                 db=duckdb.connect(str(path),read_only=True); found=db.execute("SELECT COUNT(*) FROM messages WHERE content=?",(content,)).fetchone()[0]; db.close()

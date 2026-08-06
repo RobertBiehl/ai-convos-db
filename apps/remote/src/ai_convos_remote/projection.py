@@ -10,7 +10,7 @@ from ai_convos.cli import ARCHIVE_COLUMNS as COLUMNS, PROVENANCE_KINDS as PROVEN
 from ai_convos_changegraph.provenance import query as graph_query
 from .protocol import digest
 
-STATE_VERSION="5"
+STATE_VERSION="6"
 STATE = """
 CREATE TABLE IF NOT EXISTS outbox(workspace TEXT,event TEXT,entity TEXT,revision TEXT,author TEXT,seq INT,epoch INT,kind TEXT,status TEXT,path TEXT,size INT,PRIMARY KEY(workspace,event)) WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS receipts(workspace TEXT,event TEXT,cursor INT,author TEXT,seq INT,epoch INT,kind TEXT,entity TEXT,revision TEXT,status TEXT,PRIMARY KEY(workspace,event)) WITHOUT ROWID;
@@ -21,6 +21,7 @@ CREATE TABLE IF NOT EXISTS publication_heads(workspace TEXT,owner TEXT,entity TE
 CREATE TABLE IF NOT EXISTS cursors(workspace TEXT PRIMARY KEY,cursor INT) WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS heads(workspace TEXT,author_user TEXT,entity TEXT,sort_key TEXT,event TEXT,PRIMARY KEY(workspace,author_user,entity)) WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS lazy_events(workspace TEXT,event TEXT,cursor INT,size INT,PRIMARY KEY(workspace,event)) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS deferred_events(workspace TEXT,event TEXT,cursor INT,kind TEXT,payload_v INT,required INT,PRIMARY KEY(workspace,event)) WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS event_sequences(workspace TEXT,author TEXT,seq INT,event TEXT,PRIMARY KEY(workspace,author,seq)) WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS sequence_gaps(workspace TEXT,author TEXT,seq INT,parents TEXT,PRIMARY KEY(workspace,author,seq)) WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS attachment_parts(workspace TEXT,author TEXT,blob TEXT,idx INT,total INT,attachment TEXT,sha256 TEXT,size INT,chunk_hash TEXT,path TEXT,PRIMARY KEY(workspace,author,blob,idx)) WITHOUT ROWID;
@@ -30,9 +31,10 @@ CREATE TABLE IF NOT EXISTS sharing_boundaries(id TEXT PRIMARY KEY,workspace TEXT
 CREATE TABLE IF NOT EXISTS sync_states(workspace TEXT PRIMARY KEY,lifecycle TEXT NOT NULL,tail INT NOT NULL DEFAULT 0,floor INT NOT NULL DEFAULT 0,error TEXT) WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY,value TEXT) WITHOUT ROWID;
 """
-STATE_TABLES={"outbox","receipts","history_sources","history_queue","publication_heads","cursors","heads","lazy_events","event_sequences","sequence_gaps","attachment_parts","attachment_blobs","policies","sharing_boundaries","sync_states","meta"}
+STATE_TABLES={"outbox","receipts","history_sources","history_queue","publication_heads","cursors","heads","lazy_events","deferred_events","event_sequences","sequence_gaps","attachment_parts","attachment_blobs","policies","sharing_boundaries","sync_states","meta"}
 STATE_FORBIDDEN={"published","event_log","history_material","history_outbox","attachment_chunks","imported_rows","raw_events","repositories","files","file_versions","changesets","edits","checkpoints","assertions","gaps","boundaries"}
 TABLES={"conversation.record":"conversations","message.record":"messages","tool.record":"tool_calls","attachment.record":"attachments","artifact.record":"artifacts","file_edit.record":"file_edits"}
+CORE_EVENTS={(kind,1) for kind in set(TABLES)|PROVENANCE|{"workspace.policy","workspace.membership","workspace.device","turn.boundary","attachment.chunk","history.republish"}}; AUXILIARY_EVENTS={"memory.canonical"}
 FKS={"messages":(("conversation_id","conversations"),("parent_id","messages")),"tool_calls":(("message_id","messages"),),"attachments":(("message_id","messages"),),"artifacts":(("conversation_id","conversations"),),"file_edits":(("message_id","messages"),)}
 
 def _connect(path,journal="WAL"):
@@ -89,8 +91,13 @@ def connect(path):
 @lru_cache(maxsize=1)
 def bridges():
     result=[entry.load()() for entry in entry_points(group="convos.remote")]
-    if any(set(b)!={"v","records","project","purges"} or b["v"]!=2 or isinstance(b["v"],bool) or any(not callable(b[k]) for k in ("records","project","purges")) for b in result): raise ValueError("Unsupported remote bridge")
+    if any(set(b)!={"v","events","records","project","purges"} or b["v"]!=3 or isinstance(b["v"],bool) or any(not callable(b[k]) for k in ("records","project","purges")) or any(not isinstance(e,tuple) or len(e)!=2 or not isinstance(e[0],str) or not isinstance(e[1],int) or isinstance(e[1],bool) or e[1]<1 for e in b["events"]) for b in result): raise ValueError("Unsupported remote bridge")
     return result
+def event_support(value):
+    kind,version=value["kind"],value["payload_v"]
+    if not isinstance(kind,str) or not isinstance(version,int) or isinstance(version,bool) or version<1: raise ValueError("invalid event schema")
+    installed={event for bridge in bridges() for event in bridge["events"]}
+    return "supported" if (kind,version) in CORE_EVENTS or (kind,version) in installed else "optional" if kind in AUXILIARY_EVENTS and not any(event[0]==kind for event in installed) else "required"
 def bridge_records(root,state,workspace,kind): return [record for bridge in bridges() for record in bridge["records"](root,state,workspace,kind)]
 def bridge_purges(root,state,workspace,kind): return sorted({event for bridge in bridges() for event in bridge["purges"](root,state,workspace,kind)})
 def clean(v):
@@ -165,10 +172,11 @@ def sequence(state,workspace,value):
     if after: state.execute("DELETE FROM sequence_gaps WHERE workspace=? AND author=? AND seq=?",(workspace,value["author"],value["seq"]+1))
     return True
 def reset_history(state,workspace,boundary):
-    [state.execute(f"DELETE FROM {table} WHERE workspace=?",(workspace,)) for table in ("receipts","history_sources","cursors","heads","lazy_events","event_sequences","sequence_gaps","sharing_boundaries")]; [state.execute("INSERT INTO event_sequences VALUES (?,?,?,?)",(workspace,author,head["seq"],head["event"])) for author,head in boundary["heads"].items()]
+    [state.execute(f"DELETE FROM {table} WHERE workspace=?",(workspace,)) for table in ("receipts","history_sources","cursors","heads","lazy_events","deferred_events","event_sequences","sequence_gaps","sharing_boundaries")]; [state.execute("INSERT INTO event_sequences VALUES (?,?,?,?)",(workspace,author,head["seq"],head["event"])) for author,head in boundary["heads"].items()]
 def verify_history(state,workspace,controls,start):
     gaps=state.execute("SELECT author,seq FROM sequence_gaps WHERE workspace=? ORDER BY author,seq LIMIT 1",(workspace,)).fetchone()
     if gaps: raise ValueError(f"required event sequence is incomplete at {gaps[0]}:{gaps[1]}")
+    if deferred:=state.execute("SELECT kind,payload_v FROM deferred_events WHERE workspace=? AND required=1 ORDER BY cursor LIMIT 1",(workspace,)).fetchone(): raise ValueError(f"required event is unsupported: {deferred[0]} payload_v={deferred[1]}")
     for control in controls:
         if control["boundary"]["epoch"]>=start:
             for author,head in control["boundary"]["heads"].items():
@@ -198,6 +206,7 @@ def apply_record(db_path,state,value,workspace,local_device=None,db=None,authors
     if own: state.commit()
     return True
 def project(db_path,state,value,workspace,local_device=None,db=None,root=None,batch=False,authors=None,recover=None,local_user=None):
+    if event_support(value)!="supported": return False
     if value["kind"] in TABLES: return apply_record(db_path,state,value,workspace,local_device,db,authors,recover,local_user)
     if value["kind"]=="workspace.policy":
         p=value["payload"]; state.execute("INSERT OR REPLACE INTO policies VALUES (?,?,?,COALESCE((SELECT local_root FROM policies WHERE workspace=? AND kind=? AND value=?),NULL))",(workspace,p["kind"],p["value"],workspace,p["kind"],p["value"])); batch or state.commit(); return True

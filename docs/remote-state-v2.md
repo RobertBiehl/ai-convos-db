@@ -177,7 +177,8 @@ An absent, incompatible, or incomplete state with configured workspaces enters
    sequences, and cursors while projecting archive rows and their canonical
    DuckDB origins.
 6. Verifies that the advertised accessible tail was reached, every applicable
-   signed author checkpoint is present, and no required sequence gap remains.
+   signed author checkpoint is present, and no required sequence gap or
+   unsupported required event remains.
 7. Commits `READY`.
 
 An unavailable relay, missing key, sequence conflict, or incomplete retained
@@ -251,8 +252,13 @@ Outgoing plaintext is never written to `state.db`. Epoch rotation reopens a
 pending envelope in memory and reseals it.
 
 Incoming plaintext exists in memory only until DuckDB projection commits.
-Unknown but potentially supported future events leave a content-free deferred
-manifest and remain fetchable from the relay.
+Dispatch is exact on `(kind, payload_v)`. Unknown families and unsupported core
+versions are required by default and block publication; only receiver-known,
+archive-isolated auxiliary families whose product is not installed may defer
+without blocking core readiness. An installed but outdated product blocks its
+workspace from publishing. Both leave a content-free manifest and remain
+fetchable from the relay. When a handler becomes available, Remote replays from
+the signed history boundary.
 
 Selected-history grants fetch exact envelopes from the relay, decrypt and
 verify them in memory, reseal them for authorized devices, upload, and discard
@@ -319,7 +325,7 @@ idempotent schema initializer, which adds provenance, origins, and
 tables. This is the frictionless user-data migration path and is covered by a
 preservation test.
 
-Remote state schema 5 has no compatibility transform in this pre-stability
+Remote state schema 6 has no compatibility transform in this pre-stability
 release.
 Inspection and doctor are side-effect-free. An absent state is initialized as
 empty metadata. A mutating sync handles an incompatible or damaged regular
@@ -352,9 +358,9 @@ old workers are stopped.
 at its advertised tail with no required deferred event. It emits exact counts,
 not guessed percentages or time estimates.
 
-`convos remote doctor` reports lifecycle, pending and lazy counts, last
-successful sync, and any retained cutover backup. For an old state it reports
-the pending backup/rebaseline without opening it for writes.
+`convos remote doctor` reports lifecycle, pending, lazy, deferred, and required
+deferred counts, last successful sync, and any retained cutover backup. For an
+old state it reports the pending backup/rebaseline without opening it for writes.
 A normal user never runs SQL, manually reseeds imported rows, fetches lazy
 events, or vacuums SQLite.
 

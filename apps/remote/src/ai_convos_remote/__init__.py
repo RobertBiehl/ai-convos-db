@@ -9,7 +9,7 @@ _pending=[]
 def register(app): _pending.append(app) if "remote" not in globals() else app.add_typer(remote,name="remote")
 from ai_convos.cli import PROJECT_ROOT, archive_state as core_archive_state, drain_hooks, init_schema, install_hooks, repository
 from .control import approved, electorate, proposal as device_proposal, record as control_record, sign as control_sign, state_hash, verify_proposal, verify_state, vote as device_vote
-from .projection import bridge_purges, bridge_records, connect, cutover_state, inspect_state, project, project_many, query as graph_query, read_state, reset_history, scan, sequence, verify_history
+from .projection import bridge_purges, bridge_records, connect, cutover_state, event_support, inspect_state, project, project_many, query as graph_query, read_state, reset_history, scan, sequence, verify_history
 from .protocol import (b64, certificate, digest, event, identity, material_event, open_event, open_key, public, public_id, recover,
                        recovery_bundle, seal_event, seal_history, seal_key, sign_control, signer, unb64, verify_certificate)
 from .service import edit_hooks, enable
@@ -144,10 +144,12 @@ def rotate(cfg,ws,members,devices,deactivate=(),root=None):
     control=control_body(cfg,previous,new,action,meta,records,removed,approval,boundary); envs={d:seal_key(new,r["device"]["box_public"],f"workspace:{ws}:epoch:{epoch}") for d,r in records.items()}; request(cfg,sign_control(cfg["device"],{"op":"rotate","workspace":ws,"control":control,"envelopes":envs})); cfg["keys"][f"{ws}:{epoch}"]=b64(new); cfg["workspaces"][ws]["epoch"]=epoch; cfg["controls"][ws]=control; update_recovery(cfg,root); cfg["device"]["id"] in records and membership_event(cfg,ws,epoch,members,root); return epoch
 def publish(cfg,state,ws,record,root=None,defer=False,heads=None):
     if cfg["workspaces"][ws]["kind"]=="team" and (record:=protect_record(record,root,ws)) is None: return None
+    payload_v=record.get("payload_v",1)
+    if event_support({"kind":record["kind"],"payload_v":payload_v})!="supported": raise ValueError(f"unsupported event schema: {record['kind']} payload_v={payload_v}")
     revision=digest(record["payload"]); old=heads.get(record["entity"]) if heads is not None else state.execute("SELECT revision,event FROM publication_heads WHERE workspace=? AND owner=? AND entity=?",(ws,cfg["user"],record["entity"])).fetchone()
     if heads is not None and old==revision: return None
     if heads is None and old and old["revision"]==revision: return old["event"]
-    seq=int((state.execute("SELECT value FROM meta WHERE key=?",(f"seq:{ws}",)).fetchone() or ["0"])[0])+1; prev=(state.execute("SELECT value FROM meta WHERE key=?",(f"prev:{ws}",)).fetchone() or [None])[0]; value=event(cfg["device"],seq,record["kind"],record["entity"],record["payload"],[prev] if prev else (),record.get("observed_at")); epoch=cfg["workspaces"][ws]["epoch"]; env=seal_event(value,ws,epoch,key(cfg,ws,epoch)); path,size=encrypted_file(root,value["id"],env); status=record["payload"].get("status") if isinstance(record["payload"],dict) and record["payload"].get("status") in ("active","deleted") else None
+    seq=int((state.execute("SELECT value FROM meta WHERE key=?",(f"seq:{ws}",)).fetchone() or ["0"])[0])+1; prev=(state.execute("SELECT value FROM meta WHERE key=?",(f"prev:{ws}",)).fetchone() or [None])[0]; value=event(cfg["device"],seq,record["kind"],record["entity"],record["payload"],[prev] if prev else (),record.get("observed_at"),payload_v); epoch=cfg["workspaces"][ws]["epoch"]; env=seal_event(value,ws,epoch,key(cfg,ws,epoch)); path,size=encrypted_file(root,value["id"],env); status=record["payload"].get("status") if isinstance(record["payload"],dict) and record["payload"].get("status") in ("active","deleted") else None
     state.execute("INSERT INTO outbox VALUES (?,?,?,?,?,?,?,?,?,?,?)",(ws,value["id"],record["entity"],revision,value["author"],seq,epoch,record["kind"],status,str(path),size)); state.execute("INSERT OR REPLACE INTO publication_heads VALUES (?,?,?,?,?)",(ws,cfg["user"],record["entity"],revision,value["id"])); state.execute("INSERT OR REPLACE INTO meta VALUES (?,?),(?,?)",(f"seq:{ws}",str(seq),f"prev:{ws}",value["id"])); sequence(state,ws,value)
     if not defer: state.commit()
     if heads is not None: heads[record["entity"]]=revision
@@ -199,7 +201,8 @@ def pull(cfg,state,root=None):
         sid=ws["id"]; current=state.execute("SELECT lifecycle FROM sync_states WHERE workspace=?",(sid,)).fetchone(); lifecycle=current[0] if current else "rebaselining"; state.execute("INSERT OR REPLACE INTO sync_states VALUES (?,?,COALESCE((SELECT tail FROM sync_states WHERE workspace=?),0),COALESCE((SELECT floor FROM sync_states WHERE workspace=?),0),NULL)",(sid,lifecycle,sid,sid)); state.commit()
         records={r["device"]["id"]:r for control in ws["controls"] for r in control["devices"].values()}; devices={device:r["device"] for device,r in records.items()}; authors={device:r["user"] for device,r in records.items()}
         after=(state.execute("SELECT cursor FROM cursors WHERE workspace=?",(sid,)).fetchone() or [0])[0]; seen=(state.execute("SELECT value FROM meta WHERE key=?",(f"history_from:{sid}",)).fetchone() or [str(ws["history_from"])])[0]; earliest=min([k["epoch"] for k in ws["keys"]],default=ws["epoch"]); old_key=int((state.execute("SELECT value FROM meta WHERE key=?",(f"key_from:{sid}",)).fetchone() or [earliest])[0]); start=access_from(cfg,sid); candidates=[control["boundary"] for control in ws["controls"] if control["boundary"]["epoch"]==start]; boundary=candidates[0] if candidates and all(value==candidates[0] for value in candidates) else (_ for _ in ()).throw(ValueError("signed history boundary is ambiguous")); proof=digest(boundary); old_proof=(state.execute("SELECT value FROM meta WHERE key=?",(f"boundary:{sid}",)).fetchone() or [None])[0]; mode=(state.execute("SELECT value FROM meta WHERE key=?",(f"archive_mode:{sid}",)).fetchone() or [None])[0]; recover=mode if mode=="adopt" or ws["kind"]=="personal" and mode in ("native","import") else None
-        if not current or ws["history_from"]<int(seen) or earliest<old_key or proof!=old_proof: after=0; reset_history(state,sid,boundary); state.execute("INSERT OR REPLACE INTO meta VALUES (?,?)",(f"boundary:{sid}",proof)); state.commit()
+        deferred=state.execute("SELECT kind,payload_v,required FROM deferred_events WHERE workspace=?",(sid,)).fetchall(); reclassify=any(event_support(r)!=("required" if r["required"] else "optional") for r in deferred)
+        if not current or ws["history_from"]<int(seen) or earliest<old_key or proof!=old_proof or reclassify: after=0; reset_history(state,sid,boundary); state.execute("INSERT OR REPLACE INTO meta VALUES (?,?)",(f"boundary:{sid}",proof)); state.commit()
         try:
             total=0
             while True:
@@ -208,18 +211,22 @@ def pull(cfg,state,root=None):
                 incoming=[]
                 for item in result["events"]:
                     if item.get("tombstone"):
-                        sequence(state,sid,{"id":item["event"],"author":item["author"],"seq":item["seq"],"parents":item["parents"]}); state.execute("DELETE FROM receipts WHERE workspace=? AND event=?",(sid,item["event"])); state.execute("DELETE FROM publication_heads WHERE workspace=? AND event=?",(sid,item["event"])); state.execute("DELETE FROM history_sources WHERE workspace=? AND (event=? OR carrier=?)",(sid,item["event"],item["event"])); state.execute("DELETE FROM lazy_events WHERE workspace=? AND event=?",(sid,item["event"]))
+                        sequence(state,sid,{"id":item["event"],"author":item["author"],"seq":item["seq"],"parents":item["parents"]}); state.execute("DELETE FROM receipts WHERE workspace=? AND event=?",(sid,item["event"])); state.execute("DELETE FROM publication_heads WHERE workspace=? AND event=?",(sid,item["event"])); state.execute("DELETE FROM history_sources WHERE workspace=? AND (event=? OR carrier=?)",(sid,item["event"],item["event"])); state.execute("DELETE FROM lazy_events WHERE workspace=? AND event=?",(sid,item["event"])); state.execute("DELETE FROM deferred_events WHERE workspace=? AND event=?",(sid,item["event"]))
                         if item["author"]==cfg["device"]["id"] and item["seq"]>=int((state.execute("SELECT value FROM meta WHERE key=?",(f"seq:{sid}",)).fetchone() or ["0"])[0]): state.execute("INSERT OR REPLACE INTO meta VALUES (?,?),(?,?)",(f"seq:{sid}",str(item["seq"]),f"prev:{sid}",item["event"]))
                         after=max(after,item["cursor"]); continue
                     env=request(cfg,{"op":"fetch","workspace":sid,"event":item["event"]})["envelope"] if item.get("lazy") else item["envelope"]
                     if (env["workspace"],env["event"])!=(sid,item.get("event",env["event"])) or not access_from(cfg,sid)<=env["epoch"]<=cfg["controls"][sid]["epoch"]: raise ValueError("event envelope response mismatch")
-                    value=open_event(env,key(cfg,sid,env["epoch"]),signer(devices,env["author"])); material=material_event(value,devices,cfg["device"]); sequence(state,sid,value); receipt(state,sid,value,item["cursor"],env["epoch"])
+                    value=open_event(env,key(cfg,sid,env["epoch"]),signer(devices,env["author"])); support=event_support(value); material=material_event(value,devices,cfg["device"]) if support=="supported" else None; sequence(state,sid,value); receipt(state,sid,value,item["cursor"],env["epoch"])
                     if authors[value["author"]]==cfg["user"]:
                         state.execute("INSERT OR REPLACE INTO publication_heads VALUES (?,?,?,?,?)",(sid,cfg["user"],value["entity"],value["revision"],value["id"]))
                     if value["author"]==cfg["device"]["id"]:
                         if value["seq"]>=int((state.execute("SELECT value FROM meta WHERE key=?",(f"seq:{sid}",)).fetchone() or ["0"])[0]): state.execute("INSERT OR REPLACE INTO meta VALUES (?,?),(?,?)",(f"seq:{sid}",str(value["seq"]),f"prev:{sid}",value["id"]))
                     if material and material["id"]!=value["id"]: state.execute("INSERT OR REPLACE INTO history_sources VALUES (?,?,?)",(sid,material["id"],value["id"]))
-                    if material: incoming.append((sid,material))
+                    if support!="supported": state.execute("INSERT OR REPLACE INTO deferred_events VALUES (?,?,?,?,?,?)",(sid,value["id"],item["cursor"],value["kind"],value["payload_v"],support=="required"))
+                    elif material:
+                        support=event_support(material)
+                        if support=="supported": incoming.append((sid,material))
+                        else: state.execute("INSERT OR REPLACE INTO deferred_events VALUES (?,?,?,?,?,?)",(sid,material["id"],item["cursor"],material["kind"],material["payload_v"],support=="required"))
                     after=max(after,item["cursor"])
                 project_many(core_path(root),state,incoming,cfg["device"]["id"],root,False,authors,recover,cfg["user"]); total+=len(result["events"]); state.execute("INSERT OR REPLACE INTO cursors VALUES (?,?)",(sid,after)); state.execute("INSERT OR REPLACE INTO meta VALUES (?,?),(?,?)",(f"history_from:{sid}",str(ws["history_from"]),f"key_from:{sid}",str(earliest))); state.commit()
                 if after>=tail: break
@@ -237,7 +244,7 @@ def fetch_lazy(cfg,state,event_id=None,root=None):
         records={r["device"]["id"]:r for control in controls[ws] for r in control["devices"].values()}; devices={device:r["device"] for device,r in records.items()}; authors={device:r["user"] for device,r in records.items()}
         env=request(cfg,{"op":"fetch","workspace":ws,"event":eid})["envelope"]
         if (env["workspace"],env["event"])!=(ws,eid) or not access_from(cfg,ws)<=env["epoch"]<=cfg["controls"][ws]["epoch"]: raise ValueError("lazy event response mismatch")
-        value=open_event(env,key(cfg,ws,env["epoch"]),signer(devices,env["author"])); material=material_event(value,devices,cfg["device"]); sequence(state,ws,value); receipt(state,ws,value,cursor,env["epoch"]); material and material["id"]!=value["id"] and state.execute("INSERT OR REPLACE INTO history_sources VALUES (?,?,?)",(ws,material["id"],value["id"])); material and project(core_path(root),state,material,ws,cfg["device"]["id"],root=root,batch=True,authors=authors); state.execute("DELETE FROM lazy_events WHERE event=?",(eid,))
+        value=open_event(env,key(cfg,ws,env["epoch"]),signer(devices,env["author"])); support=event_support(value); material=material_event(value,devices,cfg["device"]) if support=="supported" else None; inner=event_support(material) if material else None; sequence(state,ws,value); receipt(state,ws,value,cursor,env["epoch"]); material and material["id"]!=value["id"] and state.execute("INSERT OR REPLACE INTO history_sources VALUES (?,?,?)",(ws,material["id"],value["id"])); material and inner=="supported" and project(core_path(root),state,material,ws,cfg["device"]["id"],root=root,batch=True,authors=authors); deferred=value if support!="supported" else material if material and inner!="supported" else None; deferred and state.execute("INSERT OR REPLACE INTO deferred_events VALUES (?,?,?,?,?,?)",(ws,deferred["id"],cursor,deferred["kind"],deferred["payload_v"],event_support(deferred)=="required")); state.execute("DELETE FROM lazy_events WHERE event=?",(eid,))
     state.commit(); return len(rows)
 def sync_once(root=None,force=False):
     root=local_root(root)
@@ -383,9 +390,9 @@ def doctor_status():
         except Exception: online="error"
         if info["status"]!="current": return f"remote: {online}, state={info['status']}, schema={info['version'] or 'unknown'}, next_sync={'backup+rebaseline' if info['status'] in ('incompatible','invalid') else 'initialize'}"
         state=read_state(paths()[2])
-        try: pending=state.execute("SELECT COUNT(*) FROM outbox").fetchone()[0]; lazy=state.execute("SELECT COUNT(*) FROM lazy_events").fetchone()[0]; lifecycle=",".join(f"{r[0][:8]}:{r[1]}" for r in state.execute("SELECT workspace,lifecycle FROM sync_states ORDER BY workspace").fetchall()) or "uninitialized"; last=(state.execute("SELECT value FROM meta WHERE key='last_sync'").fetchone() or ["never"])[0]; backup=(state.execute("SELECT value FROM meta WHERE key='state_cutover'").fetchone() or [None])[0]
+        try: pending=state.execute("SELECT COUNT(*) FROM outbox").fetchone()[0]; lazy=state.execute("SELECT COUNT(*) FROM lazy_events").fetchone()[0]; deferred,required=state.execute("SELECT COUNT(*),COALESCE(SUM(required),0) FROM deferred_events").fetchone(); lifecycle=",".join(f"{r[0][:8]}:{r[1]}" for r in state.execute("SELECT workspace,lifecycle FROM sync_states ORDER BY workspace").fetchall()) or "uninitialized"; last=(state.execute("SELECT value FROM meta WHERE key='last_sync'").fetchone() or ["never"])[0]; backup=(state.execute("SELECT value FROM meta WHERE key='state_cutover'").fetchone() or [None])[0]
         finally: state.close()
-        return f"remote: {online}, user={cfg['user'][:8]}, device={cfg['device']['id'][:8]}, workspaces={len(cfg['workspaces'])}, epochs={len(cfg['keys'])}, lifecycle={lifecycle}, pending={pending}, lazy={lazy}, last={last}"+(f", backup={json.loads(backup)['backup']}" if backup else "")
+        return f"remote: {online}, user={cfg['user'][:8]}, device={cfg['device']['id'][:8]}, workspaces={len(cfg['workspaces'])}, epochs={len(cfg['keys'])}, lifecycle={lifecycle}, pending={pending}, lazy={lazy}, deferred={deferred}, required={required}, last={last}"+(f", backup={json.loads(backup)['backup']}" if backup else "")
     except Exception as e: return f"remote: unavailable ({e})"
 @remote.command("doctor")
 def doctor_cmd(): typer.echo(doctor_status())
