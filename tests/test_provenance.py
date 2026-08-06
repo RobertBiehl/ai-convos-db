@@ -1,4 +1,4 @@
-import json, subprocess
+import json, subprocess, sys
 
 import duckdb
 import pytest
@@ -21,7 +21,7 @@ def graph(path):
 
 def test_path_independent_repo_cross_repo_changeset_and_canonical_schema(tmp_path):
     a,b=repo(tmp_path/"a",content="new a\n"),repo(tmp_path/"b",content="new b\n"); clone=tmp_path/"clone"; subprocess.run(("git","clone","-q",str(a),str(clone)),check=True); assert repository(a)["id"]==repository(clone)["id"]
-    db=core(tmp_path/"core.db",a,[(a/"x.py","write","new a\n",None),(b/"x.py","write","new b\n",None)]); records=capture(db); wire=json.dumps(records); assert str(a) not in wire and str(b) not in wire and not any(r["kind"]=="changeset.observed" for r in records)
+    path=tmp_path/"core.db"; db=core(path,a,[(a/"x.py","write","new a\n",None),(b/"x.py","write","new b\n",None)]); db.close(); records=capture(path); db=duckdb.connect(str(path)); wire=json.dumps(records); assert str(a) not in wire and str(b) not in wire and not any(r["kind"]=="changeset.observed" for r in records)
     assert len({r["payload"]["id"] for r in records if r["kind"]=="repository.observed"})==2 and {r["payload"]["id"] for r in records if r["kind"]=="edit.observed"}=={"e0","e1"}
     row=query(db,"conversation_changes","c")[0]; assert row["repositories"]==2 and row["files"]==2 and row["prompt"]=="make the cross-repo change" and row["changeset_id"]=="m"
     assert len(query(db,"changeset_files","m"))==2 and query(db,"current_activity",str(a))[0]["repository"]==repository(a)["id"]
@@ -41,18 +41,19 @@ def test_archive_generation_is_transactional_and_counts_only_owned_rows(tmp_path
 
 def test_git_checkpoint_exact_commit_link_and_unobserved_gap(tmp_path):
     root=repo(tmp_path/"repo",content="old\n"); (root/"x.py").write_text("new\n"); git(root,"add","x.py"); git(root,"commit","-qm","agent edit"); (root/"manual.py").write_text("outside capture\n")
-    db=core(tmp_path/"core.db",root,[(root/"x.py","write","new\n",None)]); capture(db)
+    path=tmp_path/"core.db"; db=core(path,root,[(root/"x.py","write","new\n",None)]); db.close(); capture(path); db=duckdb.connect(str(path))
     assert query(db,"capture_gaps")[0]["path"]=="manual.py" and query(db,"commit_conversations",git(root,"rev-parse","HEAD"))[0]["conversation"]=="c"
     assert query(db,"file_history","x.py")[0]["evidence"]=="captured_exact" and query(db,"file_history","x.py")[0]["prompt"]=="make the cross-repo change"
 
 
 def test_provenance_failure_rolls_back_only_enrichment(tmp_path,monkeypatch):
-    root=repo(tmp_path/"repo"); db=core(tmp_path/"core.db",root,[(root/"x.py","write","one\n",None)]); write=core_module.project_provenance; generation=archive_state(db)[1]
+    root=repo(tmp_path/"repo"); path=tmp_path/"core.db"; db=core(path,root,[(root/"x.py","write","one\n",None)]); write=core_module.project_provenance; generation=archive_state(db)[1]; db.close()
     def fail(conn,value,*args):
         if value["kind"]=="file.observed": raise OSError("git evidence failed")
         return write(conn,value,*args)
     monkeypatch.setattr(core_module,"project_provenance",fail)
-    with pytest.raises(OSError,match="evidence"): capture(db)
+    with pytest.raises(OSError,match="evidence"): capture(path)
+    db=duckdb.connect(str(path))
     assert db.execute("SELECT COUNT(*) FROM file_edits").fetchone()[0]==1 and db.execute("SELECT COUNT(*) FROM provenance.repositories").fetchone()[0]==0 and db.execute("SELECT COUNT(*) FROM provenance.repository_checkouts").fetchone()[0]==0 and archive_state(db)[1]==generation
 
 
@@ -69,7 +70,7 @@ def test_file_relationships_keep_distinct_semantics(tmp_path):
 
 
 def test_checkpoint_diff_uses_local_git_evidence(tmp_path):
-    root=repo(tmp_path/"repo",content="one\n"); db=core(tmp_path/"core.db",root,[(root/"x.py","write","one\n",None)]); first=capture(db); cp1=next(r["payload"]["id"] for r in first if r["kind"]=="git.checkpoint"); (root/"x.py").write_text("two\n"); git(root,"add","x.py"); git(root,"commit","-qm","second"); second=capture(db); cp2=next(r["payload"]["id"] for r in second if r["kind"]=="git.checkpoint")
+    root=repo(tmp_path/"repo",content="one\n"); path=tmp_path/"core.db"; db=core(path,root,[(root/"x.py","write","one\n",None)]); db.close(); first=capture(path); cp1=next(r["payload"]["id"] for r in first if r["kind"]=="git.checkpoint"); (root/"x.py").write_text("two\n"); git(root,"add","x.py"); git(root,"commit","-qm","second"); second=capture(path); cp2=next(r["payload"]["id"] for r in second if r["kind"]=="git.checkpoint"); db=duckdb.connect(str(path))
     result=query(db,"checkpoint_diff",f"{cp1}..{cp2}")[0]; assert result["head_before"]!=result["head_after"] and result["changed"]==["M\tx.py"]
 
 
@@ -84,9 +85,15 @@ def test_repository_identity_distinguishes_fork_but_preserves_lineage_and_unborn
     source=repo(tmp_path/"source"); git(source,"remote","add","origin","https://example.com/acme/repo.git"); clone=tmp_path/"clone"; subprocess.run(("git","clone","-q",str(source),str(clone)),check=True); git(clone,"remote","set-url","origin","https://example.com/acme/repo.git"); fork=tmp_path/"fork"; subprocess.run(("git","clone","-q",str(source),str(fork)),check=True); git(fork,"remote","set-url","origin","https://example.com/other/fork.git")
     a,b,c=repository(source),repository(clone),repository(fork); assert a["id"]==b["id"]!=c["id"] and a["lineage"]==b["lineage"]==c["lineage"]
     empty=tmp_path/"empty"; empty.mkdir(); git(empty,"init","-q"); (empty/"new.py").write_text("new\n"); observed=repository(empty); assert observed["head"]=="" and observed["lineage"] is None
-    records=capture(core(tmp_path/"empty-core.db",empty,[(empty/"new.py","write","new\n",None)])); assert any(r["kind"]=="git.checkpoint" and r["payload"]["head"]=="" for r in records)
+    path=tmp_path/"empty-core.db"; db=core(path,empty,[(empty/"new.py","write","new\n",None)]); db.close(); records=capture(path); assert any(r["kind"]=="git.checkpoint" and r["payload"]["head"]=="" for r in records)
 
 
 def test_semantic_capture_ids_are_existing_archive_identities(tmp_path):
-    root=repo(tmp_path/"repo"); db=core(tmp_path/"core.db",root,[(root/"x.py","write","one\n",None)]); records=capture(db); one=lambda kind:next(r["payload"]["id"] for r in records if r["kind"]==kind)
+    root=repo(tmp_path/"repo"); path=tmp_path/"core.db"; db=core(path,root,[(root/"x.py","write","one\n",None)]); db.close(); records=capture(path); one=lambda kind:next(r["payload"]["id"] for r in records if r["kind"]==kind)
     assert one("edit.observed")=="e0" and one("file.observed")==digest({"repository":repository(root)["id"],"path":"x.py"})
+
+
+def test_provenance_git_observation_does_not_hold_duckdb_lock(tmp_path,monkeypatch):
+    root=repo(tmp_path/"repo"); path=tmp_path/"core.db"; db=core(path,root,[(root/"x.py","write","one\n",None)]); db.close(); run=core_module._git_run
+    def unlocked(repo,*args): subprocess.run((sys.executable,"-c","import duckdb,sys; duckdb.connect(sys.argv[1]).close()",str(path)),check=True); return run(repo,*args)
+    monkeypatch.setattr(core_module,"_git_run",unlocked); capture(path)
