@@ -94,9 +94,10 @@ def _checkpoint(repo):
     paths=sorted({x[3:].split(" -> ")[-1] for x in _git_run(repo["root"],"status","--porcelain=v1","-z").decode(errors="replace").split("\0") if len(x)>3}); state=provenance_digest((_git_maybe(repo["root"],"diff","--binary","HEAD")+_git_maybe(repo["root"],"diff","--binary","--cached","HEAD")) if repo["head"] else _git_run(repo["root"],"status","--porcelain=v1","-z"))
     return dict(id=provenance_digest({"repository":repo["id"],"head":repo["head"],"state":state}),repository=repo["id"],head=repo["head"],state_hash=state,paths=paths)
 def _provenance_record(kind,entity,payload,observed_at): return dict(kind=kind,entity=entity,payload=payload,observed_at=observed_at)
-def _observe_provenance(core,edit_ids=None):
-    _git_root.cache_clear(); _repository.cache_clear(); captured=datetime.now(timezone.utc).isoformat().replace("+00:00","Z"); ids=sorted(set(edit_ids or ())) if edit_ids is not None else None; selected="" if ids is None else " AND ("+(f"fe.id IN ({','.join('?'*len(ids))}) OR " if ids else "")+"NOT EXISTS (SELECT 1 FROM provenance.file_edit_files x WHERE x.file_edit_id=fe.id))"
-    sql="""SELECT fe.id,fe.file_path,fe.edit_type,fe.content,fe.old_content,CAST(fe.created_at AS VARCHAR),m.id,m.conversation_id,c.cwd FROM file_edits fe JOIN messages m ON m.id=fe.message_id JOIN conversations c ON c.id=m.conversation_id WHERE NOT EXISTS (SELECT 1 FROM remote.row_origins o WHERE o.table_name='file_edits' AND o.physical_row_id=fe.id)"""+selected+" ORDER BY fe.created_at,fe.id"; edits=[dict(zip(("id","path","type","content","old","ts","turn","conversation","cwd"),r)) for r in core.execute(sql,ids or ()).fetchall()]; records=[]; repos={}; touched={}; versions={}; cache={}; fulls={}
+def _provenance_edits(core,edit_ids=None):
+    ids=sorted(set(edit_ids or ())) if edit_ids is not None else None; selected="" if ids is None else " AND ("+(f"fe.id IN ({','.join('?'*len(ids))}) OR " if ids else "")+"NOT EXISTS (SELECT 1 FROM provenance.file_edit_files x WHERE x.file_edit_id=fe.id))"; sql="""SELECT fe.id,fe.file_path,fe.edit_type,fe.content,fe.old_content,CAST(fe.created_at AS VARCHAR),m.id,m.conversation_id,c.cwd FROM file_edits fe JOIN messages m ON m.id=fe.message_id JOIN conversations c ON c.id=m.conversation_id WHERE NOT EXISTS (SELECT 1 FROM remote.row_origins o WHERE o.table_name='file_edits' AND o.physical_row_id=fe.id)"""+selected+" ORDER BY fe.created_at,fe.id"; return [dict(zip(("id","path","type","content","old","ts","turn","conversation","cwd"),r)) for r in core.execute(sql,ids or ()).fetchall()]
+def _observe_provenance(edits):
+    _git_root.cache_clear(); _repository.cache_clear(); captured=datetime.now(timezone.utc).isoformat().replace("+00:00","Z"); records=[]; repos={}; touched={}; versions={}; cache={}; fulls={}
     for e in edits:
         repo,path,kind=_provenance_where(e["path"],e["cwd"],cache); rid=repo["id"] if repo else None; fid=provenance_digest({"repository":rid,"path":path})
         if repo and rid not in repos: repos[rid]=repo; records.append(_provenance_record("repository.observed",rid,{k:repo[k] for k in ("id","lineage","roots","remotes","head")},captured))
@@ -113,7 +114,7 @@ def _observe_provenance(core,edit_ids=None):
             if r==rid and path not in cp["paths"] and after==full: records.append(_provenance_record("checkpoint.link",provenance_digest({"checkpoint":cp["id"],"edit":edit}),{"checkpoint":cp["id"],"edit":edit,"evidence":"full_content_match"},captured))
         records += [_provenance_record("capture.gap",provenance_digest({"checkpoint":cp["id"],"path":path}),{"repository":rid,"checkpoint":cp["id"],"path":path,"relation":"unobserved_change"},captured) for path in set(cp["paths"])-touched.get(rid,set())]
     return records,repos
-def observe_provenance(core): return _observe_provenance(core)[0]
+def observe_provenance(core): return _observe_provenance(_provenance_edits(core))[0]
 def project_provenance(db,value,map_id=lambda table,value:value):
     p,k=value["payload"],value["kind"]; observed=value["observed_at"]
     if k not in PROVENANCE_KINDS: return False
@@ -141,10 +142,14 @@ def project_provenance(db,value,map_id=lambda table,value:value):
         db.execute("INSERT OR IGNORE INTO provenance.capture_gaps VALUES (?,?,?,?,?,?)",(value["entity"],p["repository"],p["checkpoint"],p["path"],p["relation"],observed))
     _archive_touch(db)
     return True
-def capture_provenance(core,edit_ids=None):
-    records,repos=_observe_provenance(core,edit_ids); core.execute("BEGIN")
+def capture_provenance(path=None,edit_ids=None):
+    connect=lambda read_only=False: duckdb.connect(str(path),read_only=read_only) if path else get_db(read_only); core=connect(True)
+    try: edits=_provenance_edits(core,edit_ids)
+    finally: core.close()
+    records,repos=_observe_provenance(edits); core=connect(); core.execute("BEGIN")
     try: [_observe_checkout(core,r) for r in repos.values()]; [project_provenance(core,r) for r in records]; core.execute("COMMIT")
     except BaseException: core.execute("ROLLBACK"); raise
+    finally: core.close()
     return records
 def project_archive_row(db,table,columns,values,origin=None):
     if table not in ARCHIVE_COLUMNS or columns!=ARCHIVE_COLUMNS[table] or len(values)!=len(columns): raise ValueError("record schema/entity mismatch")
@@ -759,8 +764,9 @@ def drain_hooks(embed=False, local_only=False):
                 if snap != [st2.st_mtime_ns, st2.st_size]: retry_hook(work); continue
                 if not r.convs: done.append((work, key, snap, set())); continue
                 conn = get_db(); init_schema(conn); conn.execute("BEGIN")
-                try: changed = upsert(conn, r)[-1] | ({m["id"] for m in r.msgs} if e.get("retry") else set()); conn.execute("COMMIT"); capture_provenance(conn,[x["id"] for x in r.edits])
+                try: changed = upsert(conn, r)[-1] | ({m["id"] for m in r.msgs} if e.get("retry") else set()); conn.execute("COMMIT")
                 finally: conn.close()
+                capture_provenance(edit_ids=[x["id"] for x in r.edits])
                 atomic_json(work, {**e, "snap":snap, "changed":sorted(changed)})
                 done.append((work, key, snap, changed))
             except FileNotFoundError: work.unlink(missing_ok=True)
@@ -1170,9 +1176,7 @@ def sync(watch: bool = typer.Option(False, "-w"), interval: int = typer.Option(3
                         if j["name"] == "chatgpt": st[2]["coverage"] = sorted(known)
                         set_state(*st)
                     if src := j.get("source"): typer.echo(f"Updated {j['label']} ({n} new, {u} updated convs; {fmt([c, m, t, a, e])} processed){' before failure' if r is None else ''}{' in %.2fs' % (time.perf_counter()-j['t']) if verbose else ''}")
-        conn = get_db()
-        try: capture_provenance(conn,provenance_edits)
-        finally: conn.close()
+        capture_provenance(edit_ids=provenance_edits)
         mark_dirty(changed)
         if dirty: atomic_json(STATE_PATH, state)
         sync_lock.close()
