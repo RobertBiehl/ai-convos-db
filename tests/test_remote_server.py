@@ -2,7 +2,7 @@ import copy, json, sqlite3
 
 import pytest
 from ai_convos_remote.control import record, sign, state_hash
-from ai_convos_remote.protocol import certificate, digest, event, identity, seal_event, seal_key, sign_control
+from ai_convos_remote.protocol import certificate, digest, event, identity, purge_certificate, seal_event, seal_key, sign_control
 from ai_convos_remote_server import action, connect, ledger_state
 
 
@@ -78,19 +78,30 @@ def test_large_events_are_manifested_then_fetched(tmp_path):
 
 
 def test_personal_event_purge_is_idempotent_author_bound_and_blocks_resurrection(tmp_path):
-    db=connect(tmp_path/"server.db"); a=account(db,"alice"); key=bytes([9])*32; personal="personal"; create_ws(db,a,personal,key,"personal"); env=seal_event(event(a["device"],1,"memory.canonical","memory:x",{"opaque":True},[],"2026-01-01T00:00:00Z"),personal,1,key); action(db,{"op":"upload","envelope":env},a["token"])
-    assert action(db,{"op":"purge","workspace":personal,"events":[env["event"]]},a["token"])=={"purged":1} and action(db,{"op":"purge","workspace":personal,"events":[env["event"]]},a["token"])=={"purged":1}; pulled=action(db,{"op":"pull","workspace":personal,"after":0},a["token"]); assert pulled["events"]==[{"cursor":pulled["tail"],"tombstone":True,"event":env["event"],"author":env["author"],"seq":env["seq"],"parents":[]}] and pulled["floor"]==pulled["tail"]
+    db=connect(tmp_path/"server.db"); a=account(db,"alice"); key=bytes([9])*32; personal="personal"; create_ws(db,a,personal,key,"personal"); env=seal_event(event(a["device"],1,"memory.canonical","memory:x:part:0",{"opaque":True},[],"2026-01-01T00:00:00Z"),personal,1,key); action(db,{"op":"upload","envelope":env},a["token"]); deleted=seal_event(event(a["device"],2,"memory.canonical","memory:x",{"status":"deleted"},[env["event"]],"2026-01-02T00:00:00Z"),personal,1,key); anchor=action(db,{"op":"upload","envelope":deleted},a["token"]); proof=purge_certificate(a["device"],personal,env|{"kind":"memory.canonical","payload_v":1},[],deleted)
+    assert action(db,{"op":"purge","workspace":personal,"certificates":[proof]},a["token"])=={"purged":1} and action(db,{"op":"purge","workspace":personal,"certificates":[proof]},a["token"])=={"purged":1}; pulled=action(db,{"op":"pull","workspace":personal,"after":anchor["cursor"]},a["token"]); assert pulled["events"]==[{"cursor":pulled["tail"],"purge":proof}] and pulled["floor"]<pulled["tail"]
     with pytest.raises(ValueError,match="purged"): action(db,{"op":"upload","envelope":env},a["token"])
-    with pytest.raises(PermissionError,match="denied"): action(db,{"op":"purge","workspace":personal,"events":["unknown"]},a["token"])
-    team="team"; create_ws(db,a,team,key,"team"); team_env=seal_event(event(a["device"],2,"x","x",{},[],"2026-01-02T00:00:00Z"),team,1,key); action(db,{"op":"upload","envelope":team_env},a["token"])
-    with pytest.raises(PermissionError,match="denied"): action(db,{"op":"purge","workspace":team,"events":[team_env["event"]]},a["token"])
+    missing=purge_certificate(a["device"],personal,env|{"event":"0"*64,"kind":"memory.canonical","payload_v":1},[],deleted)
+    with pytest.raises(PermissionError,match="denied"): action(db,{"op":"purge","workspace":personal,"certificates":[missing]},a["token"])
+    team="team"; create_ws(db,a,team,key,"team"); team_env=seal_event(event(a["device"],1,"memory.canonical","memory:y:part:0",{},[],"2026-01-02T00:00:00Z"),team,1,key); action(db,{"op":"upload","envelope":team_env},a["token"]); team_deleted=seal_event(event(a["device"],2,"memory.canonical","memory:y",{"status":"deleted"},[team_env["event"]]),team,1,key); action(db,{"op":"upload","envelope":team_deleted},a["token"]); team_proof=purge_certificate(a["device"],team,team_env|{"kind":"memory.canonical","payload_v":1},[],team_deleted)
+    with pytest.raises(PermissionError,match="denied"): action(db,{"op":"purge","workspace":team,"certificates":[team_proof]},a["token"])
 
 
-def test_tombstone_retains_parent_chain_and_blocks_sequence_reuse(tmp_path):
-    db=connect(tmp_path/"server.db"); a=account(db,"alice"); ws,key="personal",bytes([6])*32; create_ws(db,a,ws,key,"personal"); first=seal_event(event(a["device"],1,"x","one",{},[],"2026-01-01T00:00:00Z"),ws,1,key); one=action(db,{"op":"upload","envelope":first},a["token"]); second=seal_event(event(a["device"],2,"x","two",{},[first["event"]],"2026-01-01T00:00:01Z"),ws,1,key); action(db,{"op":"upload","envelope":second},a["token"]); action(db,{"op":"purge","workspace":ws,"events":[second["event"]]},a["token"]); pulled=action(db,{"op":"pull","workspace":ws,"after":one["cursor"]},a["token"])
-    assert pulled["events"][0]["parents"]==[first["event"]]
+def test_purge_certificate_retains_parent_chain_and_blocks_sequence_reuse(tmp_path):
+    db=connect(tmp_path/"server.db"); a=account(db,"alice"); ws,key="personal",bytes([6])*32; create_ws(db,a,ws,key,"personal"); first=seal_event(event(a["device"],1,"x","one",{},[],"2026-01-01T00:00:00Z"),ws,1,key); one=action(db,{"op":"upload","envelope":first},a["token"]); second=seal_event(event(a["device"],2,"memory.canonical","memory:x:part:0",{},[first["event"]],"2026-01-01T00:00:01Z"),ws,1,key); action(db,{"op":"upload","envelope":second},a["token"]); deleted=seal_event(event(a["device"],3,"memory.canonical","memory:x",{"status":"deleted"},[second["event"]]),ws,1,key); action(db,{"op":"upload","envelope":deleted},a["token"]); proof=purge_certificate(a["device"],ws,second|{"kind":"memory.canonical","payload_v":1},[first["event"]],deleted); action(db,{"op":"purge","workspace":ws,"certificates":[proof]},a["token"]); pulled=action(db,{"op":"pull","workspace":ws,"after":one["cursor"]},a["token"])
+    assert pulled["events"][-1]["purge"]["parents"]==[first["event"]]
     replacement=seal_event(event(a["device"],2,"x","fork",{},[first["event"]],"2026-01-01T00:00:02Z"),ws,1,key)
     with pytest.raises(ValueError,match="sequence was purged"): action(db,{"op":"upload","envelope":replacement},a["token"])
+
+
+def test_purge_certificate_tamper_header_conflict_and_anchor_removal_fail_closed(tmp_path):
+    db=connect(tmp_path/"server.db"); a=account(db,"alice"); ws,key="personal",bytes([4])*32; create_ws(db,a,ws,key,"personal"); active=seal_event(event(a["device"],1,"memory.canonical","memory:x:part:0",{},[]),ws,1,key); deleted=seal_event(event(a["device"],2,"memory.canonical","memory:x",{"status":"deleted"},[active["event"]]),ws,1,key); action(db,{"op":"upload","envelope":active},a["token"]); action(db,{"op":"upload","envelope":deleted},a["token"]); target=active|{"kind":"memory.canonical","payload_v":1}; proof=purge_certificate(a["device"],ws,target,[],deleted)
+    with pytest.raises(ValueError,match="does not match"): action(db,{"op":"purge","workspace":ws,"certificates":[purge_certificate(a["device"],ws,target|{"epoch":2},[],deleted)]},a["token"])
+    with pytest.raises(PermissionError,match="signature"): action(db,{"op":"purge","workspace":ws,"certificates":[proof|{"superseded_by":"0"*64}]},a["token"])
+    assert db.execute("SELECT COUNT(*) FROM events").fetchone()[0]==2 and action(db,{"op":"purge","workspace":ws,"certificates":[proof]},a["token"])["purged"]==1
+    newer=seal_event(event(a["device"],3,"memory.canonical","memory:x",{"status":"deleted"},[deleted["event"]]),ws,1,key); action(db,{"op":"upload","envelope":newer},a["token"])
+    with pytest.raises(ValueError,match="conflicts"): action(db,{"op":"purge","workspace":ws,"certificates":[purge_certificate(a["device"],ws,target,[],newer)]},a["token"])
+    with pytest.raises(PermissionError,match="denied"): action(db,{"op":"purge","workspace":ws,"certificates":[purge_certificate(a["device"],ws,deleted|{"kind":"memory.canonical","payload_v":1},[active["event"]],newer)]},a["token"])
 
 
 def test_restart_preserves_events_tokens_and_idempotency(tmp_path):

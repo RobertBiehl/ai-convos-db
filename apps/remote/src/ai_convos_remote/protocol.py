@@ -2,6 +2,7 @@
 import base64, hashlib, hmac, json, os
 from datetime import datetime, timezone
 
+from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey, Ed25519PublicKey
 from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey, X25519PublicKey
@@ -44,6 +45,14 @@ def verify_event(value, sign_public):
     sig, signed = unb64(value["signature"]), {k:v for k,v in value.items() if k != "signature"}; _pub(Ed25519PublicKey, sign_public).verify(sig, canon(signed))
     body = {k:v for k,v in signed.items() if k != "id"}
     if digest(body) != value["id"] or digest(value["payload"]) != value["revision"]: raise ValueError("Invalid event digest")
+    return value
+PURGE_FIELDS={"v","kind","workspace","event","author","epoch","seq","parents","event_kind","payload_v","superseded_by","signature"}
+def purge_certificate(device,workspace,target,parents,anchor):
+    body=dict(v=V,kind="event.purge",workspace=workspace,event=target["event"],author=target["author"],epoch=target["epoch"],seq=target["seq"],parents=list(parents),event_kind=target["kind"],payload_v=target["payload_v"],superseded_by=anchor["event"]); body["signature"]=b64(_priv(Ed25519PrivateKey,device["sign_private"]).sign(canon(body))); return body
+def verify_purge(value,sign_public):
+    if set(value)!=PURGE_FIELDS or value["v"]!=V or value["kind"]!="event.purge" or value["event_kind"]!="memory.canonical" or value["payload_v"]!=1 or not isinstance(value["workspace"],str) or not isinstance(value["author"],str) or len(value["author"])!=32 or any(not isinstance(value[k],str) or len(value[k])!=64 for k in ("event","superseded_by")) or any(not isinstance(value[k],int) or isinstance(value[k],bool) or value[k]<1 for k in ("epoch","seq")) or not isinstance(value["parents"],list) or len(value["parents"])!=(value["seq"]>1) or any(not isinstance(p,str) or len(p)!=64 for p in value["parents"]): raise ValueError("invalid purge certificate")
+    try: _pub(Ed25519PublicKey,sign_public).verify(unb64(value["signature"]),canon({k:v for k,v in value.items() if k!="signature"}))
+    except (InvalidSignature,KeyError,TypeError,ValueError) as e: raise ValueError("invalid purge certificate") from e
     return value
 def signer(devices,author): value=devices[author]["sign_public"]; return value if public_id(value)==author else (_ for _ in ()).throw(ValueError("device signing key mismatch"))
 def material_event(value,devices=None,device=None):

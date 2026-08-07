@@ -128,8 +128,11 @@ installed but outdated product blocks publication. Events are never edited.
 Corrections, identity links, retractions, key changes, and tombstones are new
 events. The sole deletion exception is an
 author-bound purge of superseded `memory.canonical` events from a personal
-workspace after its signed tombstone is durable. The relay keeps only opaque
-event-id replay-denial tombstones; team events cannot use this operation.
+workspace after its signed tombstone is durable. The author signs one
+`event.purge` certificate per removed event over version, workspace, original
+event ID, author, epoch, sequence, exact parents, fixed event kind/payload
+version, and the retained later deletion-event ID. Team events cannot use this
+operation.
 
 Required initial kinds:
 
@@ -160,9 +163,13 @@ clocks never establish causality.
 
 For personal-memory privacy deletion, a device may purge only explicit event
 ids that it authored and only after publishing the corresponding memory
-tombstone. Purge is idempotent: clients remove local ciphertext and decrypted
-event rows only after relay acknowledgement, while replay-denial tombstones
-prevent the same event ids from being uploaded again. Recipients remove an
+tombstone. The relay verifies each author signature, exact stored envelope
+header, later same-author anchor, personal scope, and permanent selected-history
+protection before atomically storing certificates and deleting live ciphertext.
+Clients verify the historical device key and signed deletion anchor before
+changing sequence or receipt state. Missing or invalid proof blocks readiness.
+Purge is idempotent, and stored proofs prevent event-ID or author-sequence reuse.
+Recipients remove an
 unchanged remote-only memory and its revisions; a locally changed memory or one
 with another provider origin or active projection survives, with the deleted
 remote origin redacted to hash and link metadata. This preserves conflicts

@@ -12,7 +12,7 @@ def roots(tmp_path, monkeypatch):
     monkeypatch.setenv("CONVOS_CODEX_MEMORY_ROOT", str(codex)); monkeypatch.setenv("CONVOS_CLAUDE_PROJECTS_ROOT", str(claude)); monkeypatch.setenv("CONVOS_MEMORY_DB", str(tmp_path/"memory.db")); monkeypatch.setenv("CODEX_HOME", str(tmp_path/"codex-home")); monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path/"claude-home"))
     return codex, claude
 def acknowledged(state,value,workspace="personal",cursor=1):
-    status=value["payload"].get("status"); state.execute("INSERT INTO receipts VALUES (?,?,?,?,?,?,?,?,?,?)",(workspace,value["id"],cursor,value["author"],value["seq"],1,value["kind"],value["entity"],value["revision"],status)); state.execute("INSERT OR REPLACE INTO publication_heads VALUES (?,?,?,?,?)",(workspace,value["author"],value["entity"],value["revision"],value["id"])); state.commit()
+    status=value["payload"].get("status"); state.execute("INSERT INTO receipts VALUES (?,?,?,?,?,?,?,?,?,?,?)",(workspace,value["id"],cursor,value["author"],value["seq"],1,value["kind"],value["payload_v"],value["entity"],value["revision"],status)); state.execute("INSERT OR REPLACE INTO publication_heads VALUES (?,?,?,?,?)",(workspace,value["author"],value["entity"],value["revision"],value["id"])); state.commit()
 
 
 def test_memory_product_import_does_not_reenter_core_plugins():
@@ -20,7 +20,7 @@ def test_memory_product_import_does_not_reenter_core_plugins():
     assert result.returncode == 0 and result.stderr == ""
 def test_memory_distribution_metadata_and_public_help():
     root = Path(__file__).resolve().parents[1]; project = tomllib.loads((root/"apps"/"memory"/"pyproject.toml").read_text())["project"]; core = tomllib.loads((root/"pyproject.toml").read_text())["project"]
-    assert project["readme"] == "README.md" and set(project["urls"]) == {"Documentation","Repository"} and "ai-convos-db>=0.7,<0.8" in project["dependencies"] and project["entry-points"]["convos.init"] == {"memory":"ai_convos_memory:initialize"} and project["entry-points"]["convos.remote"] == {"memory":"ai_convos_memory:remote_bridge"} and memory_module.remote_bridge()["v"] == 3 and memory_module.remote_bridge()["events"] == {("memory.canonical",1)} and set(memory_module.remote_bridge()) == {"v","events","records","project","purges"} and core["optional-dependencies"]["memory"] == ["ai-convos-memory>=0.7,<0.8"]
+    assert project["readme"] == "README.md" and set(project["urls"]) == {"Documentation","Repository"} and "ai-convos-db>=0.7,<0.8" in project["dependencies"] and project["entry-points"]["convos.init"] == {"memory":"ai_convos_memory:initialize"} and project["entry-points"]["convos.remote"] == {"memory":"ai_convos_memory:remote_bridge"} and memory_module.remote_bridge()["v"] == 4 and memory_module.remote_bridge()["events"] == {("memory.canonical",1)} and set(memory_module.remote_bridge()) == {"v","events","records","project","purges"} and core["optional-dependencies"]["memory"] == ["ai-convos-memory>=0.7,<0.8"]
     commands=typer.main.get_command(memory).commands; public={name for name,command in commands.items() if not command.hidden}; hidden={name for name,command in commands.items() if command.hidden}
     assert {"status","audit","sync","review","remember","forget","backup","restore","enable","disable","current","history"} <= public
     assert {"scan","plan","apply","reconcile","context","install-hook","project","runtime-hook","adopt-scope"} <= hidden
@@ -307,7 +307,7 @@ def test_remote_tombstone_purges_unchanged_remote_only_memory_and_decrypted_even
     roots(tmp_path,monkeypatch); a,b=tmp_path/"a",tmp_path/"b"; a.mkdir(); monkeypatch.delenv("CONVOS_MEMORY_DB"); monkeypatch.setenv("CONVOS_PROJECT_ROOT",str(a)); created=memory_module.remember_data("forget me remotely","global"); outgoing,incoming=remote_connect(tmp_path/"out.db"),remote_connect(tmp_path/"in.db"); record=remote_records(a,outgoing,"personal","personal")[0]; device=identity("a"); active=event(device,1,record["kind"],record["entity"],record["payload"],observed_at="2026-01-01T00:00:00Z")
     acknowledged(outgoing,active); assert remote_project(b,incoming,active,"personal","b")
     memory_module.forget_data(created["id"],"global"); deleted=remote_records(a,outgoing,"personal","personal")[0]; tombstone=event(device,2,deleted["kind"],deleted["entity"],deleted["payload"],[active["id"]],observed_at="2026-01-02T00:00:00Z"); assert remote_project(b,incoming,tombstone,"personal","b") and not remote_project(b,incoming,tombstone,"personal","b")
-    acknowledged(outgoing,tombstone,cursor=2); assert memory_module.remote_purges(a,outgoing,"personal","personal")==[active["id"]]
+    acknowledged(outgoing,tombstone,cursor=2); assert memory_module.remote_purges(a,outgoing,"personal","personal")==[{"event":active["id"],"superseded_by":tombstone["id"]}]
     db=memory_module.connect(b); assert db.execute("SELECT COUNT(*) FROM canonicals").fetchone()[0]==db.execute("SELECT COUNT(*) FROM sources").fetchone()[0]==db.execute("SELECT COUNT(*) FROM revisions").fetchone()[0]==0; db.close(); assert "event_log" not in {r[0] for r in incoming.execute("SELECT name FROM sqlite_master WHERE type='table'")}; outgoing.close(); incoming.close()
 
 

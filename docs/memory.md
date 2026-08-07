@@ -242,8 +242,10 @@ provider memories are never changed or deleted.
 
 With encrypted personal sync configured, the next successful worker cycle
 publishes a tombstone, removes the author's prior ciphertext events from the
-relay, and permanently rejects re-upload of those event IDs. Other devices
-purge unchanged remote-only copies and decrypted event payloads. Local
+relay, and permanently rejects re-upload of those event IDs. This remains one
+automatic sync operation: author-signed purge certificates are generated and
+verified internally without another prompt or key step. Other devices purge
+unchanged remote-only copies and decrypted event payloads. Local
 divergence, another provider origin, or a managed projection prevents automatic
 canonical deletion and remains visible for review. Existing private memory or
 relay backups are historical copies and are not rewritten; expire pre-forget
