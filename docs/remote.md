@@ -187,23 +187,27 @@ the invitation to the intended root key even if the relay directory is later
 compromised. Before wrapping any workspace or history key, clients verify each
 device's user-root-signed certificate and its signing and encryption keys.
 
-Linking a Git checkout stores its checkout root only on that device. Encrypted
-root-commit and remote evidence identifies other clones. A linked non-Git path
-uses a local root binding. Every relevant turn, tool, edit, checkpoint, and
-changeset is shared automatically after the one-time link.
+Linking a Git checkout publishes its stable repository identity; core resolves
+every known clone and worktree for that identity. A linked non-Git path uses an
+opaque policy token whose absolute root remains a machine-local `config.json`
+binding. Once a conversation's working directory or any edit matches a policy,
+the complete conversation is routed to that workspace. Repository policy never
+silently slices turns or creates partial conversation history.
 
 The client requires `ai-convos-redact` and runs it inside the team `publish`
 boundary before event signing and encryption. High-confidence credential spans
 become typed markers without secret-derived hashes; personal workspaces remain
-lossless. Team attachment records and bodies are omitted, and their bodies are
-not read while building a team projection. `convos redact status` shows only
+lossless. Team binary bodies are not read; their attachment records become
+explicit `[REDACTED:attachment]` placeholders rather than disappearing.
+`convos redact status` shows only
 the local workspace, record, field path, line, and secret kind. The relay cannot
 scan because it receives no plaintext. See [local secret
 protection](redact.md) for supported forms and the non-retroactive boundary.
 
-A changeset may span several repositories. Each edit is authorized separately.
-When only part belongs to a workspace, recipients get allowed edits plus an
-opaque boundary record, never private paths or content.
+A conversation may span several repositories. A match routes the whole
+conversation, including all of its turns, tools, edits, and provenance. The
+workspace membership is therefore the trust boundary; use a separate
+conversation when work must remain outside it.
 
 Membership and history:
 
@@ -345,8 +349,8 @@ Remote client state lives under `<root>/remote/` (by default,
 `~/.convos/remote/`):
 
 - `config.json`: mode `0600`, device private keys, token, encrypted-workspace
-  keyring, local workspace labels, pinned controls, and the last successfully
-  synchronized DuckDB archive ID/generation
+  keyring, local workspace labels and non-Git path bindings, pinned controls,
+  and the last successfully synchronized DuckDB archive ID/generation
 - `state.db`: content-free receipts, cursors, heads, exact sequence metadata,
   sharing policy, and working-file manifests
 - `outbox/`: unacknowledged encrypted envelopes; removed after acknowledgement
@@ -354,6 +358,6 @@ Remote client state lives under `<root>/remote/` (by default,
   user deliberately removes them
 - `worker.log`, `last_error`: operational state
 
-Absolute checkout roots remain local in core checkout mappings or remote policy
-metadata. They are not placed in event payloads, server storage, repository
+Absolute checkout roots remain local in core checkout mappings or device
+configuration. They are not placed in event payloads, server storage, repository
 fixtures, CI artifacts, or logs.
