@@ -43,6 +43,12 @@ def test_state_chain_rejects_role_change_split_transition_and_bad_commitment_sha
     with pytest.raises(ValueError,match="membership"): verify_state(successor(ad,base,"membership",{**base["devices"],target["id"]:entry}),base)
 
 
+def test_selected_history_is_append_only_in_signed_controls():
+    ar,ad,a=person("alice"); base=genesis(ar,ad,a); base["members"][ar["id"]]["selected"]=["a"*64]; base=sign(ad,{k:v for k,v in base.items() if k not in ("author","signature")}); body={k:copy.deepcopy(v) for k,v in base.items() if k not in ("author","signature")}; body.update(revision=2,prev=state_hash(base),action="history",approval=None,approved_at=time.time()); body["members"][ar["id"]]["selected"]=[]
+    with pytest.raises(ValueError,match="history transition"): verify_state(sign(ad,body),base)
+    body["members"][ar["id"]]["selected"]=["a"*64,"b"*64]; assert verify_state(sign(ad,body),base)
+
+
 def test_personal_workspace_cannot_add_or_start_with_other_users():
     ar,ad,a=person("alice"); br,bd,b=person("bob"); base=genesis(ar,ad,a); injected={**base,"scope":"personal","members":{**base["members"],br["id"]:{"role":"member","joined":1,"history_from":1,"selected":[]}},"devices":{**base["devices"],bd["id"]:b}}; injected=sign(ad,{k:v for k,v in injected.items() if k not in ("author","signature")})
     with pytest.raises(ValueError,match="genesis"): verify_state(injected)

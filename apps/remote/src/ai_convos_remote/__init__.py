@@ -10,8 +10,8 @@ def register(app): _pending.append(app) if "remote" not in globals() else app.ad
 from ai_convos.cli import PROJECT_ROOT, archive_state as core_archive_state, drain_hooks, init_schema, install_hooks, repository
 from .control import approved, electorate, proposal as device_proposal, record as control_record, sign as control_sign, state_hash, verify_proposal, verify_state, vote as device_vote
 from .projection import bridge_purges, bridge_records, connect, cutover_state, event_support, inspect_state, project, project_many, query as graph_query, read_state, reset_history, scan, sequence, verify_history
-from .protocol import (b64, certificate, digest, event, identity, material_event, open_event, open_key, public, public_id, recover,
-                       recovery_bundle, seal_event, seal_history, seal_key, sign_control, signer, unb64, verify_certificate)
+from .protocol import (b64, certificate, digest, event, identity, material_event, open_event, open_key, public, public_id, purge_certificate, recover,
+                       recovery_bundle, seal_event, seal_history, seal_key, sign_control, signer, unb64, verify_certificate, verify_purge)
 from .service import edit_hooks, enable
 
 remote=typer.Typer(help="End-to-end encrypted personal and team synchronization")
@@ -37,16 +37,16 @@ def encrypted_file(root,event,value):
     os.chmod(path.parent,0o700); raw=json.dumps(value,separators=(",",":")).encode(); tmp=path.with_name(f".{path.name}.{os.getpid()}"); handle=tmp.open("xb"); os.chmod(tmp,0o600); handle.write(raw); handle.close(); os.replace(tmp,path); return path,len(raw)
 def receipt(state,ws,value,cursor,epoch):
     status=value["payload"].get("status") if isinstance(value["payload"],dict) and value["payload"].get("status") in ("active","deleted") else None
-    state.execute("INSERT OR REPLACE INTO receipts VALUES (?,?,?,?,?,?,?,?,?,?)",(ws,value["id"],cursor,value["author"],value["seq"],epoch,value["kind"],value["entity"],value["revision"],status))
+    state.execute("INSERT OR REPLACE INTO receipts VALUES (?,?,?,?,?,?,?,?,?,?,?)",(ws,value["id"],cursor,value["author"],value["seq"],epoch,value["kind"],value["payload_v"],value["entity"],value["revision"],status))
 def safe_url(url): parsed=urllib.parse.urlparse(url); parsed.scheme=="https" or parsed.hostname in ("127.0.0.1","localhost","::1") or os.environ.get("CONVOS_REMOTE_INSECURE")=="1" or (_ for _ in ()).throw(ValueError("Remote URL must use HTTPS (set CONVOS_REMOTE_INSECURE=1 only on a trusted test network)"))
 def request(cfg,body,auth=True):
     safe_url(cfg["url"])
     headers={"Content-Type":"application/json"};
     if auth: headers["Authorization"]="Bearer "+cfg["token"]
-    req=urllib.request.Request(cfg["url"].rstrip("/")+"/v2",data=json.dumps(body).encode(),headers=headers,method="POST")
+    req=urllib.request.Request(cfg["url"].rstrip("/")+"/v3",data=json.dumps(body).encode(),headers=headers,method="POST")
     try: return json.loads(urllib.request.urlopen(req,timeout=10).read())
     except urllib.error.HTTPError as e: raise ValueError(json.loads(e.read())["error"]) from e
-def health(cfg): safe_url(cfg["url"]); result=json.loads(urllib.request.urlopen(cfg["url"].rstrip("/")+"/v2/health",timeout=3).read()); result.get("version")==2 or (_ for _ in ()).throw(ValueError("relay protocol v2 required")); return result
+def health(cfg): safe_url(cfg["url"]); result=json.loads(urllib.request.urlopen(cfg["url"].rstrip("/")+"/v3/health",timeout=3).read()); result.get("version")==3 or (_ for _ in ()).throw(ValueError("relay protocol v3 required")); return result
 @contextmanager
 def sync_lock(root):
     path=paths(root)[0]/"sync.lock"; path.parent.mkdir(parents=True,exist_ok=True); handle=path.open("a+"); os.chmod(path,0o600); fcntl.flock(handle,fcntl.LOCK_EX)
@@ -150,7 +150,7 @@ def publish(cfg,state,ws,record,root=None,defer=False,heads=None):
     if heads is not None and old==revision: return None
     if heads is None and old and old["revision"]==revision: return old["event"]
     seq=int((state.execute("SELECT value FROM meta WHERE key=?",(f"seq:{ws}",)).fetchone() or ["0"])[0])+1; prev=(state.execute("SELECT value FROM meta WHERE key=?",(f"prev:{ws}",)).fetchone() or [None])[0]; value=event(cfg["device"],seq,record["kind"],record["entity"],record["payload"],[prev] if prev else (),record.get("observed_at"),payload_v); epoch=cfg["workspaces"][ws]["epoch"]; env=seal_event(value,ws,epoch,key(cfg,ws,epoch)); path,size=encrypted_file(root,value["id"],env); status=record["payload"].get("status") if isinstance(record["payload"],dict) and record["payload"].get("status") in ("active","deleted") else None
-    state.execute("INSERT INTO outbox VALUES (?,?,?,?,?,?,?,?,?,?,?)",(ws,value["id"],record["entity"],revision,value["author"],seq,epoch,record["kind"],status,str(path),size)); state.execute("INSERT OR REPLACE INTO publication_heads VALUES (?,?,?,?,?)",(ws,cfg["user"],record["entity"],revision,value["id"])); state.execute("INSERT OR REPLACE INTO meta VALUES (?,?),(?,?)",(f"seq:{ws}",str(seq),f"prev:{ws}",value["id"])); sequence(state,ws,value)
+    state.execute("INSERT INTO outbox VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",(ws,value["id"],record["entity"],revision,value["author"],seq,epoch,record["kind"],payload_v,status,str(path),size)); state.execute("INSERT OR REPLACE INTO publication_heads VALUES (?,?,?,?,?)",(ws,cfg["user"],record["entity"],revision,value["id"])); state.execute("INSERT OR REPLACE INTO meta VALUES (?,?),(?,?)",(f"seq:{ws}",str(seq),f"prev:{ws}",value["id"])); sequence(state,ws,value)
     if not defer: state.commit()
     if heads is not None: heads[record["entity"]]=revision
     project(core_path(root),state,value,ws,cfg["device"]["id"],root=root,authors={cfg["device"]["id"]:cfg["user"]}); return value["id"]
@@ -186,12 +186,21 @@ def upload(cfg,state,root=None,workspaces=None):
         state.commit(); result=request(cfg,{"op":"upload_many","envelopes":[p[1] for p in prepared]})["events"] if prepared else []
         if len(result)!=len(prepared) or any(not isinstance(r.get("cursor"),int) or isinstance(r["cursor"],bool) or r["cursor"]<1 for r in result): raise ValueError("relay upload acknowledgement mismatch")
         for row,env,path,ack in acknowledged+[(row,env,path,ack) for (row,env,path),ack in zip(prepared,result)]:
-            state.execute("INSERT OR REPLACE INTO receipts VALUES (?,?,?,?,?,?,?,?,?,?)",(row["workspace"],row["event"],ack["cursor"],row["author"],row["seq"],env["epoch"],row["kind"],row["entity"],row["revision"],row["status"])); state.execute("DELETE FROM outbox WHERE workspace=? AND event=?",(row["workspace"],row["event"]))
+            state.execute("INSERT OR REPLACE INTO receipts VALUES (?,?,?,?,?,?,?,?,?,?,?)",(row["workspace"],row["event"],ack["cursor"],row["author"],row["seq"],env["epoch"],row["kind"],row["payload_v"],row["entity"],row["revision"],row["status"])); state.execute("DELETE FROM outbox WHERE workspace=? AND event=?",(row["workspace"],row["event"]))
         state.commit(); [path.unlink(missing_ok=True) for row,env,path,ack in acknowledged+[(row,env,path,ack) for (row,env,path),ack in zip(prepared,result)]]
-def purge_events(cfg,state,ws,events):
-    protected={event for member in cfg["controls"][ws]["members"].values() for event in member["selected"]}; events=[event for event in events if event not in protected]
-    for i in range(0,len(events),500):
-        batch=events[i:i+500]; request(cfg,{"op":"purge","workspace":ws,"events":batch}); marks=",".join("?"*len(batch)); state.execute(f"DELETE FROM publication_heads WHERE workspace=? AND event IN ({marks})",(ws,*batch)); state.execute(f"DELETE FROM receipts WHERE workspace=? AND event IN ({marks})",(ws,*batch)); state.commit()
+def drop_event(state,ws,event):
+    state.execute("DELETE FROM publication_heads WHERE workspace=? AND event=?",(ws,event)); state.execute("DELETE FROM receipts WHERE workspace=? AND event=?",(ws,event)); state.execute("DELETE FROM history_sources WHERE workspace=? AND (event=? OR carrier=?)",(ws,event,event)); state.execute("DELETE FROM lazy_events WHERE workspace=? AND event=?",(ws,event)); state.execute("DELETE FROM deferred_events WHERE workspace=? AND event=?",(ws,event))
+def purge_events(cfg,state,ws,intents):
+    if cfg["workspaces"][ws]["kind"]!="personal": raise ValueError("event purge requires a personal workspace")
+    protected={event for member in cfg["controls"][ws]["members"].values() for event in member["selected"]}; certificates=[]
+    for intent in (i for i in intents if i["event"] not in protected):
+        target=state.execute("SELECT * FROM receipts WHERE workspace=? AND event=?",(ws,intent["event"])).fetchone(); anchor=state.execute("SELECT * FROM receipts WHERE workspace=? AND event=?",(ws,intent["superseded_by"])).fetchone(); head=anchor and state.execute("SELECT event FROM publication_heads WHERE workspace=? AND owner=? AND entity=?",(ws,cfg["user"],anchor["entity"])).fetchone()
+        if not target or not anchor or (target["author"],target["kind"],target["payload_v"],target["status"])!=(cfg["device"]["id"],"memory.canonical",1,"active") or (anchor["author"],anchor["kind"],anchor["payload_v"],anchor["status"])!=(target["author"],"memory.canonical",1,"deleted") or anchor["seq"]<=target["seq"] or target["entity"].rsplit(":part:",1)[0]!=anchor["entity"] or not head or head[0]!=anchor["event"]: raise ValueError("invalid purge intent")
+        previous=state.execute("SELECT event FROM event_sequences WHERE workspace=? AND author=? AND seq=?",(ws,target["author"],target["seq"]-1)).fetchone() if target["seq"]>1 else None
+        if target["seq"]>1 and not previous: raise ValueError("purge target parent is unavailable")
+        certificates.append(purge_certificate(cfg["device"],ws,target,[previous[0]] if previous else [],anchor))
+    for i in range(0,len(certificates),500):
+        batch=certificates[i:i+500]; request(cfg,{"op":"purge","workspace":ws,"certificates":batch}); [drop_event(state,ws,value["event"]) for value in batch]; state.commit()
 def pull(cfg,state,root=None):
     root=local_root(root)
     server=refresh(cfg,root)
@@ -209,10 +218,12 @@ def pull(cfg,state,root=None):
                 result=request(cfg,{"op":"pull","workspace":sid,"after":after,"limit":500}); floor,tail=result["floor"],result["tail"]
                 if not all(isinstance(v,int) and not isinstance(v,bool) and v>=0 for v in (floor,tail)) or floor>tail and tail or after>tail: raise ValueError("relay cursor window is invalid")
                 incoming=[]
-                for item in result["events"]:
-                    if item.get("tombstone"):
-                        sequence(state,sid,{"id":item["event"],"author":item["author"],"seq":item["seq"],"parents":item["parents"]}); state.execute("DELETE FROM receipts WHERE workspace=? AND event=?",(sid,item["event"])); state.execute("DELETE FROM publication_heads WHERE workspace=? AND event=?",(sid,item["event"])); state.execute("DELETE FROM history_sources WHERE workspace=? AND (event=? OR carrier=?)",(sid,item["event"],item["event"])); state.execute("DELETE FROM lazy_events WHERE workspace=? AND event=?",(sid,item["event"])); state.execute("DELETE FROM deferred_events WHERE workspace=? AND event=?",(sid,item["event"]))
-                        if item["author"]==cfg["device"]["id"] and item["seq"]>=int((state.execute("SELECT value FROM meta WHERE key=?",(f"seq:{sid}",)).fetchone() or ["0"])[0]): state.execute("INSERT OR REPLACE INTO meta VALUES (?,?),(?,?)",(f"seq:{sid}",str(item["seq"]),f"prev:{sid}",item["event"]))
+                for item in sorted(result["events"],key=lambda value:"purge" in value):
+                    if cert:=item.get("purge"):
+                        verify_purge(cert,signer(devices,cert["author"])); support=event_support({"kind":cert["event_kind"],"payload_v":cert["payload_v"]}); anchor=state.execute("SELECT * FROM receipts WHERE workspace=? AND event=?",(sid,cert["superseded_by"])).fetchone(); target=state.execute("SELECT * FROM receipts WHERE workspace=? AND event=?",(sid,cert["event"])).fetchone(); protected={event for member in cfg["controls"][sid]["members"].values() for event in member["selected"]}
+                        if cert["workspace"]!=sid or ws["kind"]!="personal" or cert["event"] in protected or support=="required" or not anchor or (anchor["author"],anchor["kind"],anchor["payload_v"],anchor["status"])!=(cert["author"],"memory.canonical",1,"deleted") or anchor["seq"]<=cert["seq"] or target and ((target["author"],target["epoch"],target["seq"],target["kind"],target["payload_v"],target["status"])!=(cert["author"],cert["epoch"],cert["seq"],cert["event_kind"],cert["payload_v"],"active") or target["entity"].rsplit(":part:",1)[0]!=anchor["entity"]): raise ValueError("invalid purge certificate")
+                        sequence(state,sid,{"id":cert["event"],"author":cert["author"],"seq":cert["seq"],"parents":cert["parents"]}); drop_event(state,sid,cert["event"])
+                        if cert["author"]==cfg["device"]["id"] and cert["seq"]>=int((state.execute("SELECT value FROM meta WHERE key=?",(f"seq:{sid}",)).fetchone() or ["0"])[0]): state.execute("INSERT OR REPLACE INTO meta VALUES (?,?),(?,?)",(f"seq:{sid}",str(cert["seq"]),f"prev:{sid}",cert["event"]))
                         after=max(after,item["cursor"]); continue
                     env=request(cfg,{"op":"fetch","workspace":sid,"event":item["event"]})["envelope"] if item.get("lazy") else item["envelope"]
                     if (env["workspace"],env["event"])!=(sid,item.get("event",env["event"])) or not access_from(cfg,sid)<=env["epoch"]<=cfg["controls"][sid]["epoch"]: raise ValueError("event envelope response mismatch")

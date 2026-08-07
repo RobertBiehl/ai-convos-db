@@ -363,7 +363,6 @@ def remote_project(root,state,value,workspace,local_device):
     else:
         content=None
         if value["entity"]!=entity: raise ValueError("Malformed remote memory event")
-    if not active: state.execute("DELETE FROM receipts WHERE workspace=? AND author=? AND kind='memory.canonical' AND status='active' AND (entity=? OR entity LIKE ?)",(workspace,value["author"],entity,entity+":part:%"))
     db=connect(root); head=db.execute("SELECT seq,event FROM remote_heads WHERE workspace=? AND author=? AND entity=?",(workspace,value["author"],value["entity"])).fetchone()
     if head and (head["seq"] > value["seq"] or head["seq"] == value["seq"] and head["event"] == value["id"]):
         db.close(); return False
@@ -390,9 +389,9 @@ def remote_purges(root,state,workspace,kind):
     if kind!="personal": return []
     groups={}
     for event,cursor,entity,status,author,current in state.execute("SELECT r.event,r.cursor,r.entity,r.status,r.author,h.event IS NOT NULL FROM receipts r LEFT JOIN publication_heads h ON h.workspace=r.workspace AND h.event=r.event WHERE r.workspace=? AND r.kind='memory.canonical' ORDER BY r.seq",(workspace,)):
-        group=groups.setdefault(entity.rsplit(":part:",1)[0],dict(active=[])); current and group.update(latest=(status,cursor,author)); status=="active" and group["active"].append((event,author))
-    return [event for group in groups.values() if group.get("latest",(None,))[0]=="deleted" for event,author in group["active"] if author==group["latest"][2]]
-def remote_bridge(): return dict(v=3,events={("memory.canonical",1)},records=remote_records,project=remote_project,purges=remote_purges)
+        group=groups.setdefault(entity.rsplit(":part:",1)[0],dict(active=[])); current and group.update(latest=(status,cursor,author,event)); status=="active" and group["active"].append((event,author))
+    return [dict(event=event,superseded_by=group["latest"][3]) for group in groups.values() if group.get("latest",(None,))[0]=="deleted" for event,author in group["active"] if author==group["latest"][2]]
+def remote_bridge(): return dict(v=4,events={("memory.canonical",1)},records=remote_records,project=remote_project,purges=remote_purges)
 def _skill_source():
     rel = Path("skills")/"agent-convos"/"SKILL.md"; root = Path(os.environ.get("CONVOS_PROJECT_ROOT", Path.home()/".convos")).expanduser()
     roots = (root, Path(__file__).resolve().parents[4], Path(sysconfig.get_paths().get("data", ""))/"share"/"ai-convos-db", Path(site.getuserbase())/"share"/"ai-convos-db")

@@ -2,6 +2,12 @@
 
 ## 0.7.0
 
+- Replace relay-authored memory purge markers with deterministic author-signed
+  per-event certificates that bind exact envelope history to a retained signed
+  deletion event; clients verify proofs before sequence or receipt mutation,
+  selected history remains permanently protected, fresh state recovery closes
+  purged sequence slots without ciphertext, and normal forget/sync usage is
+  unchanged.
 - Avoid downloading legacy ChatGPT conversations already covered by a completed
   account-scoped sync frontier; normal sync now fetches their details only after
   new activity moves them above that frontier.
@@ -38,7 +44,7 @@
 - Add the standalone `ai-convos-redact` product and make it a mandatory remote-client dependency: local scans report only secret type and exact record location, every team event is scrubbed inside the pre-encryption publish boundary, personal sync stays lossless, redaction markers contain no secret-derived fingerprint, binary attachments are omitted without being read, and a private value-free audit ledger records automatic removals.
 - Add the optional read-only `ai-convos-explore` product with local semantic `convos related` pivots and bounded cycle-free multi-hop `convos trail` graphs from exact conversation or message IDs, with conversation fingerprints, strongest-turn evidence, text/JSON/JSONL/DOT output, injected-scaffolding exclusion, and exact-duplicate collapse; hybrid indexing and health counts now skip that scaffolding too.
 - Synchronize canonical memory automatically across configured personal devices through the existing signed end-to-end encrypted remote, with versioned optional package discovery, watcher-safe root resolution, path-free repository scope, bounded non-lazy encrypted parts for large records, out-of-order and replay convergence, tombstones, and conflict-preserving three-way resolution instead of last-write-wins.
-- Propagate user-owned memory deletion through personal sync with safe remote-only canonical and decrypted-event purging, author-bound relay ciphertext removal, permanent replay-denial tombstones, conflict preservation for local/provider/projected state, recreation support, and explicit historical-backup retention boundaries.
+- Propagate user-owned memory deletion through personal sync with safe remote-only canonical and decrypted-event purging, author-bound relay ciphertext removal, permanent signed replay-denial proofs, conflict preservation for local/provider/projected state, recreation support, and explicit historical-backup retention boundaries.
 - Restore supported older private memory snapshots through a validated in-memory migration without modifying the source snapshot, while continuing to reject malformed tables, triggers, cross-scope links, failed integrity checks, and unknown newer schemas.
 - Deliver synchronized memory automatically through Claude Code and Codex `SessionStart` hooks, with nullable Codex transcript handling, bounded live Codex trust diagnostics, one-time trust guidance, dual health reporting, and preflighted atomic-per-file configuration that prevents partial installs or removals.
 - Make bare `convos memory` a delivery-aware project health surface, keep the default command list human-sized while retaining callable agent protocol commands, and render irregular memory plurals correctly.
