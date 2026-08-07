@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import json, time, zipfile, hashlib, struct, sqlite3, subprocess, ssl, urllib.request, re, os, sysconfig, site, csv, sys, shutil, shlex, fcntl, signal, tempfile
+import base64, json, time, zipfile, hashlib, struct, sqlite3, subprocess, ssl, urllib.request, re, os, sysconfig, site, csv, sys, shutil, shlex, fcntl, signal, tempfile
 from importlib.metadata import entry_points, version
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
@@ -37,6 +37,22 @@ def atomic_write(path: Path, text):
     if path.is_symlink() or path.exists() and not path.is_file(): typer.echo(f"Refusing unsafe managed file: {path}", err=True); raise typer.Exit(1)
     path.parent.mkdir(parents=True, exist_ok=True); mode = path.stat().st_mode&0o777 if path.exists() else 0o600; fd, tmp = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent); f = os.fdopen(fd, "w"); f.write(text); f.close(); os.chmod(tmp, mode); os.replace(tmp, path)
 def atomic_json(path: Path, data): atomic_write(path, json.dumps(data))
+ATTACHMENT_LIMIT=32*1024**2
+def attachment_body(data):
+    if len(data)>ATTACHMENT_LIMIT: return None
+    root=DATA_DIR/"attachments"; root.is_symlink() and (_ for _ in ()).throw(ValueError("attachment directory must not be a symlink")); root.mkdir(parents=True,exist_ok=True); os.chmod(root,0o700); blob=hashlib.sha256(data).hexdigest(); path=root/blob
+    if path.exists():
+        if path.is_symlink() or not path.is_file() or path.stat().st_size!=len(data): raise ValueError("attachment body conflicts with content hash")
+        with path.open("rb") as source: actual=hashlib.file_digest(source,"sha256").hexdigest()
+        if actual!=blob: raise ValueError("attachment body conflicts with content hash")
+        os.chmod(path,0o600); return path
+    fd,tmp=tempfile.mkstemp(prefix=f".{blob}.",dir=root); out=os.fdopen(fd,"wb")
+    try:
+        os.chmod(tmp,0o600); out.write(data); out.flush(); os.fsync(out.fileno()); out.close(); os.replace(tmp,path); dfd=os.open(root,os.O_RDONLY)
+        try: os.fsync(dfd)
+        finally: os.close(dfd)
+        return path
+    except BaseException: out.close(); Path(tmp).unlink(missing_ok=True); raise
 
 def detect_source(path: Path):
     if path.is_dir(): return "codex" if (path / "sessions").exists() else "claude-code"
@@ -626,10 +642,13 @@ def parse_codex_session(jsonl: Path) -> dict | None:
 
     def extract_msg_text(p):
         return "\n".join(b["text"] for b in p.get("content", []) if isinstance(b, dict) and b.get("type") in ("input_text", "output_text", "text") and b.get("text"))
+    def image(i,j,b):
+        url=b["image_url"]; data=url.startswith("data:"); head,encoded=url.split(",",1) if data else ("",""); mime=head[5:-7] if head.startswith("data:image/") and head.endswith(";base64") else b.get("mime_type"); data and not mime and (_ for _ in ()).throw(ValueError("invalid Codex image data URL")); size=len(encoded.rstrip("="))*3//4 if data else None; body=base64.b64decode(encoded,validate=True) if data and len(encoded)<=4*((ATTACHMENT_LIMIT+2)//3) else None; path=attachment_body(body) if body is not None else None; ext={"image/jpeg":"jpg"}.get(mime,mime.rsplit("/",1)[-1] if mime and re.fullmatch(r"image/[a-z0-9.+-]+",mime) else "bin")
+        return dict(id=gen_id(src,f"attach:{cid}:{i}:{j}"),message_id=gen_id(src,f"{cid}:{i}"),filename=f"image-{j+1}.{ext}",mime_type=mime,size=len(body) if body is not None else size,path=str(path) if path else None,url=None if data else url,created_at=timestamps[i] if i<len(timestamps) else None)
     def norm_args(p):
         return json.loads(a) if isinstance((a := p.get("arguments", {})), str) else a
 
-    mitems = [(i, p, t) for i, p in items if p.get("type") == "message" and p.get("role") not in ("developer", "system") and (t := extract_msg_text(p))]
+    mitems = [(i, p, t) for i, p in items if p.get("type") == "message" and p.get("role") not in ("developer", "system") and ((t := extract_msg_text(p)) or any(isinstance(b,dict) and b.get("type")=="input_image" for b in p.get("content",[])))]
     if not (msgs := [dict(id=gen_id(src, f"{cid}:{i}"), conversation_id=cid, role=p["role"], content=t.strip(),
                           thinking=None, created_at=timestamps[i] if i < len(timestamps) else None, model=None, metadata="{}", parent_id=None)
                      for i, p, t in mitems]): return None
@@ -692,7 +711,7 @@ def parse_codex_session(jsonl: Path) -> dict | None:
                     created_at=timestamps[0] if timestamps else None, updated_at=timestamps[-1] if timestamps else None,
                     model=meta.get("model_provider", "openai"), cwd=meta.get("cwd"), git_branch=None, project_id=None,
                     metadata=json.dumps({"cli_version": meta.get("cli_version"), "session_id": jsonl.stem})),
-        "msgs": msgs, "tools": tools, "edits": edits}
+        "msgs": msgs, "tools": tools, "attachs":[image(i,j,b) for i,p,t in mitems for j,b in enumerate(x for x in p.get("content",[]) if isinstance(x,dict) and x.get("type")=="input_image")], "edits": edits}
 
 def parse_codex(codex_dir: Path, files: list[Path] | None = None) -> ParseResult:
     sessions_dir = codex_dir / "sessions"
@@ -701,7 +720,7 @@ def parse_codex(codex_dir: Path, files: list[Path] | None = None) -> ParseResult
                 if (s := safe_parse(f"codex session {jsonl}", parse_codex_session, jsonl))]
     return ParseResult(
         convs=[s["conv"] for s in sessions], msgs=[m for s in sessions for m in s["msgs"]],
-        tools=[t for s in sessions for t in s["tools"]], edits=[e for s in sessions for e in s["edits"]])
+        tools=[t for s in sessions for t in s["tools"]], attachs=[a for s in sessions for a in s["attachs"]], edits=[e for s in sessions for e in s["edits"]])
 
 _MSG_UPS = "INSERT INTO messages VALUES (?,?,?,?,?,?,?,?,NULL,?) ON CONFLICT(id) DO UPDATE SET conversation_id=excluded.conversation_id, role=excluded.role, content=excluded.content, thinking=excluded.thinking, created_at=excluded.created_at, model=excluded.model, metadata=excluded.metadata, parent_id=excluded.parent_id, embedding=CASE WHEN messages.content IS DISTINCT FROM excluded.content THEN NULL ELSE messages.embedding END"
 _CONV_UPS = "INSERT INTO conversations VALUES (?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET source=excluded.source,title=excluded.title,created_at=CASE WHEN conversations.created_at IS NULL OR excluded.created_at < conversations.created_at THEN excluded.created_at ELSE conversations.created_at END,updated_at=CASE WHEN conversations.updated_at IS NULL OR excluded.updated_at > conversations.updated_at THEN excluded.updated_at ELSE conversations.updated_at END,model=COALESCE(excluded.model,conversations.model),cwd=COALESCE(excluded.cwd,conversations.cwd),git_branch=COALESCE(excluded.git_branch,conversations.git_branch),project_id=COALESCE(excluded.project_id,conversations.project_id),metadata=excluded.metadata"
@@ -732,7 +751,7 @@ def upsert(conn, r: ParseResult):
     return len(r.convs), len(r.msgs), len(r.tools), len(r.attachs), len(r.edits), len(new_convs), len(updated), changed_msgs
 
 def hook_root(source): return Path(os.environ.get("CLAUDE_CONFIG_DIR", Path.home()/".claude"))/"projects" if source == "claude-code" else Path(os.environ.get("CODEX_HOME", Path.home()/".codex"))/"sessions"
-def hook_result(source, path): s = (parse_claude_code_session if source == "claude-code" else parse_codex_session)(path); return ParseResult(convs=[s["conv"]], msgs=s["msgs"], tools=s["tools"], edits=s["edits"]) if s else ParseResult()
+def hook_result(source, path): s = (parse_claude_code_session if source == "claude-code" else parse_codex_session)(path); return ParseResult(convs=[s["conv"]], msgs=s["msgs"], tools=s["tools"], attachs=s.get("attachs",[]), edits=s["edits"]) if s else ParseResult()
 def enqueue_hook(source, payload):
     path = Path(payload["transcript_path"]).expanduser().resolve(); root = hook_root(source).expanduser().resolve()
     if source not in ("claude-code", "codex") or path.suffix != ".jsonl" or not path.is_relative_to(root): raise ValueError(f"Invalid {source} transcript path")
