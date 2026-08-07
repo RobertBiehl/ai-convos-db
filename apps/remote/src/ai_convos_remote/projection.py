@@ -6,17 +6,16 @@ from importlib.metadata import entry_points
 from pathlib import Path
 
 import duckdb
-from ai_convos.cli import ARCHIVE_COLUMNS as COLUMNS, PROVENANCE_KINDS as PROVENANCE, init_schema, observe_provenance, project_archive_row, project_provenance, set_attachment_path
+from ai_convos.cli import ARCHIVE_COLUMNS as COLUMNS, PROVENANCE_KINDS as PROVENANCE, init_schema, observe_provenance, project_archive_row, project_provenance, repository as resolve_repository, set_attachment_path
 from ai_convos_changegraph.provenance import query as graph_query
 from .protocol import digest
 
-STATE_VERSION="7"
+STATE_VERSION="8"
 STATE = """
 CREATE TABLE IF NOT EXISTS outbox(workspace TEXT,event TEXT,entity TEXT,revision TEXT,author TEXT,seq INT,epoch INT,kind TEXT,payload_v INT,status TEXT,path TEXT,size INT,PRIMARY KEY(workspace,event)) WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS receipts(workspace TEXT,event TEXT,cursor INT,author TEXT,seq INT,epoch INT,kind TEXT,payload_v INT,entity TEXT,revision TEXT,status TEXT,PRIMARY KEY(workspace,event)) WITHOUT ROWID;
 CREATE INDEX IF NOT EXISTS receipt_cursor ON receipts(workspace,cursor);
 CREATE TABLE IF NOT EXISTS history_sources(workspace TEXT,event TEXT,carrier TEXT,PRIMARY KEY(workspace,event)) WITHOUT ROWID;
-CREATE TABLE IF NOT EXISTS history_queue(workspace TEXT,target TEXT,event TEXT,PRIMARY KEY(workspace,target,event)) WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS publication_heads(workspace TEXT,owner TEXT,entity TEXT,revision TEXT,event TEXT,PRIMARY KEY(workspace,owner,entity)) WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS cursors(workspace TEXT PRIMARY KEY,cursor INT) WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS heads(workspace TEXT,author_user TEXT,entity TEXT,sort_key TEXT,event TEXT,PRIMARY KEY(workspace,author_user,entity)) WITHOUT ROWID;
@@ -26,15 +25,14 @@ CREATE TABLE IF NOT EXISTS event_sequences(workspace TEXT,author TEXT,seq INT,ev
 CREATE TABLE IF NOT EXISTS sequence_gaps(workspace TEXT,author TEXT,seq INT,parents TEXT,PRIMARY KEY(workspace,author,seq)) WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS attachment_parts(workspace TEXT,author TEXT,blob TEXT,idx INT,total INT,attachment TEXT,sha256 TEXT,size INT,chunk_hash TEXT,path TEXT,PRIMARY KEY(workspace,author,blob,idx)) WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS attachment_blobs(workspace TEXT,author TEXT,attachment TEXT,path TEXT,PRIMARY KEY(workspace,author,attachment)) WITHOUT ROWID;
-CREATE TABLE IF NOT EXISTS policies(workspace TEXT,kind TEXT,value TEXT,local_root TEXT,PRIMARY KEY(workspace,kind,value)) WITHOUT ROWID;
-CREATE TABLE IF NOT EXISTS sharing_boundaries(id TEXT PRIMARY KEY,workspace TEXT,turn_id TEXT,hidden_count INT) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS policies(workspace TEXT,kind TEXT,value TEXT,PRIMARY KEY(workspace,kind,value)) WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS sync_states(workspace TEXT PRIMARY KEY,lifecycle TEXT NOT NULL,tail INT NOT NULL DEFAULT 0,floor INT NOT NULL DEFAULT 0,error TEXT) WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY,value TEXT) WITHOUT ROWID;
 """
-STATE_TABLES={"outbox","receipts","history_sources","history_queue","publication_heads","cursors","heads","lazy_events","deferred_events","event_sequences","sequence_gaps","attachment_parts","attachment_blobs","policies","sharing_boundaries","sync_states","meta"}
-STATE_FORBIDDEN={"published","event_log","history_material","history_outbox","attachment_chunks","imported_rows","raw_events","repositories","files","file_versions","changesets","edits","checkpoints","assertions","gaps","boundaries"}
+STATE_TABLES={"outbox","receipts","history_sources","publication_heads","cursors","heads","lazy_events","deferred_events","event_sequences","sequence_gaps","attachment_parts","attachment_blobs","policies","sync_states","meta"}
+STATE_FORBIDDEN={"published","event_log","history_material","history_outbox","history_queue","attachment_chunks","imported_rows","raw_events","repositories","files","file_versions","changesets","edits","checkpoints","assertions","gaps","boundaries","sharing_boundaries"}
 TABLES={"conversation.record":"conversations","message.record":"messages","tool.record":"tool_calls","attachment.record":"attachments","artifact.record":"artifacts","file_edit.record":"file_edits"}
-CORE_EVENTS={(kind,1) for kind in set(TABLES)|PROVENANCE|{"workspace.policy","workspace.membership","workspace.device","turn.boundary","attachment.chunk","history.republish"}}; AUXILIARY_EVENTS={"memory.canonical"}
+CORE_EVENTS={(kind,1) for kind in set(TABLES)|PROVENANCE|{"workspace.policy","workspace.membership","workspace.device","attachment.chunk","history.republish"}}; AUXILIARY_EVENTS={"memory.canonical"}
 FKS={"messages":(("conversation_id","conversations"),("parent_id","messages")),"tool_calls":(("message_id","messages"),),"attachments":(("message_id","messages"),),"artifacts":(("conversation_id","conversations"),),"file_edits":(("message_id","messages"),)}
 
 def _connect(path,journal="WAL"):
@@ -110,6 +108,30 @@ def clean(v):
     return v
 def file_hash(path):
     with Path(path).open("rb") as source: return hashlib.file_digest(source,"sha256").hexdigest()
+def relocate_attachments(db_path,remote_root):
+    db_path,remote_root=Path(db_path),Path(remote_root)
+    if not db_path.is_file() or not remote_root.exists(): return 0
+    if remote_root.is_symlink() or not remote_root.is_dir(): raise ValueError("legacy attachment root must be a regular directory")
+    db=duckdb.connect(str(db_path)); rows=db.execute("SELECT id,path,size FROM attachments WHERE path IS NOT NULL").fetchall(); moved=[]; target_root=db_path.parent/"attachments"; begun=False
+    try:
+        for row_id,value,size in rows:
+            source=Path(value)
+            if not source.is_absolute(): continue
+            if not source.is_relative_to(remote_root.absolute()): continue
+            if source.is_symlink() or not source.is_file() or source.resolve()!=source or size is not None and source.stat().st_size!=size: raise ValueError("legacy attachment body is unsafe or inconsistent")
+            if target_root.is_symlink(): raise ValueError("archive attachment root must not be a symlink")
+            target_root.mkdir(parents=True,exist_ok=True); os.chmod(target_root,0o700); blob=file_hash(source); target=target_root/blob
+            if target.exists():
+                if target.is_symlink() or not target.is_file() or target.stat().st_size!=source.stat().st_size or file_hash(target)!=blob: raise ValueError("archive attachment body conflicts")
+            else:
+                tmp=target.with_name(f".{target.name}.{os.getpid()}"); shutil.copyfile(source,tmp); os.chmod(tmp,0o600); _fsync(tmp); os.replace(tmp,target); _fsync(target_root)
+            os.chmod(target,0o600); moved.append((row_id,source,target))
+        db.execute("BEGIN"); begun=True; [set_attachment_path(db,row_id,target) for row_id,source,target in moved]; db.execute("COMMIT"); begun=False
+    except BaseException:
+        if begun: db.execute("ROLLBACK")
+        raise
+    finally: db.close()
+    [source.unlink(missing_ok=True) for row_id,source,target in moved if source!=target]; return len(moved)
 def _records(core,state,blobs=True):
     out=[]; imported=set(core.execute("SELECT table_name,physical_row_id FROM remote.row_origins").fetchall())
     for kind,table in TABLES.items():
@@ -121,38 +143,25 @@ def _records(core,state,blobs=True):
                 data=attachment.read_bytes(); blob=hashlib.sha256(data).hexdigest(); chunks=[data[i:i+49152] for i in range(0,len(data),49152)] or [b""]
                 out += [dict(kind="attachment.chunk",entity=f"attachment:{row['id']}:{blob}:{i}",payload={"attachment":row["id"],"blob":blob,"index":i,"total":len(chunks),"sha256":blob,"size":len(data),"data":base64.b64encode(chunk).decode()}) for i,chunk in enumerate(chunks)]
     return out
+def _under(path,cwd,roots):
+    p=Path(path); p=(Path(cwd)/p if not p.is_absolute() and cwd else p).expanduser().resolve(); return any(p.is_relative_to(root) for root in roots)
 def _team_scope(core,provenance,repositories,roots):
-    origins={r["payload"]["id"] for r in provenance if r["kind"]=="edit.observed" and r["payload"]["repository"] in repositories}; rows=core.execute("SELECT fe.id,fe.file_path,m.id,m.conversation_id,c.cwd FROM file_edits fe JOIN messages m ON m.id=fe.message_id JOIN conversations c ON c.id=m.conversation_id").fetchall()
-    for eid,path,mid,cid,cwd in rows:
-        p=Path(path); p=(Path(cwd)/p if not p.is_absolute() and cwd else p).expanduser().resolve()
-        if any(p.is_relative_to(Path(root).expanduser().resolve()) for root in roots): origins.add(eid)
-    turns={mid for eid,path,mid,cid,cwd in rows if eid in origins}; convs={cid for eid,path,mid,cid,cwd in rows if eid in origins}
-    users=set()
-    for turn in turns:
-        if row:=core.execute("SELECT conversation_id FROM messages WHERE id=?",(turn,)).fetchone():
-            if prompt:=core.execute("SELECT id FROM messages WHERE conversation_id=? AND role='user' AND created_at<=(SELECT created_at FROM messages WHERE id=?) ORDER BY created_at DESC LIMIT 1",(row[0],turn)).fetchone(): users.add(prompt[0])
-    return convs,turns|users,origins
+    roots=[Path(p).expanduser().resolve() for p in roots]; checkouts=[Path(r[0]).expanduser().resolve() for r in core.execute("SELECT root FROM provenance.repository_checkouts WHERE repository IN (SELECT UNNEST(?))",[list(repositories)]).fetchall()] if repositories else []; allowed=roots+checkouts; edit_repos={r["payload"]["id"]:r["payload"]["repository"] for r in provenance if r["kind"]=="edit.observed"}; rows=core.execute("SELECT fe.id,fe.file_path,m.conversation_id,c.cwd FROM file_edits fe JOIN messages m ON m.id=fe.message_id JOIN conversations c ON c.id=m.conversation_id").fetchall(); cwd_rows=core.execute("SELECT id,cwd FROM conversations WHERE cwd IS NOT NULL").fetchall(); cwd_repos={cwd:repo["id"] if (repo:=resolve_repository(cwd)) else None for cwd in {cwd for cid,cwd in cwd_rows if not allowed or not _under(cwd,None,allowed)}}
+    return {cid for eid,path,cid,cwd in rows if edit_repos.get(eid) in repositories or _under(path,cwd,roots)}|{cid for cid,cwd in cwd_rows if allowed and _under(cwd,None,allowed) or cwd_repos.get(cwd) in repositories}
 def scan(core,graph,kind="personal",repositories=(),roots=()):
     provenance=observe_provenance(core); records=_records(core,graph,kind=="personal")
     edit_paths={r["payload"]["id"]:r["payload"]["file"] for r in provenance if r["kind"]=="edit.observed"}; file_paths={r["payload"]["id"]:r["payload"]["path"] for r in provenance if r["kind"]=="file.observed"}
     for r in records:
         if r["kind"]=="file_edit.record" and (fid:=edit_paths.get(r["payload"]["row"][0])): r["payload"]["row"][2]=file_paths[fid]
     if kind=="personal": return records+provenance
-    convs,msgs,origins=_team_scope(core,provenance,set(repositories),roots); keep=[]
-    allowed_attachments=set()
+    convs=_team_scope(core,provenance,set(repositories),roots); keep=[]; msgs={r["payload"]["row"][0] for r in records if r["kind"]=="message.record" and r["payload"]["row"][1] in convs}; edits={r["payload"]["row"][0] for r in records if r["kind"]=="file_edit.record" and r["payload"]["row"][1] in msgs}
     for r in records:
-        if r["kind"]=="attachment.chunk":
-            if r["payload"]["attachment"] in allowed_attachments: keep.append(r)
-            continue
         table,row=r["payload"]["table"],r["payload"]["row"]
-        if table=="conversations" and row[0] in convs or table=="messages" and row[0] in msgs or table in ("tool_calls","attachments") and row[1] in msgs or table=="file_edits" and row[0] in origins or table=="artifacts" and row[1] in convs: keep.append(r); table=="attachments" and allowed_attachments.add(row[0])
-    allowed_files={r["payload"]["file"] for r in provenance if r["kind"]=="edit.observed" and r["payload"]["id"] in origins}; allowed_repos=set(repositories)
+        if table=="conversations" and row[0] in convs or table=="messages" and row[0] in msgs or table in ("tool_calls","attachments","file_edits") and row[1] in msgs or table=="artifacts" and row[1] in convs: keep.append(r)
+    allowed_files={r["payload"]["file"] for r in provenance if r["kind"]=="edit.observed" and r["payload"]["id"] in edits}; allowed_repos={r["payload"]["repository"] for r in provenance if r["kind"]=="edit.observed" and r["payload"]["id"] in edits}; allowed_entities=edits|allowed_files|allowed_repos
     for r in provenance:
         p,k=r["payload"],r["kind"]
-        if k=="edit.observed" and p["id"] in origins or k=="file.observed" and p["id"] in allowed_files or k=="file.version" and p["file"] in allowed_files or k in ("repository.observed","git.checkpoint","capture.gap") and p.get("repository",p.get("id")) in allowed_repos or k=="checkpoint.link" and p["edit"] in origins: keep.append(r)
-    for turn in {r["payload"]["turn"] for r in provenance if r["kind"]=="edit.observed"}:
-        total=sum(r["kind"]=="edit.observed" and r["payload"]["turn"]==turn for r in provenance); visible=sum(r["kind"]=="edit.observed" and r["payload"]["turn"]==turn and r["payload"]["id"] in origins for r in provenance)
-        if total>visible: keep.append(dict(kind="turn.boundary",entity=digest({"turn":turn,"visible":sorted(origins)}),payload={"turn":turn,"hidden_count":total-visible}))
+        if k=="edit.observed" and p["id"] in edits or k=="file.observed" and p["id"] in allowed_files or k=="file.version" and p["file"] in allowed_files or k in ("repository.observed","git.checkpoint","capture.gap") and p.get("repository",p.get("id")) in allowed_repos or k=="checkpoint.link" and p["edit"] in edits or k=="identity.assertion" and (p["left"] in allowed_entities or p["right"] in allowed_entities): keep.append(r)
     return keep
 def author_user(value,authors): return (authors or {}).get(value["author"]) or (_ for _ in ()).throw(ValueError("verified author user required"))
 def foreign_id(workspace,author_user,table,old): return digest(f"{workspace}:{author_user}:{table}:{old}")[:16] if old else old
@@ -175,7 +184,7 @@ def sequence(state,workspace,value):
     if after: state.execute("DELETE FROM sequence_gaps WHERE workspace=? AND author=? AND seq=?",(workspace,value["author"],value["seq"]+1))
     return True
 def reset_history(state,workspace,boundary):
-    [state.execute(f"DELETE FROM {table} WHERE workspace=?",(workspace,)) for table in ("receipts","history_sources","cursors","heads","lazy_events","deferred_events","event_sequences","sequence_gaps","sharing_boundaries")]; [state.execute("INSERT INTO event_sequences VALUES (?,?,?,?)",(workspace,author,head["seq"],head["event"])) for author,head in boundary["heads"].items()]
+    [state.execute(f"DELETE FROM {table} WHERE workspace=?",(workspace,)) for table in ("receipts","history_sources","cursors","heads","lazy_events","deferred_events","event_sequences","sequence_gaps")]; [state.execute("INSERT INTO event_sequences VALUES (?,?,?,?)",(workspace,author,head["seq"],head["event"])) for author,head in boundary["heads"].items()]
 def verify_history(state,workspace,controls,start):
     gaps=state.execute("SELECT author,seq FROM sequence_gaps WHERE workspace=? ORDER BY author,seq LIMIT 1",(workspace,)).fetchone()
     if gaps: raise ValueError(f"required event sequence is incomplete at {gaps[0]}:{gaps[1]}")
@@ -212,15 +221,15 @@ def project(db_path,state,value,workspace,local_device=None,db=None,root=None,ba
     if event_support(value)!="supported": return False
     if value["kind"] in TABLES: return apply_record(db_path,state,value,workspace,local_device,db,authors,recover,local_user)
     if value["kind"]=="workspace.policy":
-        p=value["payload"]; state.execute("INSERT OR REPLACE INTO policies VALUES (?,?,?,COALESCE((SELECT local_root FROM policies WHERE workspace=? AND kind=? AND value=?),NULL))",(workspace,p["kind"],p["value"],workspace,p["kind"],p["value"])); batch or state.commit(); return True
-    if value["kind"]=="turn.boundary":
-        p=value["payload"]; state.execute("INSERT OR IGNORE INTO sharing_boundaries VALUES (?,?,?,?)",(value["entity"],workspace,foreign_id(workspace,author_user(value,authors),"messages",p["turn"]),p["hidden_count"])); batch or state.commit(); return True
+        p=value["payload"]; state.execute("INSERT OR REPLACE INTO policies VALUES (?,?,?)",(workspace,p["kind"],p["value"])); batch or state.commit(); return True
     if value["kind"]=="attachment.chunk":
         p=value["payload"]; user=author_user(value,authors); owned=bool(recover and user==local_user); native=owned and recover=="native"
         if owned and recover=="adopt": return False
         if value["author"]==local_device and not owned: return False
-        data=base64.b64decode(p["data"],validate=True); expected=f"attachment:{p['attachment']}:{p['blob']}:{p['index']}"; base=Path(db_path).parent.parent/"remote/attachments"; safe=base/digest(workspace)[:32]; path=safe/p["blob"]; parts=safe/".parts"/value["author"]/p["blob"]
+        data=base64.b64decode(p["data"],validate=True); expected=f"attachment:{p['attachment']}:{p['blob']}:{p['index']}"; base=Path(db_path).parent/"attachments"; parts=Path(db_path).parent.parent/"remote/attachments/.parts"/digest(workspace)[:32]/value["author"]/p["blob"]; path=base/p["blob"]
         if value["entity"]!=expected or p["blob"]!=p["sha256"] or len(p["blob"])!=64 or any(c not in "0123456789abcdef" for c in p["blob"]) or not 0<=p["index"]<p["total"] or p["size"]<0 or len(data)>49152: raise ValueError("attachment chunk schema mismatch")
+        if base.is_symlink() or (working:=Path(db_path).parent.parent/"remote/attachments").is_symlink() or any(x.is_symlink() for x in (parts,*parts.parents) if x==working or x.is_relative_to(working)): raise ValueError("attachment directory must not be a symlink")
+        base.mkdir(parents=True,exist_ok=True); os.chmod(base,0o700); working.mkdir(parents=True,exist_ok=True); os.chmod(working,0o700)
         if path.exists():
             if path.is_symlink() or path.stat().st_size!=p["size"] or file_hash(path)!=p["sha256"]: raise ValueError("attachment file conflict")
             stale=state.execute("SELECT path FROM attachment_parts WHERE workspace=? AND author=? AND blob=?",(workspace,value["author"],p["blob"])).fetchall(); state.execute("INSERT OR REPLACE INTO attachment_blobs VALUES (?,?,?,?)",(workspace,value["author"],p["attachment"],str(path))); state.execute("DELETE FROM attachment_parts WHERE workspace=? AND author=? AND blob=?",(workspace,value["author"],p["blob"])); [Path(r[0]).unlink(missing_ok=True) for r in stale if Path(r[0]).parent==parts]; target=p["attachment"] if native else foreign_id(workspace,user,"attachments",p["attachment"]); attachment_path(db_path,db,target,path)
@@ -238,9 +247,9 @@ def project(db_path,state,value,workspace,local_device=None,db=None,root=None,ba
             try:
                 for row in rows:
                     with Path(row[1]).open("rb") as source: shutil.copyfileobj(source,out,65536)
-                out.close()
+                out.flush(); os.fsync(out.fileno()); out.close()
                 if tmp.stat().st_size!=p["size"] or file_hash(tmp)!=p["sha256"]: raise ValueError("attachment hash mismatch")
-                os.replace(tmp,path)
+                os.replace(tmp,path); _fsync(base)
             except BaseException: out.close(); tmp.unlink(missing_ok=True); raise
             state.execute("INSERT OR REPLACE INTO attachment_blobs VALUES (?,?,?,?)",(workspace,value["author"],p["attachment"],str(path))); state.execute("DELETE FROM attachment_parts WHERE workspace=? AND author=? AND blob=?",(workspace,value["author"],p["blob"])); [Path(r[1]).unlink(missing_ok=True) for r in rows]; target=p["attachment"] if native else foreign_id(workspace,user,"attachments",p["attachment"]); attachment_path(db_path,db,target,path)
         batch or state.commit(); return True
