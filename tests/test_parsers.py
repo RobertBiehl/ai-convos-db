@@ -186,6 +186,15 @@ class TestCodexParser:
         assert result.convs[0]["cwd"] == "/test"
         assert result.convs[0]["model"] == "openai"
 
+    def test_input_images_become_bounded_durable_attachments(self,tmp_path,monkeypatch):
+        import ai_convos.cli as cli
+        raw=b"\x89PNG\r\n\x1a\ncapture"; monkeypatch.setattr(cli,"DATA_DIR",tmp_path/"archive"); monkeypatch.setattr(cli,"ATTACHMENT_LIMIT",len(raw)); sessions=tmp_path/".codex/sessions"; sessions.mkdir(parents=True); session=sessions/"image.jsonl"
+        session.write_text(json.dumps({"type":"response_item","timestamp":"2026-01-01T00:00:00Z","payload":{"type":"message","role":"user","content":[{"type":"input_image","image_url":"data:image/png;base64,"+__import__("base64").b64encode(raw).decode()},{"type":"input_image","image_url":"data:image/png;base64,"+__import__("base64").b64encode(raw+b"x").decode()}]}}))
+        result=cli.parse_codex(tmp_path/".codex"); assert len(result.msgs)==1 and result.msgs[0]["content"]=="" and len(result.attachs)==2
+        saved,large=result.attachs; path=Path(saved["path"]); assert (saved["message_id"],saved["filename"],saved["mime_type"],saved["size"],path.read_bytes())==(result.msgs[0]["id"],"image-1.png","image/png",len(raw),raw)
+        assert path.parent==tmp_path/"archive/attachments" and path.stat().st_mode&0o777==0o600 and path.parent.stat().st_mode&0o777==0o700 and large["path"] is None and large["size"]==len(raw)+1 and not saved["url"]
+        assert len(cli.hook_result("codex",session).attachs)==2 and len(list(path.parent.iterdir()))==1
+
     def test_parse_function_calls(self, tmp_path):
         """Parse Codex session with function calls."""
         from ai_convos.cli import parse_codex
