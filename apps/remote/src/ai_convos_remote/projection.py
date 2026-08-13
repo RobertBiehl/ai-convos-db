@@ -7,6 +7,7 @@ from pathlib import Path
 
 from ai_convos.cli import ARCHIVE_COLUMNS as COLUMNS, PROVENANCE_KINDS as PROVENANCE, init_schema, observe_provenance, open_db, project_archive_row, project_logical_row, project_provenance, project_row_proof, project_workspace_controls, repository as resolve_repository, set_attachment_path
 from ai_convos_changegraph.provenance import query as graph_query
+from .control import verify_state
 from .protocol import digest, fingerprint, logical_row, row_proof, seal_replica, verify_row_proof
 
 STATE_VERSION="1"
@@ -25,11 +26,12 @@ CREATE TABLE IF NOT EXISTS attachment_parts(workspace TEXT,author TEXT,blob TEXT
 CREATE TABLE IF NOT EXISTS attachment_blobs(workspace TEXT,author TEXT,attachment TEXT,path TEXT,PRIMARY KEY(workspace,author,attachment)) WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS replica_outbox(workspace TEXT,replica TEXT,epoch INT,uploader TEXT,path TEXT,size INT,PRIMARY KEY(workspace,replica,epoch,uploader)) WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS replica_receipts(workspace TEXT,replica TEXT,epoch INT,cursor INT,PRIMARY KEY(workspace,replica,epoch)) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS origin_bindings(workspace TEXT,origin TEXT,bundle TEXT,epoch INT,cursor INT,PRIMARY KEY(workspace,origin)) WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS policies(workspace TEXT,kind TEXT,value TEXT,PRIMARY KEY(workspace,kind,value)) WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS sync_states(workspace TEXT PRIMARY KEY,lifecycle TEXT NOT NULL,tail INT NOT NULL DEFAULT 0,floor INT NOT NULL DEFAULT 0,error TEXT) WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY,value TEXT) WITHOUT ROWID;
 """
-STATE_TABLES={"outbox","receipts","publication_heads","cursors","heads","lazy_events","deferred_events","event_sequences","sequence_gaps","attachment_parts","attachment_blobs","replica_outbox","replica_receipts","policies","sync_states","meta"}
+STATE_TABLES={"outbox","receipts","publication_heads","cursors","heads","lazy_events","deferred_events","event_sequences","sequence_gaps","attachment_parts","attachment_blobs","replica_outbox","replica_receipts","origin_bindings","policies","sync_states","meta"}
 STATE_FORBIDDEN={"published","event_log","history_material","history_outbox","history_queue","attachment_chunks","imported_rows","raw_events","repositories","files","file_versions","changesets","edits","checkpoints","assertions","gaps","boundaries","sharing_boundaries"}
 TABLES={"conversation.record":"conversations","message.record":"messages","tool.record":"tool_calls","attachment.record":"attachments","artifact.record":"artifacts","file_edit.record":"file_edits"}
 CORE_EVENTS={(kind,1) for kind in set(TABLES)|PROVENANCE|{"workspace.policy","workspace.membership","workspace.device","attachment.chunk"}}; AUXILIARY_EVENTS={"memory.canonical"}
@@ -91,6 +93,14 @@ def bridges():
     result=[entry.load()() for entry in entry_points(group="convos.remote")]
     if any(set(b)!={"v","events","records","project","purges"} or b["v"]!=1 or isinstance(b["v"],bool) or any(not callable(b[k]) for k in ("records","project","purges")) or any(not isinstance(e,tuple) or len(e)!=2 or not isinstance(e[0],str) or not isinstance(e[1],int) or isinstance(e[1],bool) or e[1]<1 for e in b["events"]) for b in result): raise ValueError("Unsupported remote bridge")
     return result
+def control_chain(controls):
+    ordered=sorted(controls,key=lambda c:c["revision"]); previous=None
+    if not ordered or [c["revision"] for c in ordered]!=list(range(1,len(ordered)+1)) or len({c["workspace"] for c in ordered})!=1: raise ValueError("invalid origin control chain")
+    for value in ordered: verify_state(value,previous); previous=value
+    return ordered
+def stored_controls(db_path,origins):
+    if not origins or not Path(db_path).is_file(): return []
+    with open_db(db_path,True) as db: return [json.loads(r[0]) for r in db.execute(f"SELECT CAST(control AS VARCHAR) FROM remote.workspace_controls WHERE workspace_id IN ({','.join('?'*len(origins))}) ORDER BY workspace_id,revision",list(origins)).fetchall()]
 def event_support(value):
     kind,version=value["kind"],value["payload_v"]
     if not isinstance(kind,str) or not isinstance(version,int) or isinstance(version,bool) or version<1: raise ValueError("invalid event schema")
@@ -163,42 +173,44 @@ def scan(core,graph,kind="personal",repositories=(),roots=()):
         p,k=r["payload"],r["kind"]
         if k=="edit.observed" and p["id"] in edits or k=="file.observed" and p["id"] in allowed_files or k=="file.version" and p["file"] in allowed_files or k in ("repository.observed","git.checkpoint") and p.get("repository",p.get("id")) in allowed_repos or k=="checkpoint.link" and p["edit"] in edits: keep.append(r)
     return keep
-def attest_rows(db_path,cfg,workspace,records):
+def attest_rows(db_path,cfg,workspace,records,origins=()):
     controls=next(w["controls"] for w in cfg["server_state"]["workspaces"] if w["id"]==workspace); device=cfg["device"]; signer=cfg["controls"][workspace]["devices"][device["id"]]; db=open_db(db_path); init_schema(db); made=0; db.execute("BEGIN")
     try:
         project_workspace_controls(db,controls)
+        scopes=(workspace,*origins); marks=','.join('?'*len(scopes))
         for record in (r for r in records if r["kind"] in TABLES):
-            p=record["payload"]; row=logical_row(p["table"],p["columns"],p["row"]); heads=db.execute("SELECT DISTINCT p.revision,p.content_hash FROM remote.row_proofs p WHERE p.workspace_id=? AND p.row_kind=? AND p.source_row_id=? AND p.author_user_id=? AND NOT EXISTS (SELECT 1 FROM remote.row_proofs c WHERE c.workspace_id=p.workspace_id AND c.row_kind=p.row_kind AND c.source_row_id=p.source_row_id AND c.author_user_id=p.author_user_id AND c.previous_revision=p.revision)",(workspace,row["kind"],row["id"],cfg["user"])).fetchall(); current=digest(row)
-            if any(h[1]==current for h in heads): continue
+            p=record["payload"]; row=logical_row(p["table"],p["columns"],p["row"]); heads=db.execute(f"SELECT DISTINCT p.workspace_id,p.revision,p.content_hash FROM remote.row_proofs p WHERE p.workspace_id IN ({marks}) AND p.row_kind=? AND p.source_row_id=? AND p.author_user_id=? AND NOT EXISTS (SELECT 1 FROM remote.row_proofs c WHERE c.workspace_id=p.workspace_id AND c.row_kind=p.row_kind AND c.source_row_id=p.source_row_id AND c.author_user_id=p.author_user_id AND c.previous_revision=p.revision)",(*scopes,row["kind"],row["id"],cfg["user"])).fetchall(); current=digest(row)
+            if any(h[2]==current for h in heads): continue
             if len(heads)>1: raise ValueError(f"row revision conflict: {row['kind']}:{row['id']}")
-            proof=row_proof(device,cfg["user"],workspace,cfg["workspaces"][workspace]["epoch"],row,heads[0][0] if heads else None); project_row_proof(db,proof,signer["root_public"],signer["certificate"]); made+=1
+            proof=row_proof(device,cfg["user"],heads[0][0] if heads else workspace,cfg["workspaces"][workspace]["epoch"],row,heads[0][1] if heads else None,workspace); project_row_proof(db,proof,signer["root_public"],signer["certificate"]); made+=1
         db.execute("COMMIT"); return made
     except BaseException: db.execute("ROLLBACK"); raise
     finally: db.close()
-def row_replicas(db_path,cfg,workspace,records,key,known=()):
-    fields=("workspace","row_kind","row_id","encoding_v","content_hash","revision","previous_revision","state","author_user_id","author_device_id","authorization_epoch","signature"); db=open_db(db_path,True); bodies={}
+def row_replicas(db_path,cfg,workspace,records,key,known=(),origins=()):
+    fields=("workspace","authorization_workspace","row_kind","row_id","encoding_v","content_hash","revision","previous_revision","state","author_user_id","author_device_id","authorization_epoch","signature"); db=open_db(db_path,True); bodies={}
     proof=lambda values:{"v":1,"kind":"row.proof",**dict(zip(fields,values))}
     keep=lambda row,p:bodies.setdefault(fingerprint(key,digest(p)),(row,p))
     try:
+        scopes=(workspace,*origins); marks=','.join('?'*len(scopes))
         for record in (r for r in records if r["kind"] in TABLES):
-            p=record["payload"]; row=logical_row(p["table"],p["columns"],p["row"]); values=db.execute("SELECT workspace_id,row_kind,source_row_id,encoding_v,content_hash,revision,previous_revision,state,author_user_id,author_device_id,authorization_epoch,signature FROM remote.row_proofs p WHERE workspace_id=? AND row_kind=? AND source_row_id=? AND author_user_id=? AND content_hash=? AND NOT EXISTS (SELECT 1 FROM remote.row_proofs c WHERE c.previous_revision=p.revision)",(workspace,row["kind"],row["id"],cfg["user"],digest(row))).fetchall()
+            p=record["payload"]; row=logical_row(p["table"],p["columns"],p["row"]); values=db.execute(f"SELECT workspace_id,authorization_workspace_id,row_kind,source_row_id,encoding_v,content_hash,revision,previous_revision,state,author_user_id,author_device_id,authorization_epoch,signature FROM remote.row_proofs p WHERE workspace_id IN ({marks}) AND row_kind=? AND source_row_id=? AND author_user_id=? AND content_hash=? AND NOT EXISTS (SELECT 1 FROM remote.row_proofs c WHERE c.workspace_id=p.workspace_id AND c.previous_revision=p.revision)",(*scopes,row["kind"],row["id"],cfg["user"],digest(row))).fetchall()
             if len(values)!=1: raise ValueError(f"current row proof unavailable: {row['kind']}:{row['id']}")
             keep(row,proof(values[0]))
-        for table,physical,source,pid,user in db.execute("SELECT table_name,physical_row_id,source_row_id,proof_id,author_user_id FROM remote.row_origins WHERE workspace_id=? AND proof_id IS NOT NULL",(workspace,)).fetchall():
-            values=db.execute("SELECT workspace_id,row_kind,source_row_id,encoding_v,content_hash,revision,previous_revision,state,author_user_id,author_device_id,authorization_epoch,signature FROM remote.row_proofs WHERE id=?",(pid,)).fetchone(); p=proof(values); cur=db.execute(f"SELECT * EXCLUDE (embedding) FROM {table} WHERE id=?",(physical,)) if table=="messages" else db.execute(f"SELECT * FROM {table} WHERE id=?",(physical,)); cols=[d[0] for d in cur.description]; raw=cur.fetchone()
+        for table,physical,source,pid,user,origin in db.execute(f"SELECT table_name,physical_row_id,source_row_id,proof_id,author_user_id,workspace_id FROM remote.row_origins WHERE workspace_id IN ({marks}) AND proof_id IS NOT NULL",scopes).fetchall():
+            values=db.execute("SELECT workspace_id,authorization_workspace_id,row_kind,source_row_id,encoding_v,content_hash,revision,previous_revision,state,author_user_id,author_device_id,authorization_epoch,signature FROM remote.row_proofs WHERE id=?",(pid,)).fetchone(); p=proof(values); cur=db.execute(f"SELECT * EXCLUDE (embedding) FROM {table} WHERE id=?",(physical,)) if table=="messages" else db.execute(f"SELECT * FROM {table} WHERE id=?",(physical,)); cols=[d[0] for d in cur.description]; raw=cur.fetchone()
             if p["state"]=="deleted": row=logical_row(table,identity=source,state="deleted")
             elif raw:
                 raw=list(map(clean,raw)); raw[cols.index("id")]=source
                 for column,parent in FKS.get(table,()):
-                    i=cols.index(column); mapped=db.execute("SELECT source_row_id FROM remote.row_origins WHERE table_name=? AND physical_row_id=? AND workspace_id=? AND author_user_id=?",(parent,raw[i],workspace,user)).fetchone(); raw[i]=mapped[0] if mapped else raw[i]
+                    i=cols.index(column); mapped=db.execute("SELECT source_row_id FROM remote.row_origins WHERE table_name=? AND physical_row_id=? AND workspace_id=? AND author_user_id=?",(parent,raw[i],origin,user)).fetchone(); raw[i]=mapped[0] if mapped else raw[i]
                 row=logical_row(table,cols,raw,source)
             else: continue
             keep(row,p)
-        for raw,values in db.execute("SELECT CAST(c.body AS VARCHAR),p.workspace_id,p.row_kind,p.source_row_id,p.encoding_v,p.content_hash,p.revision,p.previous_revision,p.state,p.author_user_id,p.author_device_id,p.authorization_epoch,p.signature FROM remote.row_conflicts c JOIN remote.row_proofs p ON p.id=c.proof_id WHERE p.workspace_id=?",(workspace,)).fetchall(): keep(json.loads(raw),proof(values))
+        for raw,values in db.execute(f"SELECT CAST(c.body AS VARCHAR),p.workspace_id,p.authorization_workspace_id,p.row_kind,p.source_row_id,p.encoding_v,p.content_hash,p.revision,p.previous_revision,p.state,p.author_user_id,p.author_device_id,p.authorization_epoch,p.signature FROM remote.row_conflicts c JOIN remote.row_proofs p ON p.id=c.proof_id WHERE p.workspace_id IN ({marks})",scopes).fetchall(): keep(json.loads(raw),proof(values))
         return [seal_replica(row,p,workspace,cfg["workspaces"][workspace]["epoch"],key,cfg["device"]["id"]) for token,(row,p) in bodies.items() if token not in known]
     finally: db.close()
 def apply_row_replica(db_path,body,workspace,controls,recover=None,local_user=None,db=None):
-    row,proof=body["row"],body["proof"]; candidates=[{k:r[k] for k in ("user","root_public","device","certificate")} for c in controls if c["workspace"]==proof["workspace"]==workspace and c["epoch"]==proof["authorization_epoch"] and proof["author_device_id"] in c["devices"] for r in [c["devices"][proof["author_device_id"]]]]; signer_=candidates[0] if candidates and all(c==candidates[0] for c in candidates) else (_ for _ in ()).throw(ValueError("row proof authorization unavailable")); verify_row_proof(proof,row,signer_["certificate"],signer_["root_public"]); own=db is None
+    row,proof=body["row"],body["proof"]; allowed={workspace,*[c["workspace"] for c in controls]}; candidates=[{k:r[k] for k in ("user","root_public","device","certificate")} for c in controls if proof["workspace"] in allowed and c["workspace"]==proof["authorization_workspace"] and c["epoch"]==proof["authorization_epoch"] and proof["author_device_id"] in c["devices"] for r in [c["devices"][proof["author_device_id"]]]]; signer_=candidates[0] if candidates and all(c==candidates[0] for c in candidates) else (_ for _ in ()).throw(ValueError("row proof authorization unavailable")); verify_row_proof(proof,row,signer_["certificate"],signer_["root_public"]); own=db is None
     if own: db=open_db(db_path); init_schema(db); db.execute("BEGIN")
     try:
         scope=(proof["workspace"],proof["row_kind"],proof["row_id"],proof["author_user_id"]); old=db.execute("SELECT 1 FROM remote.row_proofs WHERE revision=? AND workspace_id=? AND row_kind=? AND source_row_id=? AND author_user_id=?",(proof["revision"],*scope)).fetchone(); heads={r[0] for r in db.execute("SELECT DISTINCT p.revision FROM remote.row_proofs p WHERE p.workspace_id=? AND p.row_kind=? AND p.source_row_id=? AND p.author_user_id=? AND NOT EXISTS (SELECT 1 FROM remote.row_proofs c WHERE c.workspace_id=p.workspace_id AND c.row_kind=p.row_kind AND c.source_row_id=p.source_row_id AND c.author_user_id=p.author_user_id AND c.previous_revision=p.revision)",scope).fetchall()}; stale=db.execute("SELECT 1 FROM remote.row_proofs WHERE previous_revision=? AND workspace_id=? AND row_kind=? AND source_row_id=? AND author_user_id=?",(proof["revision"],*scope)).fetchone(); project_workspace_controls(db,controls); pid=project_row_proof(db,proof,signer_["root_public"],signer_["certificate"])

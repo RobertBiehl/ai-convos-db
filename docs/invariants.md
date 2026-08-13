@@ -77,6 +77,11 @@ questions do not become invariants by implication.
 > destination authorization remain separate. An excluded member cannot access
 > new data, although no protocol can erase data that member already decrypted.
 
+> A row lineage keeps one immutable origin workspace. Every revision separately
+> names the workspace and epoch that authorized its signer; after explicit
+> re-founding, a valid successor may retain the old origin and predecessor while
+> using the fresh workspace as its authorization context.
+
 > A replacement relay rebuilds from the union of surviving authorized replicas.
 > Peers advertise flat, paginated logical identities, revisions, deletion
 > states, proofs, and blob hashes; the relay requests what it lacks. Repair is

@@ -29,6 +29,7 @@ CREATE TABLE IF NOT EXISTS ledger_cursors(cursor INTEGER PRIMARY KEY AUTOINCREME
 CREATE TABLE IF NOT EXISTS events(cursor INTEGER PRIMARY KEY AUTOINCREMENT,workspace TEXT,event TEXT,author TEXT,epoch INT,seq INT,envelope TEXT,wire_hash TEXT,created REAL,UNIQUE(workspace,event));
 CREATE UNIQUE INDEX IF NOT EXISTS event_author_sequence ON events(workspace,author,seq);
 CREATE TABLE IF NOT EXISTS row_replicas(cursor INTEGER PRIMARY KEY AUTOINCREMENT,workspace TEXT,replica TEXT,epoch INT,uploader TEXT,envelope TEXT,wire_hash TEXT,created REAL,updated REAL,UNIQUE(workspace,replica,epoch,uploader));
+CREATE TABLE IF NOT EXISTS origin_bundles(cursor INTEGER PRIMARY KEY AUTOINCREMENT,workspace TEXT,origin TEXT,epoch INT,uploader TEXT,envelope TEXT,wire_hash TEXT,created REAL,updated REAL,UNIQUE(workspace,origin,epoch,uploader));
 CREATE TABLE IF NOT EXISTS event_purges(workspace TEXT,event TEXT,author TEXT,epoch INT,seq INT,superseded_by TEXT,certificate TEXT,cursor INT,deleted REAL,PRIMARY KEY(workspace,event));
 CREATE UNIQUE INDEX IF NOT EXISTS purge_author_sequence ON event_purges(workspace,author,seq);
 CREATE INDEX IF NOT EXISTS purge_anchor ON event_purges(workspace,superseded_by);
@@ -203,6 +204,13 @@ def store_replica(db,actor,env):
     if used-(old["size"] if old else 0)+size>REPLICA_QUOTA: raise ValueError("row replica quota exceeded")
     if old: db.execute("UPDATE row_replicas SET envelope=?,wire_hash=?,updated=? WHERE workspace=? AND replica=? AND epoch=? AND uploader=?",(json.dumps(env),wire,now,*key)); return {"cursor":old["cursor"],"created":False,"replaced":old["wire_hash"]!=wire}
     cursor=db.execute("INSERT INTO ledger_cursors DEFAULT VALUES").lastrowid; db.execute("INSERT INTO row_replicas VALUES (?,?,?,?,?,?,?,?,?)",(cursor,*key,json.dumps(env),wire,now,now)); return {"cursor":cursor,"created":True,"replaced":False}
+def store_origin(db,actor,env):
+    fields={"v","kind","workspace","origin","epoch","uploader","nonce","ciphertext"}; ws=env["workspace"]; device_member(db,ws,actor); current=db.execute("SELECT epoch FROM workspaces WHERE id=?",(ws,)).fetchone()[0]
+    if set(env)!=fields or env["v"]!=1 or env["kind"]!="origin.bundle" or env["uploader"]!=actor["id"] or env["epoch"]!=current or not isinstance(env["origin"],str) or len(env["origin"])!=64 or any(c not in "0123456789abcdef" for c in env["origin"]): raise PermissionError("origin bundle rejected")
+    key=(ws,env["origin"],env["epoch"],actor["id"]); wire=digest(env); old=db.execute("SELECT cursor,wire_hash,LENGTH(envelope) size FROM origin_bundles WHERE workspace=? AND origin=? AND epoch=? AND uploader=?",key).fetchone(); now=time.time(); size=len(canon(env)); used=db.execute("SELECT COALESCE(SUM(LENGTH(envelope)),0) FROM origin_bundles WHERE workspace=? AND uploader=?",(ws,actor["id"])).fetchone()[0]
+    if size>4*1024**2 or used-(old["size"] if old else 0)+size>64*1024**2: raise ValueError("origin bundle quota exceeded")
+    if old: db.execute("UPDATE origin_bundles SET envelope=?,wire_hash=?,updated=? WHERE workspace=? AND origin=? AND epoch=? AND uploader=?",(json.dumps(env),wire,now,*key)); return {"cursor":old["cursor"],"created":False,"replaced":old["wire_hash"]!=wire}
+    cursor=db.execute("INSERT INTO ledger_cursors DEFAULT VALUES").lastrowid; db.execute("INSERT INTO origin_bundles VALUES (?,?,?,?,?,?,?,?,?)",(cursor,*key,json.dumps(env),wire,now,now)); return {"cursor":cursor,"created":True,"replaced":False}
 def purge_events(db,actor,req):
     certs=req.get("certificates"); ws=req.get("workspace")
     if not isinstance(certs,list) or not certs or len(certs)>500: raise ValueError("purge requires 1 to 500 certificates")
@@ -286,6 +294,9 @@ def action(db, req, token=None):
     if op == "replica_upload_many":
         if not isinstance(req["envelopes"],list) or not 1<=len(req["envelopes"])<=500: raise ValueError("replica upload batch limit is 1 to 500")
         result=[store_replica(db,actor,env) for env in req["envelopes"]]; db.commit(); return {"replicas":result}
+    if op == "origin_upload": result=store_origin(db,actor,req["envelope"]); db.commit(); return result
+    if op == "origin_pull":
+        ws=req["workspace"]; m=device_member(db,ws,actor); values=rows(db,"SELECT cursor,envelope FROM origin_bundles WHERE workspace=? AND epoch>=? AND EXISTS(SELECT 1 FROM key_envelopes k WHERE k.workspace=origin_bundles.workspace AND k.epoch=origin_bundles.epoch AND k.device=?) ORDER BY cursor",(ws,m["history_from"],actor["id"])); return {"origins":[{"cursor":r["cursor"],"envelope":json.loads(r["envelope"])} for r in values]}
     if op == "replica_reconcile":
         ws=req["workspace"]; device_member(db,ws,actor); ids=req["replicas"]
         if not isinstance(ids,list) or not 1<=len(ids)<=500 or len(ids)!=len(set(ids)) or any(not isinstance(v,str) or len(v)!=64 for v in ids): raise ValueError("replica inventory is invalid")

@@ -135,6 +135,10 @@ retain physical-to-source attribution, bodyless signed causal revisions,
 normalized signer certificates, and the signed authorization chain needed to
 verify an origin epoch after relay loss. They contain identifiers and proofs
 only, never event bodies or duplicated archive content.
+Each row proof separates its immutable origin workspace from the workspace and
+epoch that authorized that particular revision. They are initially equal. An
+explicitly re-founded workspace may authorize a later successor without
+rewriting the original namespace or predecessor.
 Imported physical IDs derive from `(workspace, author user, table, source row)`.
 The verified device certificate supplies the user; projection fails when that
 mapping is absent. Content equality is never used to infer row identity.
@@ -264,6 +268,9 @@ retains only its encrypted-file path, size, and tuple; acknowledgement leaves
 only a cursor. An imported row is reconstructed from its canonical DuckDB row
 and retained origin proof, so any authorized holder can repair it without the
 author's key.
+For a re-founded workspace, the old signed control chain is encrypted once as
+an origin bundle and shared by all of its row replicas; it is not duplicated
+inside each proof or body. Rotation reseals that bundle for the new epoch.
 Dispatch is exact on `(kind, payload_v)`. Unknown families and unsupported core
 versions are required by default and block publication; only receiver-known,
 archive-isolated auxiliary families whose product is not installed may defer
