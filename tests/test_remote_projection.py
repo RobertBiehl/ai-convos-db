@@ -6,7 +6,7 @@ import pytest
 from ai_convos.cli import init_schema, project_row_proof
 import ai_convos_remote.projection as projection_module
 from ai_convos_remote import publish
-from ai_convos_remote.projection import apply_row_replica, apply_row_replicas, attest_rows, bridges, connect, cutover_state, event_support, foreign_id, inspect_state, project, project_many, relocate_attachments, scan, sequence
+from ai_convos_remote.projection import apply_row_replica, apply_row_replicas, attest_rows, blob_replicas, bridges, connect, cutover_state, event_support, foreign_id, inspect_state, project, project_many, relocate_attachments, scan, sequence
 from ai_convos_remote.protocol import b64, certificate, digest, event, identity, logical_row, public, public_id, row_proof
 
 
@@ -158,7 +158,7 @@ def test_team_projection_never_reads_attachment_bodies(tmp_path,monkeypatch):
     repo,core=source(tmp_path); body=tmp_path/"secret.bin"; body.write_bytes(b"secret"); core.execute("INSERT INTO attachments (id,message_id,filename,path) VALUES ('a','m','secret.bin',?)",[str(body)]); state=connect(tmp_path/"state.db"); personal=scan(core,state); rid=next(r["payload"]["id"] for r in personal if r["kind"]=="repository.observed")
     original=Path.read_bytes; monkeypatch.setattr(Path,"read_bytes",lambda path:pytest.fail("team projection read attachment body") if path==body else original(path))
     records=scan(core,state,"team",[rid],[])
-    assert any(r["kind"]=="attachment.record" for r in records) and not any(r["kind"]=="attachment.chunk" for r in records)
+    assert any(r["kind"]=="attachment.record" for r in records) and not any(r["kind"]=="attachment.chunk" for r in records) and blob_replicas(tmp_path/"source.db",{"workspaces":{"team":{"kind":"team"}}},"team",records,{})==[]
 
 
 def test_team_policy_routes_complete_cross_repo_conversation(tmp_path):
@@ -180,14 +180,6 @@ def test_per_workspace_device_chain_accepts_reorder_and_rejects_replay_or_bad_pa
     replay=event(device,2,"x","other",{},[first["id"]],"2026-01-01T00:00:03Z")
     with pytest.raises(ValueError,match="replay"): sequence(state,"team",replay)
     assert sequence(state,"personal",replay)
-
-
-def test_attachment_chunk_conflicts_are_rejected(tmp_path):
-    state=connect(tmp_path/"state.db"); device=identity(); authors={device["id"]:"user"}; data="eA=="; payload={"attachment":"a","blob":"2d711642b726b04401627ca9fbac32f5da7e5c8530fb1903cc4db02258717921","index":0,"total":2,"sha256":"2d711642b726b04401627ca9fbac32f5da7e5c8530fb1903cc4db02258717921","size":2,"data":data}; one=event(device,1,"attachment.chunk",f"attachment:a:{payload['blob']}:0",payload,[],"2026-01-01T00:00:00Z"); assert project(tmp_path/"db",state,one,"w","other",authors=authors)
-    path=Path(state.execute("SELECT path FROM attachment_parts").fetchone()[0]); assert path.read_bytes()==b"x" and os.stat(path).st_mode&0o777==0o600 and "data" not in {r[1] for r in state.execute("PRAGMA table_info(attachment_parts)")}
-    import pytest
-    changed={**payload,"total":3}; conflict=event(device,2,"attachment.chunk",f"attachment:a:{payload['blob']}:0",changed,[one["id"]],"2026-01-01T00:00:01Z")
-    with pytest.raises(ValueError,match="conflict"): project(tmp_path/"db",state,conflict,"w","other",authors=authors)
 
 
 def test_completed_remote_attachment_is_rescued_into_archive_storage(tmp_path):

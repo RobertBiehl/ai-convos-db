@@ -58,6 +58,10 @@ def test_core_upgrade_backfills_proof_authorization_workspace(tmp_path):
     db=graph(tmp_path/"graph.db"); root,device=identity("root"),identity("device"); user=public_id(root["sign_public"]); proof=row_proof(device,user,"origin",1,logical_row("messages",identity="m",state="deleted")); project_row_proof(db,proof,root["sign_public"],certificate(root,user,device)); db.execute("ALTER TABLE remote.row_proofs DROP COLUMN authorization_workspace_id"); init_schema(db); assert db.execute("SELECT workspace_id,authorization_workspace_id FROM remote.row_proofs").fetchone()==("origin","origin")
 
 
+def test_core_upgrade_indexes_existing_retained_attachment_body(tmp_path):
+    body=tmp_path/"body"; body.write_bytes(b"retained"); db=graph(tmp_path/"graph.db"); db.execute("INSERT INTO conversations VALUES ('c','codex','x','2026-01-01','2026-01-01',NULL,NULL,NULL,NULL,'{}')"); db.execute("INSERT INTO messages VALUES ('m','c','user','x',NULL,'2026-01-01',NULL,'{}',NULL,NULL)"); db.execute("INSERT INTO attachments VALUES ('a','m','body',NULL,8,?,NULL,'2026-01-01')",[str(body)]); init_schema(db); assert db.execute("SELECT content_hash,size FROM attachment_bodies").fetchone()==(digest(b"retained"),8)
+
+
 def test_workspace_authorization_chain_is_normalized_and_conflicts_fail(tmp_path):
     db=graph(tmp_path/"graph.db"); controls=[{"workspace":"w","revision":1,"epoch":1,"members":{"u":"admin"}},{"workspace":"w","revision":2,"epoch":2,"members":{"u":"admin","v":"member"}}]; assert project_workspace_controls(db,controls)==project_workspace_controls(db,controls)==2 and db.execute("SELECT revision,epoch FROM remote.workspace_controls ORDER BY revision").fetchall()==[(1,1),(2,2)]
     with pytest.raises(ValueError,match="control conflict"): project_workspace_controls(db,[{**controls[1],"members":{"u":"member"}}])

@@ -182,10 +182,11 @@ with another provider origin or active projection survives, with the deleted
 remote origin redacted to hash and link metadata. This preserves conflicts
 instead of treating deletion as last-writer-wins.
 
-Large event bodies and personal attachments use encrypted lazy events. Pull
-fetches bodies required for the active local projection and atomically assembles
-personal attachment chunks in archive-owned storage. Team workspaces publish an
-explicit attachment placeholder but never read or upload the binary body.
+Large auxiliary event bodies use encrypted lazy events. Personal attachments
+use independently repairable, content-addressed blob replicas capped at 32 MiB;
+their signed row carries the expected hash. Pull validates and atomically places
+the body in archive-owned storage. Team workspaces publish an explicit
+attachment placeholder and never read or upload the binary body.
 
 ## Membership, devices, and recovery
 

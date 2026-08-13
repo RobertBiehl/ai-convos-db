@@ -1,14 +1,14 @@
 """Portable record/event projection. The immutable relay ledger can rebuild every local view."""
-import base64, hashlib, json, os, shutil, sqlite3, time
+import hashlib, json, os, shutil, sqlite3, time
 from datetime import date, datetime
 from functools import lru_cache
 from importlib.metadata import entry_points
 from pathlib import Path
 
-from ai_convos.cli import ARCHIVE_COLUMNS as COLUMNS, PROVENANCE_KINDS as PROVENANCE, init_schema, observe_provenance, open_db, project_archive_row, project_logical_row, project_provenance, project_row_proof, project_workspace_controls, repository as resolve_repository, set_attachment_path
+from ai_convos.cli import ARCHIVE_COLUMNS as COLUMNS, PROVENANCE_KINDS as PROVENANCE, index_attachment_body, init_schema, observe_provenance, open_db, project_archive_row, project_logical_row, project_provenance, project_row_proof, project_workspace_controls, repository as resolve_repository, set_attachment_path
 from ai_convos_changegraph.provenance import query as graph_query
 from .control import verify_state
-from .protocol import digest, fingerprint, logical_row, row_proof, seal_replica, verify_row_proof
+from .protocol import digest, fingerprint, logical_row, row_proof, seal_blob, seal_replica, verify_row_proof
 
 STATE_VERSION="1"
 STATE = """
@@ -22,19 +22,19 @@ CREATE TABLE IF NOT EXISTS lazy_events(workspace TEXT,event TEXT,cursor INT,size
 CREATE TABLE IF NOT EXISTS deferred_events(workspace TEXT,event TEXT,cursor INT,kind TEXT,payload_v INT,required INT,PRIMARY KEY(workspace,event)) WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS event_sequences(workspace TEXT,author TEXT,seq INT,event TEXT,PRIMARY KEY(workspace,author,seq)) WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS sequence_gaps(workspace TEXT,author TEXT,seq INT,parents TEXT,PRIMARY KEY(workspace,author,seq)) WITHOUT ROWID;
-CREATE TABLE IF NOT EXISTS attachment_parts(workspace TEXT,author TEXT,blob TEXT,idx INT,total INT,attachment TEXT,sha256 TEXT,size INT,chunk_hash TEXT,path TEXT,PRIMARY KEY(workspace,author,blob,idx)) WITHOUT ROWID;
-CREATE TABLE IF NOT EXISTS attachment_blobs(workspace TEXT,author TEXT,attachment TEXT,path TEXT,PRIMARY KEY(workspace,author,attachment)) WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS replica_outbox(workspace TEXT,replica TEXT,epoch INT,uploader TEXT,path TEXT,size INT,PRIMARY KEY(workspace,replica,epoch,uploader)) WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS replica_receipts(workspace TEXT,replica TEXT,epoch INT,cursor INT,PRIMARY KEY(workspace,replica,epoch)) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS blob_outbox(workspace TEXT,blob TEXT,epoch INT,uploader TEXT,path TEXT,size INT,PRIMARY KEY(workspace,blob,epoch,uploader)) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS blob_receipts(workspace TEXT,blob TEXT,epoch INT,cursor INT,PRIMARY KEY(workspace,blob,epoch)) WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS origin_bindings(workspace TEXT,origin TEXT,bundle TEXT,epoch INT,cursor INT,PRIMARY KEY(workspace,origin)) WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS policies(workspace TEXT,kind TEXT,value TEXT,PRIMARY KEY(workspace,kind,value)) WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS sync_states(workspace TEXT PRIMARY KEY,lifecycle TEXT NOT NULL,tail INT NOT NULL DEFAULT 0,floor INT NOT NULL DEFAULT 0,error TEXT) WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY,value TEXT) WITHOUT ROWID;
 """
-STATE_TABLES={"outbox","receipts","publication_heads","cursors","heads","lazy_events","deferred_events","event_sequences","sequence_gaps","attachment_parts","attachment_blobs","replica_outbox","replica_receipts","origin_bindings","policies","sync_states","meta"}
+STATE_TABLES={"outbox","receipts","publication_heads","cursors","heads","lazy_events","deferred_events","event_sequences","sequence_gaps","replica_outbox","replica_receipts","blob_outbox","blob_receipts","origin_bindings","policies","sync_states","meta"}
 STATE_FORBIDDEN={"published","event_log","history_material","history_outbox","history_queue","attachment_chunks","imported_rows","raw_events","repositories","files","file_versions","changesets","edits","checkpoints","assertions","gaps","boundaries","sharing_boundaries"}
 TABLES={"conversation.record":"conversations","message.record":"messages","tool.record":"tool_calls","attachment.record":"attachments","artifact.record":"artifacts","file_edit.record":"file_edits"}
-CORE_EVENTS={(kind,1) for kind in set(TABLES)|PROVENANCE|{"workspace.policy","workspace.membership","workspace.device","attachment.chunk"}}; AUXILIARY_EVENTS={"memory.canonical"}
+CORE_EVENTS={(kind,1) for kind in set(TABLES)|PROVENANCE|{"workspace.policy","workspace.membership","workspace.device"}}; AUXILIARY_EVENTS={"memory.canonical"}
 FKS={"messages":(("conversation_id","conversations"),("parent_id","messages")),"tool_calls":(("message_id","messages"),),"attachments":(("message_id","messages"),),"artifacts":(("conversation_id","conversations"),),"file_edits":(("message_id","messages"),)}
 
 def _connect(path,journal="WAL"):
@@ -136,7 +136,7 @@ def relocate_attachments(db_path,remote_root):
             else:
                 tmp=target.with_name(f".{target.name}.{os.getpid()}"); shutil.copyfile(source,tmp); os.chmod(tmp,0o600); _fsync(tmp); os.replace(tmp,target); _fsync(target_root)
             os.chmod(target,0o600); moved.append((row_id,source,target))
-        db.execute("BEGIN"); begun=True; [set_attachment_path(db,row_id,target) for row_id,source,target in moved]; db.execute("COMMIT"); begun=False
+        db.execute("BEGIN"); begun=True; [(set_attachment_path(db,row_id,target),index_attachment_body(db,row_id,target)) for row_id,source,target in moved]; db.execute("COMMIT"); begun=False
     except BaseException:
         if begun: db.execute("ROLLBACK")
         raise
@@ -145,13 +145,10 @@ def relocate_attachments(db_path,remote_root):
 def _records(core,state,blobs=True):
     out=[]; imported=set(core.execute("SELECT table_name,physical_row_id FROM remote.row_origins").fetchall())
     for kind,table in TABLES.items():
-        cur=core.execute(f"SELECT * EXCLUDE (embedding) FROM {table}" if table=="messages" else f"SELECT * FROM {table}"); cols=[d[0] for d in cur.description]
+        cur=core.execute(f"SELECT * EXCLUDE (embedding) FROM {table}" if table=="messages" else "SELECT a.*,b.content_hash body_hash FROM attachments a LEFT JOIN attachment_bodies b ON b.attachment_id=a.id" if table=="attachments" else f"SELECT * FROM {table}"); cols=[d[0] for d in cur.description]
         for values in cur.fetchall():
-            row=dict(zip(cols,map(clean,values))); attachment=Path(row["path"]).expanduser() if table=="attachments" and row.get("path") else None; row["embedding"]=None if "embedding" in row else row.get("embedding"); row["cwd"]=None if table=="conversations" else row.get("cwd"); row["path"]=None if table=="attachments" else row.get("path")
+            row=dict(zip(cols,map(clean,values))); row["embedding"]=None if "embedding" in row else row.get("embedding"); row["cwd"]=None if table=="conversations" else row.get("cwd"); row["path"]=None if table=="attachments" else row.get("path")
             if (table,row["id"]) not in imported: out.append(dict(kind=kind,entity=f"{table}:{row['id']}",payload=dict(table=table,columns=cols,row=[row[c] for c in cols])))
-            if blobs and attachment and attachment.is_file() and (table,row["id"]) not in imported:
-                data=attachment.read_bytes(); blob=hashlib.sha256(data).hexdigest(); chunks=[data[i:i+49152] for i in range(0,len(data),49152)] or [b""]
-                out += [dict(kind="attachment.chunk",entity=f"attachment:{row['id']}:{blob}:{i}",payload={"attachment":row["id"],"blob":blob,"index":i,"total":len(chunks),"sha256":blob,"size":len(data),"data":base64.b64encode(chunk).decode()}) for i,chunk in enumerate(chunks)]
     return out
 def _under(path,cwd,roots):
     p=Path(path); p=(Path(cwd)/p if not p.is_absolute() and cwd else p).expanduser().resolve(); return any(p.is_relative_to(root) for root in roots)
@@ -197,7 +194,7 @@ def row_replicas(db_path,cfg,workspace,records,keys,known=(),origins=(),origin_e
             if len(values)!=1: raise ValueError(f"current row proof unavailable: {row['kind']}:{row['id']}")
             keep(row,proof(values[0]))
         for table,physical,source,pid,user,origin in db.execute(f"SELECT table_name,physical_row_id,source_row_id,proof_id,author_user_id,workspace_id FROM remote.row_origins WHERE workspace_id IN ({marks}) AND proof_id IS NOT NULL",scopes).fetchall():
-            values=db.execute("SELECT workspace_id,authorization_workspace_id,row_kind,source_row_id,encoding_v,content_hash,revision,previous_revision,state,author_user_id,author_device_id,authorization_epoch,signature FROM remote.row_proofs WHERE id=?",(pid,)).fetchone(); p=proof(values); cur=db.execute(f"SELECT * EXCLUDE (embedding) FROM {table} WHERE id=?",(physical,)) if table=="messages" else db.execute(f"SELECT * FROM {table} WHERE id=?",(physical,)); cols=[d[0] for d in cur.description]; raw=cur.fetchone()
+            values=db.execute("SELECT workspace_id,authorization_workspace_id,row_kind,source_row_id,encoding_v,content_hash,revision,previous_revision,state,author_user_id,author_device_id,authorization_epoch,signature FROM remote.row_proofs WHERE id=?",(pid,)).fetchone(); p=proof(values); cur=db.execute(f"SELECT * EXCLUDE (embedding) FROM {table} WHERE id=?",(physical,)) if table=="messages" else db.execute("SELECT a.*,b.content_hash body_hash FROM attachments a LEFT JOIN attachment_bodies b ON b.attachment_id=a.id WHERE a.id=?",(physical,)) if table=="attachments" else db.execute(f"SELECT * FROM {table} WHERE id=?",(physical,)); cols=[d[0] for d in cur.description]; raw=cur.fetchone()
             if p["state"]=="deleted": row=logical_row(table,identity=source,state="deleted")
             elif raw:
                 raw=list(map(clean,raw)); raw[cols.index("id")]=source
@@ -209,6 +206,17 @@ def row_replicas(db_path,cfg,workspace,records,keys,known=(),origins=(),origin_e
         for raw,values in db.execute(f"SELECT CAST(c.body AS VARCHAR),p.workspace_id,p.authorization_workspace_id,p.row_kind,p.source_row_id,p.encoding_v,p.content_hash,p.revision,p.previous_revision,p.state,p.author_user_id,p.author_device_id,p.authorization_epoch,p.signature FROM remote.row_conflicts c JOIN remote.row_proofs p ON p.id=c.proof_id WHERE p.workspace_id IN ({marks})",scopes).fetchall(): keep(json.loads(raw),proof(values))
         delivery=lambda p:p["authorization_epoch"] if p["authorization_workspace"]==workspace else (origin_epochs or {})[p["workspace"]]; return [seal_replica(row,p,workspace,epoch,keys[epoch],cfg["device"]["id"]) for row,p in bodies.values() for epoch in [delivery(p)] if epoch in keys and fingerprint(keys[epoch],digest(p)) not in known]
     finally: db.close()
+def blob_replicas(db_path,cfg,workspace,records,keys,known=(),origins=(),origin_epochs=None):
+    if cfg["workspaces"][workspace]["kind"]!="personal": return []
+    allowed={dict(zip(r["payload"]["columns"],r["payload"]["row"])).get("body_hash") for r in records if r["kind"]=="attachment.record"}; db=open_db(db_path,True); scopes=(workspace,*origins); marks=','.join('?'*len(scopes)); rows=db.execute(f"SELECT a.path,b.content_hash,b.size,p.workspace_id,p.authorization_workspace_id,p.authorization_epoch,o.proof_id IS NOT NULL FROM attachments a JOIN attachment_bodies b ON b.attachment_id=a.id LEFT JOIN remote.row_origins o ON o.table_name='attachments' AND o.physical_row_id=a.id JOIN remote.row_proofs p ON p.id=o.proof_id OR o.proof_id IS NULL AND p.workspace_id IN ({marks}) AND p.row_kind='attachments' AND p.source_row_id=a.id AND p.author_user_id=? WHERE a.path IS NOT NULL AND p.workspace_id IN ({marks}) AND NOT EXISTS (SELECT 1 FROM remote.row_proofs c WHERE c.workspace_id=p.workspace_id AND c.row_kind='attachments' AND c.source_row_id=p.source_row_id AND c.author_user_id=p.author_user_id AND c.previous_revision=p.revision)",(*scopes,cfg["user"],*scopes)).fetchall(); db.close(); out=[]
+    for path,body_hash,size,origin,authorization,authorized_epoch,imported in rows:
+        if not imported and body_hash not in allowed: continue
+        epoch=authorized_epoch if authorization==workspace else (origin_epochs or {})[origin]
+        if epoch not in keys or fingerprint(keys[epoch],body_hash) in known: continue
+        path=Path(path)
+        if path.is_symlink() or not path.is_file() or path.stat().st_size!=size or size>32*1024**2 or file_hash(path)!=body_hash: raise ValueError("retained attachment body is inconsistent")
+        out.append(seal_blob(path.read_bytes(),workspace,epoch,keys[epoch],cfg["device"]["id"]))
+    return out
 def apply_row_replica(db_path,body,workspace,controls,recover=None,local_user=None,db=None):
     row,proof=body["row"],body["proof"]; allowed={workspace,*[c["workspace"] for c in controls]}; candidates=[{k:r[k] for k in ("user","root_public","device","certificate")} for c in controls if proof["workspace"] in allowed and c["workspace"]==proof["authorization_workspace"] and c["epoch"]==proof["authorization_epoch"] and proof["author_device_id"] in c["devices"] for r in [c["devices"][proof["author_device_id"]]]]; signer_=candidates[0] if candidates and all(c==candidates[0] for c in candidates) else (_ for _ in ()).throw(ValueError("row proof authorization unavailable")); verify_row_proof(proof,row,signer_["certificate"],signer_["root_public"]); own=db is None
     if own: db=open_db(db_path); init_schema(db); db.execute("BEGIN")
@@ -229,14 +237,6 @@ def apply_row_replicas(db_path,bodies,workspace,controls,recover=None,local_user
     finally: db.close()
 def author_user(value,authors): return (authors or {}).get(value["author"]) or (_ for _ in ()).throw(ValueError("verified author user required"))
 def foreign_id(workspace,author_user,table,old): return digest(f"{workspace}:{author_user}:{table}:{old}")[:16] if old else old
-def attachment_path(db_path,db,target,path):
-    target_db=db or (open_db(db_path) if Path(db_path).exists() else None); own=target_db is not None and db is None
-    try: own and target_db.execute("BEGIN"); target_db and set_attachment_path(target_db,target,path); own and target_db.execute("COMMIT")
-    except BaseException:
-        if own: target_db.execute("ROLLBACK")
-        raise
-    finally:
-        if own: target_db.close()
 def sequence(state,workspace,value):
     old=state.execute("SELECT event FROM event_sequences WHERE workspace=? AND author=? AND seq=?",(workspace,value["author"],value["seq"])).fetchone()
     if old and old[0]!=value["id"]: raise ValueError("device sequence replay")
@@ -258,20 +258,20 @@ def verify_history(state,workspace,controls,start):
             for author,head in control["boundary"]["heads"].items():
                 if (state.execute("SELECT event FROM event_sequences WHERE workspace=? AND author=? AND seq=?",(workspace,author,head["seq"])).fetchone() or [None])[0]!=head["event"]: raise ValueError("signed history checkpoint is incomplete")
 def apply_record(db_path,state,value,workspace,local_device=None,db=None,authors=None,recover=None,local_user=None):
-    table=TABLES[value["kind"]]; p=value["payload"]
-    if value["entity"] != f"{table}:{p['row'][0]}" or p["table"] != table or p["columns"]!=COLUMNS[table] or len(p["row"])!=len(p["columns"]): raise ValueError("record schema/entity mismatch")
+    table=TABLES[value["kind"]]; p=value["payload"]; columns=COLUMNS[table]+(["body_hash"] if table=="attachments" else [])
+    if value["entity"] != f"{table}:{p['row'][0]}" or p["table"] != table or p["columns"]!=columns or len(p["row"])!=len(p["columns"]): raise ValueError("record schema/entity mismatch")
     user=author_user(value,authors); sort=f"{value['observed_at']}:{value['id']}"; old=state.execute("SELECT sort_key FROM heads WHERE workspace=? AND author_user=? AND entity=?",(workspace,user,value["entity"])).fetchone()
     if old and old[0]>=sort: return False
     owned=bool(recover and user==local_user); native=owned and recover=="native"
     if owned and recover=="adopt": return False
     if value["author"]==local_device and not owned: return False
-    mapped=lambda table,old:old if native else foreign_id(workspace,user,table,old); values=list(p["row"]); values[0]=mapped(table,values[0])
+    mapped=lambda table,old:old if native else foreign_id(workspace,user,table,old); values=list(p["row"]); body_hash=values.pop() if table=="attachments" else None; values[0]=mapped(table,values[0])
     for column,parent in FKS.get(table,()): idx=p["columns"].index(column); values[idx]=mapped(parent,values[idx])
     own=db is None
     if own: Path(db_path).parent.mkdir(parents=True,exist_ok=True); db=open_db(db_path); init_schema(db); db.execute("BEGIN")
     try:
-        project_archive_row(db,table,p["columns"],values,None if native else {"workspace_id":workspace,"author_user_id":user,"author_device_id":value["author"],"source_row_id":p["row"][0],"source_event_id":value["id"],"content_key":value["entity"],"observed_at":value["observed_at"]})
-        if table=="attachments" and (blob:=state.execute("SELECT path FROM attachment_blobs WHERE workspace=? AND author=? AND attachment=?",(workspace,value["author"],p["row"][0])).fetchone()): set_attachment_path(db,values[0],blob[0])
+        project_archive_row(db,table,COLUMNS[table],values,None if native else {"workspace_id":workspace,"author_user_id":user,"author_device_id":value["author"],"source_row_id":p["row"][0],"source_event_id":value["id"],"content_key":value["entity"],"observed_at":value["observed_at"]})
+        if body_hash: db.execute("INSERT OR REPLACE INTO attachment_bodies VALUES (?,?,?)",(values[0],body_hash,values[COLUMNS[table].index("size")]))
         if own: db.execute("COMMIT")
     except BaseException:
         if own: db.execute("ROLLBACK")
@@ -286,37 +286,6 @@ def project(db_path,state,value,workspace,local_device=None,db=None,root=None,ba
     if value["kind"] in TABLES: return apply_record(db_path,state,value,workspace,local_device,db,authors,recover,local_user)
     if value["kind"]=="workspace.policy":
         p=value["payload"]; state.execute("INSERT OR REPLACE INTO policies VALUES (?,?,?)",(workspace,p["kind"],p["value"])); batch or state.commit(); return True
-    if value["kind"]=="attachment.chunk":
-        p=value["payload"]; user=author_user(value,authors); owned=bool(recover and user==local_user); native=owned and recover=="native"
-        if owned and recover=="adopt": return False
-        if value["author"]==local_device and not owned: return False
-        data=base64.b64decode(p["data"],validate=True); expected=f"attachment:{p['attachment']}:{p['blob']}:{p['index']}"; base=Path(db_path).parent/"attachments"; parts=Path(db_path).parent.parent/"remote/attachments/.parts"/digest(workspace)[:32]/value["author"]/p["blob"]; path=base/p["blob"]
-        if value["entity"]!=expected or p["blob"]!=p["sha256"] or len(p["blob"])!=64 or any(c not in "0123456789abcdef" for c in p["blob"]) or not 0<=p["index"]<p["total"] or p["size"]<0 or len(data)>49152: raise ValueError("attachment chunk schema mismatch")
-        if base.is_symlink() or (working:=Path(db_path).parent.parent/"remote/attachments").is_symlink() or any(x.is_symlink() for x in (parts,*parts.parents) if x==working or x.is_relative_to(working)): raise ValueError("attachment directory must not be a symlink")
-        base.mkdir(parents=True,exist_ok=True); os.chmod(base,0o700); working.mkdir(parents=True,exist_ok=True); os.chmod(working,0o700)
-        if path.exists():
-            if path.is_symlink() or path.stat().st_size!=p["size"] or file_hash(path)!=p["sha256"]: raise ValueError("attachment file conflict")
-            stale=state.execute("SELECT path FROM attachment_parts WHERE workspace=? AND author=? AND blob=?",(workspace,value["author"],p["blob"])).fetchall(); state.execute("INSERT OR REPLACE INTO attachment_blobs VALUES (?,?,?,?)",(workspace,value["author"],p["attachment"],str(path))); state.execute("DELETE FROM attachment_parts WHERE workspace=? AND author=? AND blob=?",(workspace,value["author"],p["blob"])); [Path(r[0]).unlink(missing_ok=True) for r in stale if Path(r[0]).parent==parts]; target=p["attachment"] if native else foreign_id(workspace,user,"attachments",p["attachment"]); attachment_path(db_path,db,target,path)
-            batch or state.commit(); return True
-        chunk_hash=hashlib.sha256(data).hexdigest(); part=parts/str(p["index"]); meta=state.execute("SELECT total,attachment,sha256,size FROM attachment_parts WHERE workspace=? AND author=? AND blob=? LIMIT 1",(workspace,value["author"],p["blob"])).fetchone(); old=state.execute("SELECT total,attachment,sha256,size,chunk_hash,path FROM attachment_parts WHERE workspace=? AND author=? AND blob=? AND idx=?",(workspace,value["author"],p["blob"],p["index"])).fetchone()
-        if meta and tuple(meta)!=(p["total"],p["attachment"],p["sha256"],p["size"]) or old and tuple(old)!=(p["total"],p["attachment"],p["sha256"],p["size"],chunk_hash,str(part)): raise ValueError("attachment chunk conflict")
-        if part.exists():
-            if part.is_symlink() or part.stat().st_size!=len(data) or file_hash(part)!=chunk_hash: raise ValueError("attachment chunk conflict")
-        else:
-            part.parent.mkdir(parents=True,exist_ok=True); tmp=part.with_name(f".{part.name}.{os.getpid()}"); out=tmp.open("xb"); os.chmod(tmp,0o600); out.write(data); out.close(); os.replace(tmp,part)
-        state.execute("INSERT OR IGNORE INTO attachment_parts VALUES (?,?,?,?,?,?,?,?,?,?)",(workspace,value["author"],p["blob"],p["index"],p["total"],p["attachment"],p["sha256"],p["size"],chunk_hash,str(part))); rows=state.execute("SELECT idx,path FROM attachment_parts WHERE workspace=? AND author=? AND blob=? ORDER BY idx",(workspace,value["author"],p["blob"])).fetchall()
-        if len(rows)==p["total"]:
-            if [r[0] for r in rows]!=list(range(p["total"])): raise ValueError("attachment chunks incomplete")
-            path.parent.mkdir(parents=True,exist_ok=True); tmp=path.with_name(f".{path.name}.{os.getpid()}"); out=tmp.open("xb"); os.chmod(tmp,0o600)
-            try:
-                for row in rows:
-                    with Path(row[1]).open("rb") as source: shutil.copyfileobj(source,out,65536)
-                out.flush(); os.fsync(out.fileno()); out.close()
-                if tmp.stat().st_size!=p["size"] or file_hash(tmp)!=p["sha256"]: raise ValueError("attachment hash mismatch")
-                os.replace(tmp,path); _fsync(base)
-            except BaseException: out.close(); tmp.unlink(missing_ok=True); raise
-            state.execute("INSERT OR REPLACE INTO attachment_blobs VALUES (?,?,?,?)",(workspace,value["author"],p["attachment"],str(path))); state.execute("DELETE FROM attachment_parts WHERE workspace=? AND author=? AND blob=?",(workspace,value["author"],p["blob"])); [Path(r[1]).unlink(missing_ok=True) for r in rows]; target=p["attachment"] if native else foreign_id(workspace,user,"attachments",p["attachment"]); attachment_path(db_path,db,target,path)
-        batch or state.commit(); return True
     if root is not None:
         for bridge in bridges():
             if (result:=bridge["project"](root,state,value,workspace,local_device)) is not None: return result

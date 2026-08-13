@@ -285,12 +285,13 @@ History has only two access modes: membership-forward and all retained epochs.
 Complete-history grants rewrap epoch keys; no row body passes through
 `state.db`, and no per-row carrier bookkeeping exists.
 
-Attachment chunks remain encrypted until streamed to a mode-0600 temporary
-file under remote working storage. Hash and size validation precede atomic
-rename to archive-owned `data/attachments/<sha256>`. SQLite stores only the
-incomplete manifest and content-free completion lookup. A local cutover copies,
-validates, commits new DuckDB paths, and only then removes legacy completed
-bodies from `remote/attachments`.
+Attachment bodies are separate bounded blob replicas. Their hashes are covered
+by the signed attachment rows, while any authorized holder may deliver the
+matching ciphertext without impersonating the author. The relay stores raw
+ciphertext rather than base64 JSON; `state.db` retains only outbox paths and
+receipts. Decryption, hash and size validation precede atomic placement in
+archive-owned `data/attachments/<sha256>`. A local cutover copies, validates,
+commits new DuckDB paths, and only then removes legacy completed bodies.
 
 ## Exact sequence storage
 

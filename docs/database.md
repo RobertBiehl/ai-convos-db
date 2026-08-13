@@ -85,6 +85,10 @@ File and image attachments.
 | url | VARCHAR | Remote URL if available |
 | created_at | TIMESTAMP | Attachment timestamp |
 
+`attachment_bodies` maps an attachment ID to the SHA-256 and bounded size of a
+retained body. The bytes live once under `data/attachments/<sha256>`; this table
+preserves the canonical association when the local body is temporarily absent.
+
 ### artifacts
 
 Claude artifacts (code, documents, etc.).
