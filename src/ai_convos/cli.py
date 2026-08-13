@@ -81,6 +81,7 @@ CREATE TABLE IF NOT EXISTS remote.workspace_controls(workspace_id VARCHAR,revisi
 CREATE TABLE IF NOT EXISTS remote.row_proofs(id VARCHAR PRIMARY KEY,workspace_id VARCHAR,authorization_workspace_id VARCHAR,row_kind VARCHAR,source_row_id VARCHAR,encoding_v USMALLINT,content_hash VARCHAR,revision VARCHAR,previous_revision VARCHAR,state VARCHAR,author_user_id VARCHAR,author_device_id VARCHAR,authorization_epoch UINTEGER,signature VARCHAR);
 CREATE TABLE IF NOT EXISTS remote.row_conflicts(proof_id VARCHAR PRIMARY KEY,body JSON);
 CREATE TABLE IF NOT EXISTS attachment_bodies(attachment_id VARCHAR PRIMARY KEY,content_hash VARCHAR NOT NULL,size UINTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS core_schema(singleton BOOLEAN PRIMARY KEY,version USMALLINT NOT NULL);
 CREATE TABLE IF NOT EXISTS archive_state(singleton BOOLEAN PRIMARY KEY,archive_id UUID NOT NULL,generation UBIGINT NOT NULL);
 """
 ARCHIVE_COLUMNS={"conversations":["id","source","title","created_at","updated_at","model","cwd","git_branch","project_id","metadata"],"messages":["id","conversation_id","role","content","thinking","created_at","model","metadata","parent_id"],"tool_calls":["id","message_id","tool_name","input","output","status","duration_ms","created_at"],"attachments":["id","message_id","filename","mime_type","size","path","url","created_at"],"artifacts":["id","conversation_id","artifact_type","title","content","language","created_at","version"],"file_edits":["id","message_id","file_path","edit_type","content","created_at","old_content"]}
@@ -205,7 +206,19 @@ def project_attachment_body(db_path,data,body_hash):
         return len(rows)
     except BaseException: begun and db.execute("ROLLBACK"); raise
     finally: db.close()
+def _migration_backup(conn,version=1):
+    tables={r[0] for r in conn.execute("SELECT table_name FROM information_schema.tables WHERE table_schema='main'").fetchall()}; current=(conn.execute("SELECT version FROM core_schema WHERE singleton").fetchone() or [0])[0] if "core_schema" in tables else 0
+    if "conversations" not in tables or current>=version: return None
+    path=Path(next((r[2] for r in conn.execute("PRAGMA database_list").fetchall() if r[2]),"")); backup=path.with_name(f"{path.name}.pre-v{version}.bak") if path.name else None
+    if not backup: return None
+    if backup.exists():
+        if backup.is_symlink() or not backup.is_file(): raise ValueError("core migration backup path is unsafe")
+        check=duckdb.connect(str(backup),read_only=True); check.execute("SELECT COUNT(*) FROM conversations").fetchone(); check.close(); return backup
+    conn.execute("CHECKPOINT"); fd,tmp=tempfile.mkstemp(prefix=f".{backup.name}.",dir=backup.parent); os.close(fd)
+    try: shutil.copyfile(path,tmp); os.chmod(tmp,0o600); check=duckdb.connect(tmp,read_only=True); check.execute("SELECT COUNT(*) FROM conversations").fetchone(); check.close(); os.replace(tmp,backup); dfd=os.open(backup.parent,os.O_RDONLY); os.fsync(dfd); os.close(dfd); return backup
+    except BaseException: Path(tmp).unlink(missing_ok=True); raise
 def init_schema(conn):
+    _migration_backup(conn)
     conn.execute("""CREATE TABLE IF NOT EXISTS conversations (
         id VARCHAR PRIMARY KEY, source VARCHAR NOT NULL, title VARCHAR, created_at TIMESTAMP, updated_at TIMESTAMP,
         model VARCHAR, cwd VARCHAR, git_branch VARCHAR, project_id VARCHAR, metadata JSON)""")
@@ -232,7 +245,7 @@ def init_schema(conn):
     conn.execute("BEGIN")
     try:
         cols={r[0] for r in conn.execute("SELECT column_name FROM information_schema.columns WHERE table_schema='provenance' AND table_name='file_edit_files'").fetchall()}; [(conn.execute(f"ALTER TABLE provenance.file_edit_files RENAME COLUMN {old} TO {new}"),cols.add(new)) for old,new in (("before_hash","old_content_hash"),("after_hash","new_content_hash")) if old in cols and new not in cols]
-        conn.execute("ALTER TABLE provenance.git_checkpoints ADD COLUMN IF NOT EXISTS capture_source VARCHAR"); conn.execute("ALTER TABLE remote.row_origins ADD COLUMN IF NOT EXISTS proof_id VARCHAR"); conn.execute("ALTER TABLE remote.row_proofs ADD COLUMN IF NOT EXISTS authorization_workspace_id VARCHAR"); conn.execute("UPDATE remote.row_proofs SET authorization_workspace_id=workspace_id WHERE authorization_workspace_id IS NULL"); [index_attachment_body(conn,*r) for r in conn.execute("SELECT id,path,size FROM attachments WHERE path IS NOT NULL AND id NOT IN (SELECT attachment_id FROM attachment_bodies)").fetchall()]; conn.execute("DROP TABLE IF EXISTS provenance.assertions"); conn.execute("DROP TABLE IF EXISTS provenance.capture_gaps"); conn.execute("COMMIT")
+        conn.execute("ALTER TABLE provenance.git_checkpoints ADD COLUMN IF NOT EXISTS capture_source VARCHAR"); conn.execute("ALTER TABLE remote.row_origins ADD COLUMN IF NOT EXISTS proof_id VARCHAR"); conn.execute("ALTER TABLE remote.row_proofs ADD COLUMN IF NOT EXISTS authorization_workspace_id VARCHAR"); conn.execute("UPDATE remote.row_proofs SET authorization_workspace_id=workspace_id WHERE authorization_workspace_id IS NULL"); [index_attachment_body(conn,*r) for r in conn.execute("SELECT id,path,size FROM attachments WHERE path IS NOT NULL AND id NOT IN (SELECT attachment_id FROM attachment_bodies)").fetchall()]; conn.execute("DROP TABLE IF EXISTS provenance.assertions"); conn.execute("DROP TABLE IF EXISTS provenance.capture_gaps"); conn.execute("INSERT OR REPLACE INTO core_schema VALUES (TRUE,1)"); conn.execute("COMMIT")
     except BaseException: conn.execute("ROLLBACK"); raise
     conn.execute("INSERT INTO archive_state SELECT TRUE,uuid(),0 WHERE NOT EXISTS (SELECT 1 FROM archive_state)")
     conn.execute("INSTALL fts; LOAD fts")

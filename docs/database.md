@@ -176,6 +176,11 @@ in the same transaction as core projection, provenance capture, attachment-path
 materialization, or ingestion, so a failed transaction cannot advance the
 proof. It is a rollback detector, not a content revision or remote cursor.
 
+Existing core archives migrate automatically. Before schema N first mutates an
+archive, Convos checkpoints and validates a mode-0600
+`<database>.pre-vN.bak`; retries retain the same recovery copy. Relay and
+`state.db` remain rebuildable and are not migrated during this clean cutover.
+
 ## Full-Text Search
 
 FTS index on `messages` table covering `content` and `thinking` columns.

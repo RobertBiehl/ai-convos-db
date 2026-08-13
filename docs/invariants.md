@@ -32,9 +32,10 @@ questions do not become invariants by implication.
 
 ## Upgrade and recovery
 
-> Core DuckDB upgrades are automatic and frictionless, with preservation and
-> validation before destructive cleanup. A failed upgrade must leave a usable
-> original or recoverable backup.
+> Core DuckDB upgrades are automatic and frictionless. Before the first
+> migration of an existing archive to schema N, Convos checkpoints and
+> validates a private `<database>.pre-vN.bak`. A failed upgrade must leave a
+> usable original or recovery copy.
 
 > Rebuildable remote state may be discarded and recreated. During the current
 > pre-establishment phase, Relay and `state.db` require no compatibility
