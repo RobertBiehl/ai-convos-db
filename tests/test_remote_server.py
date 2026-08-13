@@ -1,8 +1,9 @@
 import copy, json, sqlite3
 
 import pytest
+import ai_convos_remote_server as server_module
 from ai_convos_remote.control import record, sign, state_hash
-from ai_convos_remote.protocol import certificate, digest, event, identity, purge_certificate, seal_event, seal_key, sign_control
+from ai_convos_remote.protocol import certificate, digest, event, identity, logical_row, purge_certificate, row_proof, seal_event, seal_key, seal_replica, sign_control
 from ai_convos_remote_server import action, connect, ledger_state
 
 
@@ -37,6 +38,15 @@ def test_personal_workspace_idempotency_and_ciphertext_only(tmp_path):
     with pytest.raises(ValueError,match="different ciphertext"): action(db,{"op":"upload","envelope":bad},a["token"])
     same_seq = seal_event(event(a["device"],1,"message.record","m2",{"content":"different"},[],"2026-01-02T00:00:00Z"),ws,1,key)
     with pytest.raises(Exception): action(db,{"op":"upload","envelope":same_seq},a["token"])
+
+
+def test_repairable_replica_is_uploader_bounded_and_replaceable(tmp_path,monkeypatch):
+    db=connect(tmp_path/"server.db"); a,b=account(db,"alice"),account(db,"bob"); ws,key="team",bytes([3])*32; state=create_ws(db,a,ws,key,"team"); rotate_ws(db,a,state,bytes([4])*32,((a,"admin"),(b,"member"))); key=bytes([4])*32; row=logical_row("messages",identity="m",state="deleted"); proof=row_proof(a["device"],a["user"],ws,2,row,"a"*64); env=seal_replica(row,proof,ws,2,key,b["device"]["id"])
+    first=action(db,{"op":"replica_upload_many","envelopes":[env]},b["token"])["replicas"][0]; same=action(db,{"op":"replica_upload_many","envelopes":[env]},b["token"])["replicas"][0]; replacement=seal_replica(row,proof,ws,2,key,b["device"]["id"]); changed=action(db,{"op":"replica_upload_many","envelopes":[replacement]},b["token"])["replicas"][0]; page=action(db,{"op":"replica_pull","workspace":ws,"after":0},a["token"])
+    assert first["created"] and not same["created"] and not same["replaced"] and changed["replaced"] and first["cursor"]==same["cursor"]==changed["cursor"] and page["replicas"]==[{"cursor":first["cursor"],"envelope":replacement}] and db.execute("SELECT COUNT(*) FROM row_replicas").fetchone()[0]==1
+    with pytest.raises(PermissionError,match="rejected"): action(db,{"op":"replica_upload_many","envelopes":[{**replacement,"uploader":a["device"]["id"]}]},b["token"])
+    monkeypatch.setattr(server_module,"REPLICA_QUOTA",1)
+    with pytest.raises(ValueError,match="quota"): action(db,{"op":"replica_upload_many","envelopes":[replacement]},b["token"])
 
 
 def test_team_add_default_history_grant_remove_and_rotation(tmp_path):
