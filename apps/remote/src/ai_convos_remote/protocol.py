@@ -12,6 +12,7 @@ from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 V = 1
 ROW_FIELDS_V1={"conversations":("source","title","created_at","updated_at","model","project_id","metadata"),"messages":("conversation_id","role","content","thinking","created_at","model","metadata","parent_id"),"tool_calls":("message_id","tool_name","input","output","status","duration_ms","created_at"),"attachments":("message_id","filename","mime_type","size","created_at"),"artifacts":("conversation_id","artifact_type","title","content","language","created_at","version"),"file_edits":("message_id","file_path","edit_type","content","created_at","old_content")}
 ROW_JSON_V1={"metadata","input","output"}; ROW_TIME_V1={"created_at","updated_at"}
+ROW_PROOF_FIELDS={"v","kind","workspace","row_kind","row_id","encoding_v","content_hash","revision","previous_revision","state","author_user_id","author_device_id","authorization_epoch","signature"}
 def canon(v): return json.dumps(v, sort_keys=True, separators=(",", ":"), ensure_ascii=True, allow_nan=False).encode()
 def b64(v): return base64.urlsafe_b64encode(v).decode().rstrip("=")
 def unb64(v): return base64.urlsafe_b64decode(v + "=" * (-len(v) % 4))
@@ -43,6 +44,17 @@ def verify_certificate(cert, root_public):
     sig, body = unb64(cert["signature"]), {k:v for k,v in cert.items() if k != "signature"}; _pub(Ed25519PublicKey, root_public).verify(sig, canon(body))
     if body["v"] != V: raise ValueError(f"Unsupported certificate version {body['v']}")
     return body
+
+def row_proof(device,user,workspace,epoch,row,previous=None):
+    claim={"row_kind":row["kind"],"row_id":row["id"],"encoding_v":row["v"],"content_hash":digest(row),"previous_revision":previous,"state":row["state"]}; body={"v":1,"kind":"row.proof","workspace":workspace,**claim,"revision":digest({"v":1,**claim}),"author_user_id":user,"author_device_id":device["id"],"authorization_epoch":epoch}; body["signature"]=b64(_priv(Ed25519PrivateKey,device["sign_private"]).sign(canon(body))); return body
+
+def verify_row_proof(value,row,cert,root_public):
+    try:
+        signed={k:v for k,v in value.items() if k!="signature"}; device=verify_certificate(cert,root_public)["device"]; previous=value["previous_revision"]
+        claim={k:value[k] for k in ("row_kind","row_id","encoding_v","content_hash","previous_revision","state")}
+        if set(value)!=ROW_PROOF_FIELDS or value["v"]!=1 or value["kind"]!="row.proof" or not isinstance(value["workspace"],str) or not value["workspace"] or (value["row_kind"],value["row_id"],value["encoding_v"],value["content_hash"],value["state"])!=(row["kind"],row["id"],row["v"],digest(row),row["state"]) or value["revision"]!=digest({"v":1,**claim}) or previous is not None and (not isinstance(previous,str) or len(previous)!=64 or any(c not in "0123456789abcdef" for c in previous) or previous==value["revision"]) or not isinstance(value["authorization_epoch"],int) or isinstance(value["authorization_epoch"],bool) or value["authorization_epoch"]<1 or (cert["user"],device["id"],public_id(root_public),public_id(device["sign_public"]))!=(value["author_user_id"],value["author_device_id"],value["author_user_id"],value["author_device_id"]): raise ValueError
+        _pub(Ed25519PublicKey,device["sign_public"]).verify(unb64(value["signature"]),canon(signed)); return value
+    except (InvalidSignature,KeyError,TypeError,ValueError) as e: raise ValueError("invalid row proof") from e
 
 def event(device, seq, kind, entity, payload, parents=(), observed_at=None, payload_v=1):
     body = dict(v=V, kind=kind, entity=entity, revision=digest(payload), author=device["id"], seq=seq, parents=list(parents), observed_at=observed_at or now(), payload_v=payload_v, payload=payload)
