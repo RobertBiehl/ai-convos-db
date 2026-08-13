@@ -58,6 +58,11 @@ def test_replica_alone_recovers_row_and_original_proof(tmp_path,monkeypatch):
     db=duckdb.connect(str(b/"data/convos.db"),read_only=True); assert db.execute("SELECT id,title FROM conversations").fetchone()==("c","replica only") and not db.execute("SELECT * FROM remote.row_origins").fetchall() and db.execute("SELECT author_user_id FROM remote.row_proofs").fetchone()[0]==alice["user"]; db.close()
 
 
+def test_foreign_holder_repairs_missing_replica_without_author_key(tmp_path,monkeypatch):
+    server=server_connect(tmp_path/"server.db"); monkeypatch.setattr("ai_convos_remote.request",transport(server)); a,b=tmp_path/"a",tmp_path/"b"; alice,_=setup_client("http://server","alice",root=a); setup_client("http://server","bob",root=b); team=create(alice,"Team","team",a); add_member(alice,team,"bob",root=a); alice=load(a); path=a/"data/convos.db"; write_archive(path,"survives through bob"); db=duckdb.connect(str(path)); db.execute("INSERT INTO messages VALUES ('m','c','user','keep the relationship',NULL,'2026-01-01',NULL,'{}',NULL,NULL)"); db.close(); sa=connect(a/"remote/state.db"); core=duckdb.connect(str(path),read_only=True); records=scan(core,sa); core.close(); projection_module.attest_rows(path,alice,team,records); envs=projection_module.row_replicas(path,alice,team,records,key(alice,team,2)); action(server,{"op":"replica_upload_many","envelopes":envs},alice["token"]); sb=connect(b/"remote/state.db"); pull(load(b),sb,b); server.execute("DELETE FROM row_replicas"); server.commit(); bob=load(b); repaired=projection_module.row_replicas(b/"data/convos.db",bob,team,[],key(bob,team,2))
+    assert len(repaired)==2 and {e["uploader"] for e in repaired}=={bob["device"]["id"]} and all(r["created"] for r in action(server,{"op":"replica_upload_many","envelopes":repaired},bob["token"])["replicas"]) and server.execute("SELECT COUNT(*) FROM row_replicas").fetchone()[0]==2
+
+
 def test_personal_recovery_multidevice_delivery_and_replay(tmp_path,monkeypatch):
     server=server_connect(tmp_path/"server.db"); monkeypatch.setattr("ai_convos_remote.request",transport(server)); a,b=tmp_path/"a",tmp_path/"b"
     alice,recovery=setup_client("http://server","alice","laptop",root=a); ws=workspace(alice,"Personal"); state_a=connect(a/"remote/state.db"); publish(alice,state_a,ws,conversation(),a); upload(alice,state_a,a)

@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Add flat opaque row-replica reconciliation so state loss uploads only missing
+  proofs and any authorized holder can repair an imported row without the
+  original author's private key.
 - Simplify team history to future-only or complete-history access, remove
   per-row grants and carrier events, and define the first client/server
   protocol, signed workspace state, rebuildable state schema, optional-app
