@@ -6,8 +6,8 @@ import pytest
 from ai_convos.cli import init_schema, project_row_proof
 import ai_convos_remote.projection as projection_module
 from ai_convos_remote import publish
-from ai_convos_remote.projection import attest_rows, bridges, connect, cutover_state, event_support, foreign_id, inspect_state, project, project_many, relocate_attachments, scan, sequence
-from ai_convos_remote.protocol import b64, certificate, digest, event, identity, public, public_id
+from ai_convos_remote.projection import apply_row_replica, apply_row_replicas, attest_rows, bridges, connect, cutover_state, event_support, foreign_id, inspect_state, project, project_many, relocate_attachments, scan, sequence
+from ai_convos_remote.protocol import b64, certificate, digest, event, identity, logical_row, public, public_id, row_proof
 
 
 def git(path,*args): return subprocess.run(("git","-C",str(path),*args),check=True,capture_output=True).stdout.decode().strip()
@@ -73,6 +73,17 @@ def test_row_attestation_refuses_to_guess_between_concurrent_heads(tmp_path):
     repo,core=source(tmp_path); state=connect(tmp_path/"state.db"); records=scan(core,state); core.close(); state.close(); root,device=identity("root"),identity("device"); user=public_id(root["sign_public"]); cert=certificate(root,user,device); entry={"user":user,"root_public":root["sign_public"],"device":public(device),"certificate":cert,"history":True}; control={"workspace":"w","revision":1,"epoch":1,"devices":{device["id"]:entry}}; cfg={"user":user,"device":device,"workspaces":{"w":{"kind":"personal","epoch":1}},"controls":{"w":control},"server_state":{"workspaces":[{"id":"w","controls":[control]}]}}; attest_rows(tmp_path/"source.db",cfg,"w",records)
     db=duckdb.connect(str(tmp_path/"source.db")); base=db.execute("SELECT revision FROM remote.row_proofs WHERE row_kind='conversations'").fetchone()[0]; row=lambda title:projection_module.logical_row("conversations",["id","source","title","created_at","updated_at","model","cwd","git_branch","project_id","metadata"],["c","codex",title,"2026-01-01","2026-01-01","m",str(repo),None,None,"{}"]); [project_row_proof(db,projection_module.row_proof(device,user,"w",1,row(title),base),root["sign_public"],cert) for title in ("branch-a","branch-b")]; db.execute("UPDATE conversations SET title='third'"); db.close(); fresh=connect(tmp_path/"fresh.db"); core=duckdb.connect(str(tmp_path/"source.db"),read_only=True); current=scan(core,fresh); core.close(); fresh.close()
     with pytest.raises(ValueError,match="row revision conflict"): attest_rows(tmp_path/"source.db",cfg,"w",current)
+
+
+def test_incoming_concurrent_row_is_retained_without_overwrite(tmp_path):
+    root,device=identity("root"),identity("device"); user=public_id(root["sign_public"]); cert=certificate(root,user,device); entry={"user":user,"root_public":root["sign_public"],"device":public(device),"certificate":cert,"history":True}; control={"workspace":"w","revision":1,"epoch":1,"devices":{device["id"]:entry}}; fields=["id","source","title","created_at","updated_at","model","cwd","git_branch","project_id","metadata"]; row=lambda title:logical_row("conversations",fields,["c","codex",title,"2026-01-01","2026-01-01",None,None,None,None,"{}"]); first=row_proof(device,user,"w",1,row("base")); a=row_proof(device,user,"w",1,row("branch-a"),first["revision"]); b=row_proof(device,user,"w",1,row("branch-b"),first["revision"])
+    assert apply_row_replica(tmp_path/"db",{"row":row("base"),"proof":first},"w",[control]) and apply_row_replica(tmp_path/"db",{"row":row("branch-a"),"proof":a},"w",[control]) and not apply_row_replica(tmp_path/"db",{"row":row("branch-b"),"proof":b},"w",[control]); db=duckdb.connect(str(tmp_path/"db"),read_only=True); assert db.execute("SELECT title FROM conversations").fetchone()[0]=="branch-a" and json.loads(db.execute("SELECT CAST(body AS VARCHAR) FROM remote.row_conflicts").fetchone()[0])["data"]["title"]=="branch-b" and db.execute("SELECT COUNT(DISTINCT revision) FROM remote.row_proofs").fetchone()[0]==3 and db.execute("SELECT proof_id IS NOT NULL FROM remote.row_origins").fetchone()[0]; db.close()
+
+
+def test_row_replica_page_is_atomic(tmp_path):
+    root,device=identity("root"),identity("device"); user=public_id(root["sign_public"]); cert=certificate(root,user,device); entry={"user":user,"root_public":root["sign_public"],"device":public(device),"certificate":cert,"history":True}; control={"workspace":"w","revision":1,"epoch":1,"devices":{device["id"]:entry}}; fields=["id","source","title","created_at","updated_at","model","cwd","git_branch","project_id","metadata"]; row=logical_row("conversations",fields,["c","codex","valid","2026-01-01","2026-01-01",None,None,None,None,"{}"]); proof=row_proof(device,user,"w",1,row); bad={**row,"data":{**row["data"],"title":"tampered"}}
+    with pytest.raises(ValueError,match="invalid row proof"): apply_row_replicas(tmp_path/"db",[{"row":row,"proof":proof},{"row":bad,"proof":proof}],"w",[control])
+    db=duckdb.connect(str(tmp_path/"db"),read_only=True); assert db.execute("SELECT COUNT(*) FROM conversations").fetchone()[0]==db.execute("SELECT COUNT(*) FROM remote.row_proofs").fetchone()[0]==db.execute("SELECT COUNT(*) FROM remote.workspace_controls").fetchone()[0]==0; db.close()
 
 
 def test_provenance_projection_uses_signed_event_timestamp(tmp_path):

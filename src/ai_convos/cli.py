@@ -19,15 +19,17 @@ HOOK_DIR, HOOK_STATE, HOOK_EMBED_DIRTY, HOOK_FTS_DIRTY, _NOISE = DATA_DIR/"hook_
 CHATGPT_BURST, CHATGPT_RATE = 20, 8/15  # conservative policy below the observed ~200-detail failure point
 
 # ---- db helpers ----
-def get_db(read_only: bool = False):
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-    if read_only and not DB_PATH.exists(): return None
-    for i in range(30):
-        try: return duckdb.connect(str(DB_PATH), read_only=read_only)
+def open_db(path=None,read_only=False):
+    path=Path(path or DB_PATH); path.parent.mkdir(parents=True,exist_ok=True)
+    if read_only and not path.exists(): return None
+    deadline=time.monotonic()+30
+    while True:
+        try: return duckdb.connect(str(path),read_only=read_only)
         except Exception as e:
             if "Conflicting lock is held" not in str(e): raise
-            if i < 29: time.sleep(1); continue
+            if time.monotonic()<deadline: time.sleep(.05); continue
             raise ValueError("Database stayed locked by another convos process for 30 seconds.") from e
+def get_db(read_only:bool=False): return open_db(read_only=read_only)
 
 def load_state():
     try: return json.loads(STATE_PATH.read_text()) if STATE_PATH.exists() else {}
@@ -77,6 +79,7 @@ CREATE TABLE IF NOT EXISTS remote.row_origins(table_name VARCHAR,physical_row_id
 CREATE TABLE IF NOT EXISTS remote.row_signers(author_user_id VARCHAR,author_device_id VARCHAR,root_public VARCHAR,certificate JSON,PRIMARY KEY(author_user_id,author_device_id));
 CREATE TABLE IF NOT EXISTS remote.workspace_controls(workspace_id VARCHAR,revision UINTEGER,epoch UINTEGER,state_hash VARCHAR,control JSON,PRIMARY KEY(workspace_id,revision));
 CREATE TABLE IF NOT EXISTS remote.row_proofs(id VARCHAR PRIMARY KEY,workspace_id VARCHAR,row_kind VARCHAR,source_row_id VARCHAR,encoding_v USMALLINT,content_hash VARCHAR,revision VARCHAR,previous_revision VARCHAR,state VARCHAR,author_user_id VARCHAR,author_device_id VARCHAR,authorization_epoch UINTEGER,signature VARCHAR);
+CREATE TABLE IF NOT EXISTS remote.row_conflicts(proof_id VARCHAR PRIMARY KEY,body JSON);
 CREATE TABLE IF NOT EXISTS archive_state(singleton BOOLEAN PRIMARY KEY,archive_id UUID NOT NULL,generation UBIGINT NOT NULL);
 """
 ARCHIVE_COLUMNS={"conversations":["id","source","title","created_at","updated_at","model","cwd","git_branch","project_id","metadata"],"messages":["id","conversation_id","role","content","thinking","created_at","model","metadata","parent_id"],"tool_calls":["id","message_id","tool_name","input","output","status","duration_ms","created_at"],"attachments":["id","message_id","filename","mime_type","size","path","url","created_at"],"artifacts":["id","conversation_id","artifact_type","title","content","language","created_at","version"],"file_edits":["id","message_id","file_path","edit_type","content","created_at","old_content"]}
@@ -154,7 +157,7 @@ def project_provenance(db,value,map_id=lambda table,value:value):
     _archive_touch(db)
     return True
 def capture_provenance(path=None,edit_ids=None,source="sync"):
-    connect=lambda read_only=False: duckdb.connect(str(path),read_only=read_only) if path else get_db(read_only); core=connect(True)
+    connect=lambda read_only=False: open_db(path,read_only) if path else get_db(read_only); core=connect(True)
     try: edits=_provenance_edits(core,edit_ids)
     finally: core.close()
     records,repos=_observe_provenance(edits,source); core=connect(); core.execute("BEGIN")
@@ -181,6 +184,12 @@ def project_workspace_controls(db,controls):
         if old and old[0]!=proof: raise ValueError("workspace control conflict")
         db.execute("INSERT OR IGNORE INTO remote.workspace_controls VALUES (?,?,?,?,?)",(*key,value["epoch"],proof,raw))
     return len(controls)
+def project_logical_row(db,row,proof,proof_id,native=False):
+    table,source=row["kind"],row["id"]; mapped=lambda kind,value:value if native or value is None else provenance_digest(f"{proof['workspace']}:{proof['author_user_id']}:{kind}:{value}")[:16]; physical=mapped(table,source); origin=None if native else {"workspace_id":proof["workspace"],"author_user_id":proof["author_user_id"],"author_device_id":proof["author_device_id"],"source_row_id":source,"source_event_id":proof["revision"],"content_key":f"{table}:{source}","observed_at":None,"proof_id":proof_id}
+    if row["state"]=="deleted": db.execute(f"DELETE FROM {table} WHERE id=?",(physical,)); origin and db.execute("INSERT OR REPLACE INTO remote.row_origins VALUES (?,?,?,?,?,?,?,?,?,?)",(table,physical,*(origin[k] for k in ("workspace_id","author_user_id","author_device_id","source_row_id","source_event_id","content_key","observed_at","proof_id")))); _archive_touch(db); return physical
+    data={"id":source,**row["data"]}; values=[data[c] if c in data else None for c in ARCHIVE_COLUMNS[table]]; values[0]=physical
+    for column,parent in {"messages":(("conversation_id","conversations"),("parent_id","messages")),"tool_calls":(("message_id","messages"),),"attachments":(("message_id","messages"),),"artifacts":(("conversation_id","conversations"),),"file_edits":(("message_id","messages"),)}.get(table,()): values[ARCHIVE_COLUMNS[table].index(column)]=mapped(parent,data[column])
+    project_archive_row(db,table,ARCHIVE_COLUMNS[table],values,origin); return physical
 def set_attachment_path(db,row_id,path): db.execute("UPDATE attachments SET path=? WHERE id=?",(str(path),row_id)); _archive_touch(db)
 def init_schema(conn):
     conn.execute("""CREATE TABLE IF NOT EXISTS conversations (

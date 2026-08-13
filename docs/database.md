@@ -147,6 +147,7 @@ does not change semantic row identity after device recovery.
 | `row_proofs` | Bodyless signed revision, content hash, predecessor, state, author, and authorization epoch |
 | `row_signers` | One normalized root key and device certificate per author device |
 | `workspace_controls` | Signed origin-workspace authorization chain, once per control revision |
+| `row_conflicts` | Canonical logical body for a rare verified incomparable head not selected as the main row |
 
 Proof rows never duplicate conversation content. Reissuing an equivalent
 certificate for the same certified device keys does not create another signer.
@@ -154,6 +155,9 @@ Sync creates proofs only after portable-path normalization and mandatory team
 redaction. Unchanged rows reuse their existing proof; a changed or reverted row
 names its one known head as predecessor. Multiple unmatched heads block
 automatic publication instead of guessing ancestry.
+On receive, a causal successor updates the ordinary archive table, a stale
+ancestor is ignored, and an incomparable signed body is retained in
+`row_conflicts` rather than winning by relay arrival time.
 
 ### archive_state
 
