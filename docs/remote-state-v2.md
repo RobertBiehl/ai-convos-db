@@ -131,10 +131,12 @@ Core initializes a `provenance` DuckDB schema with these relations:
 - `git_checkpoints`
 - `checkpoint_edits`
 
-Core also initializes `remote.row_origins`, a compact canonical attribution
-relation containing the physical row, source row, workspace, author user and
-device, signed source event, logical content key, and observation time. It
-contains identifiers only, never event bodies or duplicated archive content.
+Core also initializes compact `remote.row_origins`, `remote.row_proofs`,
+`remote.row_signers`, and `remote.workspace_controls` relations. Together they
+retain physical-to-source attribution, bodyless signed causal revisions,
+normalized signer certificates, and the signed authorization chain needed to
+verify an origin epoch after relay loss. They contain identifiers and proofs
+only, never event bodies or duplicated archive content.
 Imported physical IDs derive from `(workspace, author user, table, source row)`.
 The verified device certificate supplies the user; projection fails when that
 mapping is absent. Content equality is never used to infer row identity.

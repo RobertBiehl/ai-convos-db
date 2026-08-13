@@ -12,11 +12,11 @@ read_when:
 DuckDB database at `<root>/data/convos.db`. Default root is `~/.convos` (override with `CONVOS_PROJECT_ROOT`).
 
 Core owns the `provenance` schema in this same DuckDB. It stores canonical
-repository, file, hash, checkpoint, assertion, and gap facts while joining
+repository, file, hash, checkpoint, and edit-link facts while joining
 prompts, conversations, and edits from the existing archive tables. Remote
 submits verified facts through the core projector. Transport cursors and
 device/workspace activity remain in `<root>/remote/state.db`; durable imported
-row authorship lives in `remote.row_origins` in DuckDB. The main-schema
+row authorship and compact signed proofs live in the `remote` DuckDB schema. The main-schema
 `archive_state` row gives the file a stable identity and monotonic generation
 for rollback-safe remote recovery.
 
@@ -134,12 +134,22 @@ There are intentionally no copied prompts, message bodies, changesets,
 file-edit bodies, raw remote payloads, workspace IDs, or device IDs in this
 schema.
 
-`remote.row_origins` is the separate identifier-only exception for remotely
+The `remote` schema is the separate identifier-only exception for remotely
 projected archive rows. Core writes it atomically with each imported row so
 deleting synchronization state cannot change authorship or make a foreign row
 publishable. Imported physical IDs use the verified author user plus workspace,
 table, and exact source row; the signing device remains separate provenance and
 does not change semantic row identity after device recovery.
+
+| Relation | Durable facts |
+|----------|---------------|
+| `row_origins` | Current physical-to-source row attribution and optional proof link |
+| `row_proofs` | Bodyless signed revision, content hash, predecessor, state, author, and authorization epoch |
+| `row_signers` | One normalized root key and device certificate per author device |
+| `workspace_controls` | Signed origin-workspace authorization chain, once per control revision |
+
+Proof rows never duplicate conversation content. Reissuing an equivalent
+certificate for the same certified device keys does not create another signer.
 
 ### archive_state
 
