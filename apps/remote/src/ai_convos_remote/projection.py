@@ -186,10 +186,10 @@ def attest_rows(db_path,cfg,workspace,records,origins=()):
         db.execute("COMMIT"); return made
     except BaseException: db.execute("ROLLBACK"); raise
     finally: db.close()
-def row_replicas(db_path,cfg,workspace,records,key,known=(),origins=()):
+def row_replicas(db_path,cfg,workspace,records,keys,known=(),origins=(),origin_epochs=None):
     fields=("workspace","authorization_workspace","row_kind","row_id","encoding_v","content_hash","revision","previous_revision","state","author_user_id","author_device_id","authorization_epoch","signature"); db=open_db(db_path,True); bodies={}
     proof=lambda values:{"v":1,"kind":"row.proof",**dict(zip(fields,values))}
-    keep=lambda row,p:bodies.setdefault(fingerprint(key,digest(p)),(row,p))
+    keep=lambda row,p:bodies.setdefault(digest(p),(row,p))
     try:
         scopes=(workspace,*origins); marks=','.join('?'*len(scopes))
         for record in (r for r in records if r["kind"] in TABLES):
@@ -207,7 +207,7 @@ def row_replicas(db_path,cfg,workspace,records,key,known=(),origins=()):
             else: continue
             keep(row,p)
         for raw,values in db.execute(f"SELECT CAST(c.body AS VARCHAR),p.workspace_id,p.authorization_workspace_id,p.row_kind,p.source_row_id,p.encoding_v,p.content_hash,p.revision,p.previous_revision,p.state,p.author_user_id,p.author_device_id,p.authorization_epoch,p.signature FROM remote.row_conflicts c JOIN remote.row_proofs p ON p.id=c.proof_id WHERE p.workspace_id IN ({marks})",scopes).fetchall(): keep(json.loads(raw),proof(values))
-        return [seal_replica(row,p,workspace,cfg["workspaces"][workspace]["epoch"],key,cfg["device"]["id"]) for token,(row,p) in bodies.items() if token not in known]
+        delivery=lambda p:p["authorization_epoch"] if p["authorization_workspace"]==workspace else (origin_epochs or {})[p["workspace"]]; return [seal_replica(row,p,workspace,epoch,keys[epoch],cfg["device"]["id"]) for row,p in bodies.values() for epoch in [delivery(p)] if epoch in keys and fingerprint(keys[epoch],digest(p)) not in known]
     finally: db.close()
 def apply_row_replica(db_path,body,workspace,controls,recover=None,local_user=None,db=None):
     row,proof=body["row"],body["proof"]; allowed={workspace,*[c["workspace"] for c in controls]}; candidates=[{k:r[k] for k in ("user","root_public","device","certificate")} for c in controls if proof["workspace"] in allowed and c["workspace"]==proof["authorization_workspace"] and c["epoch"]==proof["authorization_epoch"] and proof["author_device_id"] in c["devices"] for r in [c["devices"][proof["author_device_id"]]]]; signer_=candidates[0] if candidates and all(c==candidates[0] for c in candidates) else (_ for _ in ()).throw(ValueError("row proof authorization unavailable")); verify_row_proof(proof,row,signer_["certificate"],signer_["root_public"]); own=db is None

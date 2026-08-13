@@ -53,14 +53,14 @@ def test_repairable_replica_is_uploader_bounded_and_replaceable(tmp_path,monkeyp
 def test_team_add_default_history_grant_remove_and_rotation(tmp_path):
     db = connect(tmp_path/"server.db"); a, b = account(db,"alice"), account(db,"bob"); ws = "team"; k1,k2,k3 = bytes([1])*32,bytes([2])*32,bytes([3])*32
     state=create_ws(db,a,ws,k1,"team")
-    old = seal_event(event(a["device"],1,"message.record","old",{"content":"before bob"},[],"2026-01-01T00:00:00Z"),ws,1,k1); action(db,{"op":"upload","envelope":old},a["token"])
+    old = seal_event(event(a["device"],1,"message.record","old",{"content":"before bob"},[],"2026-01-01T00:00:00Z"),ws,1,k1); action(db,{"op":"upload","envelope":old},a["token"]); row=logical_row("messages",identity="old",state="deleted"); replica=seal_replica(row,row_proof(a["device"],a["user"],ws,1,row),ws,1,k1,a["device"]["id"])
     state=rotate_ws(db,a,state,k2,((a,"admin"),(b,"member")))
-    assert action(db,{"op":"pull","workspace":ws,"after":0},b["token"])["events"] == []
+    action(db,{"op":"replica_upload_many","envelopes":[replica]},a["token"]); assert action(db,{"op":"pull","workspace":ws,"after":0},b["token"])["events"] == [] and action(db,{"op":"replica_pull","workspace":ws,"after":0},b["token"])["replicas"]==[] and action(db,{"op":"replica_reconcile","workspace":ws,"replicas":[replica["replica"]]},b["token"])["present"]=={}
     current = seal_event(event(a["device"],2,"message.record","new",{"content":"after bob"},[old["event"]],"2026-01-02T00:00:00Z"),ws,2,k2); action(db,{"op":"upload","envelope":current},a["token"])
     assert [x["envelope"]["event"] for x in action(db,{"op":"pull","workspace":ws,"after":0},b["token"])["events"]] == [current["event"]]
     old_for_b = seal_key(k1,b["device"]["box_public"],f"workspace:{ws}:epoch:1")
     state=history_ws(a,state,b["user"]); action(db,sign_control(a["device"],{"op":"grant_all","workspace":ws,"user":b["user"],"control":state,"envelopes":{"1":{b["device"]["id"]:old_for_b},"2":{b["device"]["id"]:seal_key(k2,b["device"]["box_public"],f"workspace:{ws}:epoch:2")}}}),a["token"])
-    assert len(action(db,{"op":"pull","workspace":ws,"after":0},b["token"])["events"]) == 2
+    assert len(action(db,{"op":"pull","workspace":ws,"after":0},b["token"])["events"]) == 2 and action(db,{"op":"replica_pull","workspace":ws,"after":0},b["token"])["replicas"][0]["envelope"]==replica
     rotate_ws(db,a,state,k3,((a,"admin"),))
     with pytest.raises(PermissionError): action(db,{"op":"pull","workspace":ws,"after":0},b["token"])
 

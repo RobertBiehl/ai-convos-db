@@ -270,7 +270,9 @@ and retained origin proof, so any authorized holder can repair it without the
 author's key.
 For a re-founded workspace, the old signed control chain is encrypted once as
 an origin bundle and shared by all of its row replicas; it is not duplicated
-inside each proof or body. Rotation reseals that bundle for the new epoch.
+inside each proof or body. The bundle and those initial replicas remain at the
+explicit binding epoch; rotation does not silently grant them to future-only
+members. A later successor uses the epoch that authorized that revision.
 Dispatch is exact on `(kind, payload_v)`. Unknown families and unsupported core
 versions are required by default and block publication; only receiver-known,
 archive-isolated auxiliary families whose product is not installed may defer
