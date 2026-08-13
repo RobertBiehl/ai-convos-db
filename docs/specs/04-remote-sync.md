@@ -139,8 +139,7 @@ Required initial kinds:
 - `conversation.record`, `message.record`, `tool.record`, `attachment.record`,
   `artifact.record`, `file_edit.record`
 - `repository.observed`, `git.checkpoint`, `file.version`, `edit.observed`
-- `checkpoint.link`, `identity.assertion`
-- `capture.gap`, `workspace.policy`, `workspace.membership`
+- `checkpoint.link`, `workspace.policy`, `workspace.membership`
 
 Provenance events carry semantic references, not copied content: edit identity
 is `file_edits.id`, changeset identity is the existing message/turn, and prompt
@@ -238,20 +237,16 @@ normalized non-local remotes when available, while a separate lineage id uses
 root commits. Clones can match; forks remain distinct repositories connected by
 shared lineage. URLs and absolute roots are never server-visible.
 
-`git.checkpoint` records HEAD, index/worktree digest, branch, and observed file
-versions. Fine-grained edits link versions between checkpoints. Replaying
-captured edits from checkpoint A to B proves completeness only when resulting
-hashes match. Otherwise the projector emits `capture.gap` with relation
-`unobserved_change`; it never assigns a prompt or tool.
+`git.checkpoint` records HEAD, an index/worktree digest, dirty paths, capture
+source, and observation time. It is capture-time context, not a complete
+repository snapshot or inferred turn baseline. An edit links to it only when
+complete captured content exactly matches the observed file version. Unrelated
+dirty paths and theoretical tool side effects never become capture gaps.
 
-File identity is evidence-based:
-
-- equal content is `same_content`, not automatically the same file;
-- explicit captured move can assert `same_lineage` exactly;
-- copy creates a distinct file with `copied_from`;
-- generation creates `generated_from`;
-- Git similarity creates a reversible `inferred_rename` assertion;
-- user confirmation is an explicit signed assertion.
+File identity is repository plus normalized relative path, or an opaque
+external identity. Explicit moves remain captured operations; equivalence and
+likely renames remain read-only hints until a concrete use case earns a typed
+canonical relation.
 
 ## Stable application contract
 
@@ -262,8 +257,6 @@ Applications consume typed projection APIs/views, not envelopes. Initial views:
 - `conversation_changes`
 - `commit_conversations`
 - `repository_activity`
-- `identity_assertions`
-- `capture_gaps`
 
 There are two installable packages. The remote client contains internal modules
 for canonical encoding, crypto, enrollment, keyring, synchronization,

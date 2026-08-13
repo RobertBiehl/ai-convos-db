@@ -56,7 +56,7 @@ def test_cutover_install_failure_keeps_old_state_and_verified_backup(tmp_path,mo
 
 def test_unchanged_provenance_does_not_republish_but_file_change_does(tmp_path):
     repo,core=source(tmp_path); state=connect(tmp_path/"state.db"); device=identity(); ws="personal"; cfg={"user":"user","device":device,"workspaces":{ws:{"kind":"personal","epoch":1}},"keys":{f"{ws}:1":b64(bytes(range(32)))}}; heads={}
-    first=scan(core,state); timed=[r for r in first if r["kind"] in ("git.checkpoint","file.version","capture.gap")]; assert timed and all("observed_at" in r and "observed_at" not in r["payload"] for r in timed)
+    first=scan(core,state); timed=[r for r in first if r["kind"] in ("git.checkpoint","file.version")]; assert timed and all("observed_at" in r and "observed_at" not in r["payload"] for r in timed)
     assert all(publish(cfg,state,ws,r,tmp_path/"client",True,heads) for r in first); baseline=state.execute("SELECT COUNT(*) FROM outbox").fetchone()[0]
     assert not any(publish(cfg,state,ws,r,tmp_path/"client",True,heads) for r in scan(core,state)) and state.execute("SELECT COUNT(*) FROM outbox").fetchone()[0]==baseline
     (repo/"a.py").write_text("changed\n"); emitted={r["kind"] for r in scan(core,state) if publish(cfg,state,ws,r,tmp_path/"client",True,heads)}

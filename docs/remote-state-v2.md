@@ -39,7 +39,6 @@ DuckDB owns user-visible canonical content:
 - repository, checkout, and file identity;
 - file versions and exact edit-to-file relationships;
 - Git checkpoints and checkpoint-to-edit evidence;
-- identity assertions and capture gaps.
 - durable `remote.row_origins` attribution for every remotely projected archive
   row, written atomically with that row.
 - the single-row `archive_state` identity and generation used to detect file
@@ -131,8 +130,6 @@ Core initializes a `provenance` DuckDB schema with these relations:
 - `file_edit_files`
 - `git_checkpoints`
 - `checkpoint_edits`
-- `assertions`
-- `capture_gaps`
 
 Core also initializes `remote.row_origins`, a compact canonical attribution
 relation containing the physical row, source row, workspace, author user and
