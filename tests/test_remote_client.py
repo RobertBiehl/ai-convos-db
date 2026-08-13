@@ -49,6 +49,11 @@ def test_remote_scan_is_read_only_and_does_not_self_trigger(tmp_path,monkeypatch
     sync_once(root); db=duckdb.connect(str(path),read_only=True); assert db.execute("SELECT observed_at FROM provenance.repositories").fetchone()[0]==observed; db.close(); assert server.execute("SELECT COUNT(*) FROM events").fetchone()[0]==count
 
 
+def test_sync_settles_encrypted_row_replicas_without_state_content(tmp_path,monkeypatch):
+    server=server_connect(tmp_path/"server.db"); monkeypatch.setattr("ai_convos_remote.request",transport(server)); monkeypatch.setattr("ai_convos_remote.drain_hooks",lambda:None); root=tmp_path/"client"; setup_client("http://server","alice",root=root); marker="replica-plaintext-must-stay-local"; write_archive(root/"data/convos.db",marker); sync_once(root,True)
+    assert server.execute("SELECT COUNT(*) FROM row_replicas").fetchone()[0]==1 and marker.encode() not in (tmp_path/"server.db").read_bytes(); state=connect(root/"remote/state.db"); assert state.execute("SELECT COUNT(*) FROM replica_outbox").fetchone()[0]==0 and state.execute("SELECT COUNT(*) FROM replica_receipts").fetchone()[0]==1 and not {"envelope","content","data"}&{r[1] for table, in state.execute("SELECT name FROM sqlite_master WHERE type='table'") for r in state.execute(f"PRAGMA table_info({table})")}; state.close(); assert not list((root/"remote/outbox").glob("replica-*"))
+
+
 def test_personal_recovery_multidevice_delivery_and_replay(tmp_path,monkeypatch):
     server=server_connect(tmp_path/"server.db"); monkeypatch.setattr("ai_convos_remote.request",transport(server)); a,b=tmp_path/"a",tmp_path/"b"
     alice,recovery=setup_client("http://server","alice","laptop",root=a); ws=workspace(alice,"Personal"); state_a=connect(a/"remote/state.db"); publish(alice,state_a,ws,conversation(),a); upload(alice,state_a,a)
