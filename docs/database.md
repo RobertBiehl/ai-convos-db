@@ -150,6 +150,10 @@ does not change semantic row identity after device recovery.
 
 Proof rows never duplicate conversation content. Reissuing an equivalent
 certificate for the same certified device keys does not create another signer.
+Sync creates proofs only after portable-path normalization and mandatory team
+redaction. Unchanged rows reuse their existing proof; a changed or reverted row
+names its one known head as predecessor. Multiple unmatched heads block
+automatic publication instead of guessing ancestry.
 
 ### archive_state
 

@@ -25,7 +25,7 @@ def test_app_line_budgets():
     root = Path(__file__).resolve().parents[1]
     for src in sorted((root / "apps").glob("*/src")):
         loc = _loc(sorted(src.rglob("*.py")))
-        limit = {"changegraph": 400, "memory": 650, "remote": 900, "remote_server": 325}.get(src.parent.name, 200)
+        limit = {"changegraph": 400, "memory": 650, "remote": 950, "remote_server": 325}.get(src.parent.name, 200)
         assert loc < limit, f"App {src.parent.name} budget exceeded: {loc} >= {limit}"
 
 

@@ -6,9 +6,9 @@ from importlib.metadata import entry_points
 from pathlib import Path
 
 import duckdb
-from ai_convos.cli import ARCHIVE_COLUMNS as COLUMNS, PROVENANCE_KINDS as PROVENANCE, init_schema, observe_provenance, project_archive_row, project_provenance, repository as resolve_repository, set_attachment_path
+from ai_convos.cli import ARCHIVE_COLUMNS as COLUMNS, PROVENANCE_KINDS as PROVENANCE, init_schema, observe_provenance, project_archive_row, project_provenance, project_row_proof, project_workspace_controls, repository as resolve_repository, set_attachment_path
 from ai_convos_changegraph.provenance import query as graph_query
-from .protocol import digest
+from .protocol import digest, logical_row, row_proof
 
 STATE_VERSION="8"
 STATE = """
@@ -163,6 +163,18 @@ def scan(core,graph,kind="personal",repositories=(),roots=()):
         p,k=r["payload"],r["kind"]
         if k=="edit.observed" and p["id"] in edits or k=="file.observed" and p["id"] in allowed_files or k=="file.version" and p["file"] in allowed_files or k in ("repository.observed","git.checkpoint") and p.get("repository",p.get("id")) in allowed_repos or k=="checkpoint.link" and p["edit"] in edits: keep.append(r)
     return keep
+def attest_rows(db_path,cfg,workspace,records):
+    controls=next(w["controls"] for w in cfg["server_state"]["workspaces"] if w["id"]==workspace); device=cfg["device"]; signer=cfg["controls"][workspace]["devices"][device["id"]]; db=duckdb.connect(str(db_path)); init_schema(db); made=0; db.execute("BEGIN")
+    try:
+        project_workspace_controls(db,controls)
+        for record in (r for r in records if r["kind"] in TABLES):
+            p=record["payload"]; row=logical_row(p["table"],p["columns"],p["row"]); heads=db.execute("SELECT DISTINCT p.revision,p.content_hash FROM remote.row_proofs p WHERE p.workspace_id=? AND p.row_kind=? AND p.source_row_id=? AND p.author_user_id=? AND NOT EXISTS (SELECT 1 FROM remote.row_proofs c WHERE c.workspace_id=p.workspace_id AND c.row_kind=p.row_kind AND c.source_row_id=p.source_row_id AND c.author_user_id=p.author_user_id AND c.previous_revision=p.revision)",(workspace,row["kind"],row["id"],cfg["user"])).fetchall(); current=digest(row)
+            if any(h[1]==current for h in heads): continue
+            if len(heads)>1: raise ValueError(f"row revision conflict: {row['kind']}:{row['id']}")
+            proof=row_proof(device,cfg["user"],workspace,cfg["workspaces"][workspace]["epoch"],row,heads[0][0] if heads else None); project_row_proof(db,proof,signer["root_public"],signer["certificate"]); made+=1
+        db.execute("COMMIT"); return made
+    except BaseException: db.execute("ROLLBACK"); raise
+    finally: db.close()
 def author_user(value,authors): return (authors or {}).get(value["author"]) or (_ for _ in ()).throw(ValueError("verified author user required"))
 def foreign_id(workspace,author_user,table,old): return digest(f"{workspace}:{author_user}:{table}:{old}")[:16] if old else old
 def attachment_path(db_path,db,target,path):
