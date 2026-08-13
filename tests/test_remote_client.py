@@ -6,13 +6,12 @@ import pytest
 import ai_convos_memory as memory_module
 import ai_convos_remote as remote_client
 import ai_convos_remote.projection as projection_module
-from cryptography.exceptions import InvalidSignature
 from ai_convos.cli import ARCHIVE_COLUMNS, archive_state, capture_provenance, init_schema, project_archive_row
-from ai_convos_remote import (_upload_batches, add_member, approve_device, approve_history, connect, control_body, create, doctor_status, fetch_lazy, flush_selected, grant_all, grant_selected, key, load, pull, publish, refresh, remove_device,
+from ai_convos_remote import (_upload_batches, add_member, approve_device, approve_history, connect, control_body, create, doctor_status, fetch_lazy, grant_all, key, load, pull, publish, refresh, remove_device,
                               request_device, request_history, rescue_bindings, setup_client, sync_once, upload, workspace)
 from ai_convos_remote.control import sign as control_sign, vote as device_vote
 from ai_convos_remote.projection import inspect_state, scan
-from ai_convos_remote.protocol import certificate, event, identity, seal_event, seal_history, seal_key, sign_control, unb64
+from ai_convos_remote.protocol import certificate, event, identity, seal_event, seal_key, sign_control, unb64
 from ai_convos_remote_server import action, connect as server_connect
 
 
@@ -182,26 +181,17 @@ def test_relay_workspace_omission_stops_stale_upload(tmp_path,monkeypatch):
     assert team in load(a)["workspaces"] and server.execute("SELECT COUNT(*) FROM events WHERE workspace=?",(team,)).fetchone()[0]==baseline and state.execute("SELECT COUNT(*) FROM outbox WHERE event=?",(pending,)).fetchone()[0]==1
 
 
-def test_team_default_selected_complete_history_and_removal(tmp_path,monkeypatch):
+def test_team_future_only_complete_history_and_removal(tmp_path,monkeypatch):
     server=server_connect(tmp_path/"server.db"); monkeypatch.setattr("ai_convos_remote.request",transport(server)); a,b=tmp_path/"a",tmp_path/"b"
     alice,_=setup_client("http://server","alice","laptop",root=a); bob,_=setup_client("http://server","bob","desktop",root=b); team=create(alice,"Team","team",a); sa,sb=connect(a/"remote/state.db"),connect(b/"remote/state.db")
-    old=publish(alice,sa,team,conversation("before bob"),a); upload(alice,sa,a); add_member(alice,team,"bob",root=a); bob=load(b); pull(bob,sb,b); assert not (b/"data/convos.db").exists()
+    publish(alice,sa,team,conversation("before bob"),a); upload(alice,sa,a); add_member(alice,team,"bob",root=a); bob=load(b); pull(bob,sb,b); assert not (b/"data/convos.db").exists()
     publish(alice,sa,team,conversation("after bob","new"),a); upload(alice,sa,a); bob=load(b); pull(bob,sb,b); assert duckdb.connect(str(b/"data/convos.db"),read_only=True).execute("SELECT title FROM conversations").fetchall()==[("after bob",)]
-    assert grant_selected(alice,sa,team,"bob",[old],a)==1; bob=load(b); pull(bob,sb,b); assert {r[0] for r in duckdb.connect(str(b/"data/convos.db"),read_only=True).execute("SELECT title FROM conversations").fetchall()}=={"before bob","after bob"}
     previous=alice["controls"][team]; members={**previous["members"],bob["user"]:{**previous["members"][bob["user"]],"history_from":1}}; control=control_body(alice,previous,key(alice,team,previous["epoch"]),"history",members=members); incomplete={"op":"grant_all","workspace":team,"user":bob["user"],"control":control,"envelopes":{}}
     with pytest.raises(ValueError,match="every workspace epoch"): action(server,sign_control(alice["device"],incomplete),alice["token"])
     future={**incomplete,"envelopes":{"999":{bob["device"]["id"]:{}}}}
     with pytest.raises(ValueError,match="outside"): action(server,sign_control(alice["device"],future),alice["token"])
     assert grant_all(alice,team,"bob",a)>=2; bob=load(b); pull(bob,sb,b); assert any(name.endswith(":1") for name in load(b)["keys"])
     add_member(alice,team,"bob",True,root=a); bob=load(b); pull(bob,sb,b); assert team not in {w["id"] for w in load(b)["server_state"]["workspaces"]} and f"{team}:3" not in load(b)["keys"]
-
-
-def test_selected_delivery_is_derived_after_crash_and_state_loss(tmp_path,monkeypatch):
-    server=server_connect(tmp_path/"server.db"); monkeypatch.setattr("ai_convos_remote.request",transport(server)); a,b=tmp_path/"a",tmp_path/"b"; alice,_=setup_client("http://server","alice",root=a); setup_client("http://server","bob",root=b); team=create(alice,"Team","team",a); state=connect(a/"remote/state.db"); old=publish(alice,state,team,conversation("durable selected"),a); upload(alice,state,a); add_member(alice,team,"bob",root=a); real=remote_client.flush_selected; monkeypatch.setattr(remote_client,"flush_selected",lambda *args:(_ for _ in ()).throw(ConnectionError("after signed grant")))
-    with pytest.raises(ConnectionError,match="signed grant"): grant_selected(alice,state,team,"bob",[old],a)
-    assert old in load(a)["controls"][team]["members"][load(b)["user"]]["selected"]; state.close(); [Path(str(a/"remote/state.db")+suffix).unlink(missing_ok=True) for suffix in ("","-wal","-shm")]; monkeypatch.setattr(remote_client,"flush_selected",real); rebuilt=connect(a/"remote/state.db"); pull(load(a),rebuilt,a); flush_selected(load(a),rebuilt,a,{team}); upload(load(a),rebuilt,a,{team}); pull(load(b),connect(b/"remote/state.db"),b)
-    assert duckdb.connect(str(b/"data/convos.db"),read_only=True).execute("SELECT title FROM conversations").fetchone()[0]=="durable selected" and not rebuilt.execute("SELECT 1 FROM sqlite_master WHERE name='history_queue'").fetchone()
-
 
 def test_path_bindings_are_rescued_to_config_before_state_cutover(tmp_path):
     path=tmp_path/"state.db"; db=sqlite3.connect(path); db.execute("CREATE TABLE policies(workspace TEXT,kind TEXT,value TEXT,local_root TEXT)"); db.execute("INSERT INTO policies VALUES ('w','path','token','/local/worktree'),('w','repository','repo','/ignored')"); db.commit(); db.close(); cfg={"bindings":{}}
@@ -350,33 +340,14 @@ def test_history_can_be_approved_later_and_sync_rewinds(tmp_path,monkeypatch):
     recovered=load(c); pull(recovered,sc,c); assert {r[0] for r in duckdb.connect(str(c/"data/convos.db"),read_only=True).execute("SELECT title FROM conversations").fetchall()}=={"old","new"}
 
 
-def test_same_user_approval_rewraps_selected_history(tmp_path,monkeypatch):
-    server=server_connect(tmp_path/"server.db"); monkeypatch.setattr("ai_convos_remote.request",transport(server)); a,b,c=tmp_path/"a",tmp_path/"b",tmp_path/"c"; alice,_=setup_client("http://server","alice",root=a); bob,recovery=setup_client("http://server","bob","laptop",root=b); team=create(alice,"Team","team",a); sa,sb=connect(a/"remote/state.db"),connect(b/"remote/state.db"); old=publish(alice,sa,team,conversation("selected"),a); upload(alice,sa,a); add_member(alice,team,"bob",root=a); grant_selected(alice,sa,team,"bob",[old],a); pull(load(b),sb,b); desktop,_=setup_client("http://server","bob","desktop",recovery,root=c); request_device(desktop,team,c,0); assert approve_device(load(b),team,desktop["device"]["id"],root=b)["approved"]
-    pull(load(c),connect(c/"remote/state.db"),c); assert duckdb.connect(str(c/"data/convos.db"),read_only=True).execute("SELECT title FROM conversations").fetchone()[0]=="selected"
+def test_same_user_approval_rewraps_complete_history(tmp_path,monkeypatch):
+    server=server_connect(tmp_path/"server.db"); monkeypatch.setattr("ai_convos_remote.request",transport(server)); a,b,c=tmp_path/"a",tmp_path/"b",tmp_path/"c"; alice,_=setup_client("http://server","alice",root=a); bob,recovery=setup_client("http://server","bob","laptop",root=b); team=create(alice,"Team","team",a); sa,sb=connect(a/"remote/state.db"),connect(b/"remote/state.db"); publish(alice,sa,team,conversation("complete"),a); upload(alice,sa,a); add_member(alice,team,"bob",root=a); grant_all(alice,team,"bob",a); pull(load(b),sb,b); desktop,_=setup_client("http://server","bob","desktop",recovery,root=c); request_device(desktop,team,c,0); assert approve_device(load(b),team,desktop["device"]["id"],root=b)["approved"]
+    pull(load(c),connect(c/"remote/state.db"),c); assert duckdb.connect(str(c/"data/convos.db"),read_only=True).execute("SELECT title FROM conversations").fetchone()[0]=="complete"
 
 
 def test_relay_clock_enforces_proposal_delay(tmp_path,monkeypatch):
     server=server_connect(tmp_path/"server.db"); monkeypatch.setattr("ai_convos_remote.request",transport(server)); monkeypatch.setattr("ai_convos_remote_server.APPROVAL_DELAY",3600); a,b,c=tmp_path/"a",tmp_path/"b",tmp_path/"c"; alice,recovery=setup_client("http://server","alice",root=a); setup_client("http://server","bob",root=b); team=create(alice,"Team","team",a); add_member(alice,team,"bob",root=a); recovered,_=setup_client("http://server","alice","recovered",recovery,root=c); remove_device(alice,team,alice["device"]["id"],a); request_device(recovered,team,c,0)
     with pytest.raises(ValueError,match="active"): approve_device(load(b),team,recovered["device"]["id"],root=b)
-
-
-def test_republished_history_verifies_embedded_author(tmp_path,monkeypatch):
-    server=server_connect(tmp_path/"server.db"); monkeypatch.setattr("ai_convos_remote.request",transport(server)); a,b=tmp_path/"a",tmp_path/"b"; alice,_=setup_client("http://server","alice",root=a); bob,_=setup_client("http://server","bob",root=b); team=create(alice,"Team","team",a); add_member(alice,team,"bob",root=a); inner=event(bob["device"],1,"conversation.record","conversations:inner",conversation("signed","inner")["payload"]); inner["payload"]["row"][2]="forged"; state=connect(a/"remote/state.db")
-    entity="history:forged"; publish(alice,state,team,{"kind":"history.republish","entity":entity,"payload":{"target":bob["user"],"sealed":seal_history(inner,[bob["device"]],entity)}},a); upload(alice,state,a)
-    target=connect(b/"remote/state.db")
-    with pytest.raises(InvalidSignature): pull(load(b),target,b)
-    assert not target.execute("SELECT 1 FROM receipts WHERE kind='history.republish'").fetchone() and not (b/"data/convos.db").exists()
-
-
-def test_selected_history_cannot_cross_workspaces(tmp_path,monkeypatch):
-    server=server_connect(tmp_path/"server.db"); monkeypatch.setattr("ai_convos_remote.request",transport(server)); a,b=tmp_path/"a",tmp_path/"b"; alice,_=setup_client("http://server","alice",root=a); setup_client("http://server","bob",root=b); first,second=create(alice,"First","team",a),create(alice,"Second","team",a); add_member(alice,first,"bob",root=a); add_member(alice,second,"bob",root=a); state=connect(a/"remote/state.db"); eid=publish(alice,state,first,conversation("first-only"),a); upload(alice,state,a); before=server.execute("SELECT COUNT(*) FROM events WHERE workspace=?",(second,)).fetchone()[0]
-    with pytest.raises(ValueError,match="receipt"): grant_selected(alice,state,second,"bob",[eid],a)
-    assert server.execute("SELECT COUNT(*) FROM events WHERE workspace=?",(second,)).fetchone()[0]==before
-
-
-def test_selected_history_is_encrypted_to_target_devices(tmp_path,monkeypatch):
-    server=server_connect(tmp_path/"server.db"); monkeypatch.setattr("ai_convos_remote.request",transport(server)); a,b,c=tmp_path/"a",tmp_path/"b",tmp_path/"c"; alice,_=setup_client("http://server","alice",root=a); setup_client("http://server","bob",root=b); setup_client("http://server","carol",root=c); team=create(alice,"Team","team",a); state=connect(a/"remote/state.db"); old=publish(alice,state,team,conversation("old-secret"),a); upload(alice,state,a); add_member(alice,team,"bob",root=a); add_member(alice,team,"carol",root=a); grant_selected(alice,state,team,"bob",[old],a); sb,sc=connect(b/"remote/state.db"),connect(c/"remote/state.db"); pull(load(b),sb,b); pull(load(c),sc,c)
-    assert duckdb.connect(str(b/"data/convos.db"),read_only=True).execute("SELECT title FROM conversations").fetchone()[0]=="old-secret" and not (c/"data/convos.db").exists(); assert b"old-secret" not in (c/"remote/state.db").read_bytes()
 
 
 def test_lost_upload_response_and_interrupted_pull_recover_idempotently(tmp_path,monkeypatch):

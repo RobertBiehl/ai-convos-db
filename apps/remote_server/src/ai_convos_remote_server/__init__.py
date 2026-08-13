@@ -6,7 +6,7 @@ from pathlib import Path
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 
-V=1
+V=CONTROL_V=1
 APPROVAL_DELAY=int(os.environ.get("CONVOS_REMOTE_APPROVAL_DELAY","3600")); REPLICA_QUOTA=int(os.environ.get("CONVOS_REMOTE_REPLICA_QUOTA",str(10*1024**3))); CLOCK_SKEW=30
 def canon(v): return json.dumps(v,sort_keys=True,separators=(",",":"),ensure_ascii=True,allow_nan=False).encode()
 def unb64(v): return base64.urlsafe_b64decode(v+"="*(-len(v)%4))
@@ -39,8 +39,8 @@ CREATE TABLE IF NOT EXISTS device_votes(proposal TEXT,voter_user TEXT,voter_devi
 
 def connect(path):
     existed=Path(path).exists() and Path(path).stat().st_size>0; db=sqlite3.connect(path); db.row_factory=sqlite3.Row; old=existed and db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='events'").fetchone()
-    if old and db.execute("PRAGMA user_version").fetchone()[0]!=6: db.close(); raise ValueError("relay database is incompatible; create a fresh relay")
-    db.executescript("PRAGMA journal_mode=WAL;PRAGMA foreign_keys=ON;PRAGMA secure_delete=ON;PRAGMA busy_timeout=30000;"+SCHEMA+"PRAGMA user_version=6;"); return db
+    if old and db.execute("PRAGMA user_version").fetchone()[0]!=1: db.close(); raise ValueError("relay database is incompatible; create a fresh relay")
+    db.executescript("PRAGMA journal_mode=WAL;PRAGMA foreign_keys=ON;PRAGMA secure_delete=ON;PRAGMA busy_timeout=30000;"+SCHEMA+"PRAGMA user_version=1;"); return db
 def token_hash(token): return hashlib.sha256(token.encode()).hexdigest()
 def auth(db, token):
     row = db.execute("SELECT * FROM devices WHERE token_hash=? AND active=1", (token_hash(token or ""),)).fetchone()
@@ -101,9 +101,9 @@ def verify_window(db,request,now):
     row=db.execute("SELECT not_before,expires,active FROM device_proposals WHERE id=?",(control_hash(request),)).fetchone()
     if not row or not row["active"] or not row["not_before"]<=now<row["expires"]: raise ValueError("proposal is not active by relay clock")
 def verify_control(db,actor,value,previous=None):
-    if value["v"]!=V or value["kind"]!="workspace.state": raise ValueError("unsupported workspace state")
+    if value["v"]!=CONTROL_V or value["kind"]!="workspace.state": raise ValueError("unsupported workspace state")
     boundary=value["boundary"]; heads=boundary["heads"]
-    if value["scope"] not in ("personal","team") or len(value["key_commitment"])!=64 or set(boundary)!={"epoch","tail","heads"} or boundary["epoch"]!=value["epoch"] or not isinstance(boundary["tail"],int) or isinstance(boundary["tail"],bool) or boundary["tail"]<0 or not isinstance(heads,dict) or any(set(h)!={"seq","event"} or not isinstance(h["seq"],int) or isinstance(h["seq"],bool) or h["seq"]<1 or not isinstance(h["event"],str) or len(h["event"])!=64 for h in heads.values()) or any(m["role"] not in ("admin","member") or not isinstance(m["selected"],list) or len(set(m["selected"]))!=len(m["selected"]) or any(not isinstance(e,str) or len(e)!=64 for e in m["selected"]) for m in value["members"].values()) or any(d["user"] not in value["members"] for d in value["devices"].values()) or set(value["devices"])&set(value["removed"]): raise ValueError("invalid workspace state")
+    if value["scope"] not in ("personal","team") or len(value["key_commitment"])!=64 or set(boundary)!={"epoch","tail","heads"} or boundary["epoch"]!=value["epoch"] or not isinstance(boundary["tail"],int) or isinstance(boundary["tail"],bool) or boundary["tail"]<0 or not isinstance(heads,dict) or any(set(h)!={"seq","event"} or not isinstance(h["seq"],int) or isinstance(h["seq"],bool) or h["seq"]<1 or not isinstance(h["event"],str) or len(h["event"])!=64 for h in heads.values()) or any(set(m)!={"role","joined","history_from"} or m["role"] not in ("admin","member") or any(not isinstance(m[k],int) or isinstance(m[k],bool) or not 1<=m[k]<=value["epoch"] for k in ("joined","history_from")) for m in value["members"].values()) or any(d["user"] not in value["members"] for d in value["devices"].values()) or set(value["devices"])&set(value["removed"]): raise ValueError("invalid workspace state")
     author=(value["devices"] if previous is None else previous["devices"]).get(value["author"])
     if value["action"]=="personal_recover" and previous is not None: author=value["devices"].get(value["author"])
     if not author or actor["id"]!=value["author"]: raise PermissionError("state author is not authorized")
@@ -130,7 +130,7 @@ def verify_control(db,actor,value,previous=None):
         if action=="quorum_approve": verify_approval(previous,value["approval"],now)
         if action=="personal_recover" and (previous.get("scope")!="personal" or target["user"] not in previous["members"]): raise PermissionError("personal recovery mismatch")
     elif action=="history":
-        if set(value["devices"])!=set(previous["devices"]) or any({k:v for k,v in d.items() if k!="history"}!={k:v for k,v in previous["devices"][i].items() if k!="history"} or previous["devices"][i]["history"] and not d["history"] for i,d in value["devices"].items()) or value["removed"]!=previous["removed"] or value["epoch"]!=previous["epoch"] or value["key_commitment"]!=previous["key_commitment"] or set(value["members"])!=set(previous["members"]) or any((m["role"],m["joined"])!=(previous["members"][u]["role"],previous["members"][u]["joined"]) or not set(previous["members"][u]["selected"])<=set(m["selected"]) for u,m in value["members"].items()): raise ValueError("invalid history transition")
+        if set(value["devices"])!=set(previous["devices"]) or any({k:v for k,v in d.items() if k!="history"}!={k:v for k,v in previous["devices"][i].items() if k!="history"} or previous["devices"][i]["history"] and not d["history"] for i,d in value["devices"].items()) or value["removed"]!=previous["removed"] or value["epoch"]!=previous["epoch"] or value["key_commitment"]!=previous["key_commitment"] or set(value["members"])!=set(previous["members"]) or any((m["role"],m["joined"])!=(previous["members"][u]["role"],previous["members"][u]["joined"]) or m["history_from"]>previous["members"][u]["history_from"] for u,m in value["members"].items()): raise ValueError("invalid history transition")
     elif action=="history_activate":
         now=time.time()
         if abs(float(value["approved_at"])-now)>CLOCK_SKEW: raise ValueError("approval clock mismatch")
@@ -143,7 +143,7 @@ def verify_control(db,actor,value,previous=None):
         if value["members"]!=previous["members"] or value["epoch"]!=previous["epoch"]+1 or not removed or not removed<=set(value["removed"]) or not set(previous["removed"])<=set(value["removed"]) or any(value["devices"].get(d)!=r for d,r in previous["devices"].items() if d not in removed): raise ValueError("invalid device removal")
     elif action=="membership":
         added_users=set(value["members"])-set(previous["members"]); removed_users=set(previous["members"])-set(value["members"]); added=set(value["devices"])-set(previous["devices"]); removed=set(previous["devices"])-set(value["devices"])
-        if value["epoch"]!=previous["epoch"]+1 or value["scope"]=="personal" and value["members"]!=previous["members"] or set(value["devices"])&set(value["removed"]) or any(r["user"] not in added_users for d,r in value["devices"].items() if d in added) or any(r["user"] not in removed_users for d,r in previous["devices"].items() if d in removed) or any(value["devices"].get(d)!=r for d,r in previous["devices"].items() if r["user"] not in removed_users) or any((m["joined"],m["history_from"],m["selected"])!=(previous["members"][u]["joined"],previous["members"][u]["history_from"],previous["members"][u]["selected"]) for u,m in value["members"].items() if u not in added_users) or any((m["joined"],m["history_from"],m["selected"])!=(value["epoch"],value["epoch"],[]) for u,m in value["members"].items() if u in added_users) or not set(previous["removed"])<=set(value["removed"]) or not removed<=set(value["removed"]): raise ValueError("invalid membership transition")
+        if value["epoch"]!=previous["epoch"]+1 or value["scope"]=="personal" and value["members"]!=previous["members"] or set(value["devices"])&set(value["removed"]) or any(r["user"] not in added_users for d,r in value["devices"].items() if d in added) or any(r["user"] not in removed_users for d,r in previous["devices"].items() if d in removed) or any(value["devices"].get(d)!=r for d,r in previous["devices"].items() if r["user"] not in removed_users) or any((m["joined"],m["history_from"])!=(previous["members"][u]["joined"],previous["members"][u]["history_from"]) for u,m in value["members"].items() if u not in added_users) or any((m["joined"],m["history_from"])!=(value["epoch"],value["epoch"]) for u,m in value["members"].items() if u in added_users) or not set(previous["removed"])<=set(value["removed"]) or not removed<=set(value["removed"]): raise ValueError("invalid membership transition")
     else: raise ValueError("unknown workspace action")
     return value
 def apply_control(db,value,envelopes):
@@ -210,8 +210,8 @@ def purge_events(db,actor,req):
     if any(value["workspace"]!=ws for value in certs) or len({value["event"] for value in certs})!=len(certs) or len({value["seq"] for value in certs})!=len(certs): raise ValueError("purge certificate batch mismatch")
     device_member(db,ws,actor); targets={value["event"] for value in certs}
     try:
-        db.execute("BEGIN IMMEDIATE"); selected={event for member_ in current_control(db,ws)["members"].values() for event in member_["selected"]}
-        if db.execute("SELECT kind FROM workspaces WHERE id=?",(ws,)).fetchone()[0]!="personal" or targets&selected or targets&{value["superseded_by"] for value in certs} or any(db.execute("SELECT 1 FROM event_purges WHERE workspace=? AND superseded_by=?",(ws,event)).fetchone() for event in targets): raise PermissionError("event purge denied")
+        db.execute("BEGIN IMMEDIATE")
+        if db.execute("SELECT kind FROM workspaces WHERE id=?",(ws,)).fetchone()[0]!="personal" or targets&{value["superseded_by"] for value in certs} or any(db.execute("SELECT 1 FROM event_purges WHERE workspace=? AND superseded_by=?",(ws,event)).fetchone() for event in targets): raise PermissionError("event purge denied")
         fresh=[]
         for value in certs:
             encoded=canon(value).decode(); old=db.execute("SELECT certificate FROM event_purges WHERE workspace=? AND event=?",(ws,value["event"])).fetchone()
@@ -238,7 +238,7 @@ def action(db, req, token=None):
         return {"bundle":json.loads(row[0])}
     actor = auth(db, token)
     if op == "certify": return certify(db,actor,req)
-    if op in ("create","rotate","grant_all","grant_selected","history_activate","reject","recovery"): verify_request(actor,req)
+    if op in ("create","rotate","grant_all","history_activate","reject","recovery"): verify_request(actor,req)
     if op == "create":
         ws,control=req["workspace"],req["control"]; verify_control(db,actor,control)
         if (control["workspace"],control["scope"])!=(ws,req["kind"]): raise ValueError("workspace create scope mismatch")
@@ -311,9 +311,6 @@ def action(db, req, token=None):
         if not expected or not needed<=existing|provided: raise ValueError("history grant does not cover every workspace epoch")
         if req["control"]["members"][req["user"]]["history_from"]!=1 or any(not req["control"]["devices"][d]["history"] for d in expected): raise ValueError("history control does not grant all")
         apply_history(db,req["control"]); [db.execute("INSERT OR REPLACE INTO key_envelopes VALUES (?,?,?,?)", (req["workspace"],int(epoch),dev,json.dumps(env))) for epoch,values in req["envelopes"].items() for dev,env in values.items()]; db.commit(); return {"granted":"all"}
-    if op == "grant_selected":
-        if device_member(db,req["workspace"],actor)["role"]!="admin": raise PermissionError("workspace access denied")
-        previous=current_control(db,req["workspace"]); verify_control(db,actor,req["control"],previous); apply_history(db,req["control"]); db.commit(); return {"granted":"selected"}
     if op == "history_activate":
         previous=current_control(db,req["workspace"]); verify_control(db,actor,req["control"],previous); target=req["control"]["approval"]["proposal"]["target"]; device=target["device"]["id"]; start=previous["members"][target["user"]]["history_from"]; expected=set(range(start,previous["epoch"]+1)); epochs={int(e) for e in req["envelopes"]}
         if epochs!=expected: raise ValueError("history activation does not cover the entitlement")
@@ -327,9 +324,9 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args): pass
     def send(self, status, value):
         body = canon(value); self.send_response(status); self.send_header("Content-Type","application/json"); self.send_header("Content-Length",str(len(body))); self.end_headers(); self.wfile.write(body)
-    def do_GET(self): self.send(200,{"ok":True,"version":3}) if self.path == "/v3/health" else self.send(404,{"error":"not found"})
+    def do_GET(self): self.send(200,{"ok":True,"version":1}) if self.path == "/v1/health" else self.send(404,{"error":"not found"})
     def do_POST(self):
-        if self.path!="/v3": self.send(404,{"error":"protocol v3 endpoint required"}); return
+        if self.path!="/v1": self.send(404,{"error":"protocol v1 endpoint required"}); return
         try:
             length=int(self.headers.get("Content-Length","0"))
             if length>64*1024*1024: raise ValueError("request exceeds 64 MiB")
