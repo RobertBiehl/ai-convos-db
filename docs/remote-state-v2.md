@@ -96,7 +96,7 @@ Long-lived `state.db` rows contain only:
 - content-free selected-history original-to-carrier mappings; missing delivery
   work is derived from signed grants and acknowledged carrier receipts;
 - lazy/deferred event manifests, policies, retries, and last failure;
-- content-free acknowledged event receipts.
+- content-free acknowledged event and row-replica receipts.
 
 The only content-bearing remote working state permitted is an unacknowledged
 encrypted outbox file. Plaintext event JSON, acknowledged envelopes,
@@ -258,6 +258,9 @@ Outgoing plaintext is never written to `state.db`. Epoch rotation reopens a
 pending envelope in memory and reseals it.
 
 Incoming plaintext exists in memory only until DuckDB projection commits.
+Canonical rows use the same lifecycle with a repairable replica envelope keyed
+by `(workspace, revision, epoch, uploader)`. The SQLite outbox retains only its
+encrypted-file path, size, and tuple; acknowledgement leaves only a cursor.
 Dispatch is exact on `(kind, payload_v)`. Unknown families and unsupported core
 versions are required by default and block publication; only receiver-known,
 archive-isolated auxiliary families whose product is not installed may defer

@@ -9,9 +9,9 @@ _pending=[]
 def register(app): _pending.append(app) if "remote" not in globals() else app.add_typer(remote,name="remote")
 from ai_convos.cli import PROJECT_ROOT, archive_state as core_archive_state, drain_hooks, init_schema, install_hooks, repository
 from .control import approved, electorate, proposal as device_proposal, record as control_record, sign as control_sign, state_hash, verify_proposal, verify_state, vote as device_vote
-from .projection import attest_rows, bridge_purges, bridge_records, connect, cutover_state, event_support, inspect_state, project, project_many, query as graph_query, read_state, relocate_attachments, reset_history, scan, sequence, verify_history
-from .protocol import (b64, certificate, digest, event, identity, material_event, open_event, open_key, public, public_id, purge_certificate, recover,
-                       recovery_bundle, seal_event, seal_history, seal_key, sign_control, signer, unb64, verify_certificate, verify_purge)
+from .projection import attest_rows, bridge_purges, bridge_records, connect, cutover_state, event_support, inspect_state, project, project_many, query as graph_query, read_state, relocate_attachments, reset_history, row_replicas, scan, sequence, verify_history
+from .protocol import (b64, certificate, digest, event, identity, material_event, open_event, open_key, open_replica, public, public_id, purge_certificate, recover,
+                       recovery_bundle, seal_event, seal_history, seal_key, seal_replica, sign_control, signer, unb64, verify_certificate, verify_purge)
 from .service import edit_hooks, enable
 
 remote=typer.Typer(help="End-to-end encrypted personal and team synchronization")
@@ -197,6 +197,25 @@ def upload(cfg,state,root=None,workspaces=None):
         for row,env,path,ack in acknowledged+[(row,env,path,ack) for (row,env,path),ack in zip(prepared,result)]:
             state.execute("INSERT OR REPLACE INTO receipts VALUES (?,?,?,?,?,?,?,?,?,?,?)",(row["workspace"],row["event"],ack["cursor"],row["author"],row["seq"],env["epoch"],row["kind"],row["payload_v"],row["entity"],row["revision"],row["status"])); state.execute("DELETE FROM outbox WHERE workspace=? AND event=?",(row["workspace"],row["event"]))
         state.commit(); [path.unlink(missing_ok=True) for row,env,path,ack in acknowledged+[(row,env,path,ack) for (row,env,path),ack in zip(prepared,result)]]
+    upload_replicas(cfg,state,root,active)
+def queue_replica(state,root,env):
+    key_=(env["workspace"],env["revision"],env["epoch"],env["uploader"])
+    if state.execute("SELECT 1 FROM replica_outbox WHERE workspace=? AND revision=? AND epoch=? AND uploader=? UNION ALL SELECT 1 FROM replica_receipts WHERE workspace=? AND revision=? AND epoch=? AND uploader=? LIMIT 1",key_+key_).fetchone(): return False
+    path,size=encrypted_file(root,"replica-"+digest(key_),env); state.execute("INSERT INTO replica_outbox VALUES (?,?,?,?,?,?)",(*key_,str(path),size)); return True
+def upload_replicas(cfg,state,root,workspaces):
+    rows=[r for r in state.execute("SELECT * FROM replica_outbox ORDER BY workspace,revision").fetchall() if r["workspace"] in workspaces]
+    for batch in _upload_batches(rows):
+        prepared=[]
+        for row in batch:
+            path=Path(row["path"]); env=json.loads(path.read_text()); current=cfg["workspaces"][row["workspace"]]["epoch"]
+            if (env["workspace"],env["revision"],env["epoch"],env["uploader"])!=(row["workspace"],row["revision"],row["epoch"],row["uploader"]) or path.is_symlink(): raise ValueError("invalid replica outbox")
+            if env["epoch"]!=current:
+                old_path=path; body=open_replica(env,key(cfg,row["workspace"],env["epoch"])); env=seal_replica(body["row"],body["proof"],row["workspace"],current,key(cfg,row["workspace"],current),cfg["device"]["id"]); path,size=encrypted_file(root,"replica-"+digest((row["workspace"],row["revision"],current,row["uploader"])),env); state.execute("DELETE FROM replica_outbox WHERE workspace=? AND revision=? AND epoch=? AND uploader=?",(row["workspace"],row["revision"],row["epoch"],row["uploader"])); state.execute("INSERT OR REPLACE INTO replica_outbox VALUES (?,?,?,?,?,?)",(row["workspace"],row["revision"],current,row["uploader"],str(path),size)); old_path.unlink(missing_ok=True)
+            prepared.append((row,env,path))
+        result=request(cfg,{"op":"replica_upload_many","envelopes":[p[1] for p in prepared]})["replicas"]
+        if len(result)!=len(prepared): raise ValueError("relay replica acknowledgement mismatch")
+        for (row,env,path),ack in zip(prepared,result): state.execute("INSERT OR REPLACE INTO replica_receipts VALUES (?,?,?,?,?)",(env["workspace"],env["revision"],env["epoch"],env["uploader"],ack["cursor"])); state.execute("DELETE FROM replica_outbox WHERE workspace=? AND revision=? AND epoch=? AND uploader=?",(env["workspace"],env["revision"],env["epoch"],env["uploader"])); path.unlink(missing_ok=True)
+        state.commit()
 def drop_event(state,ws,event):
     state.execute("DELETE FROM publication_heads WHERE workspace=? AND event=?",(ws,event)); state.execute("DELETE FROM receipts WHERE workspace=? AND event=?",(ws,event)); state.execute("DELETE FROM history_sources WHERE workspace=? AND (event=? OR carrier=?)",(ws,event,event)); state.execute("DELETE FROM lazy_events WHERE workspace=? AND event=?",(ws,event)); state.execute("DELETE FROM deferred_events WHERE workspace=? AND event=?",(ws,event))
 def purge_events(cfg,state,ws,intents):
@@ -281,7 +300,7 @@ def sync_once(root=None,force=False):
                     pol=state.execute("SELECT kind,value FROM policies WHERE workspace=?",(ws,)).fetchall(); repos=[p[1] for p in pol if p[0]=="repository"]; roots=[cfg.get("bindings",{}).get(f"{ws}:{p[1]}") for p in pol if p[0]=="path" and cfg.get("bindings",{}).get(f"{ws}:{p[1]}")]; records=[safe for r in scan(core,state,meta["kind"],repos,roots) if (safe:=protect_record(r,root,ws) if meta["kind"]=="team" else r) is not None]; batches.append((ws,records))
                 core.close()
                 for ws,records in batches:
-                    attest_rows(path,cfg,ws,records); heads={r[0]:r[1] for r in state.execute("SELECT entity,revision FROM publication_heads WHERE workspace=? AND owner=?",(ws,cfg["user"])).fetchall()}; [publish(cfg,state,ws,r,root,True,heads) for r in records]
+                    attest_rows(path,cfg,ws,records); epoch=cfg["workspaces"][ws]["epoch"]; known={r[0] for r in state.execute("SELECT revision FROM replica_receipts WHERE workspace=? AND epoch=? UNION SELECT revision FROM replica_outbox WHERE workspace=? AND epoch=?",(ws,epoch,ws,epoch)).fetchall()}; [queue_replica(state,root,env) for env in row_replicas(path,cfg,ws,records,key(cfg,ws,epoch),known)]; heads={r[0]:r[1] for r in state.execute("SELECT entity,revision FROM publication_heads WHERE workspace=? AND owner=?",(ws,cfg["user"])).fetchall()}; [publish(cfg,state,ws,r,root,True,heads) for r in records]
                 final=path.stat().st_mtime_ns; [state.execute("INSERT OR REPLACE INTO meta VALUES (?,?)",(f"core_mtime:{ws}",str(final))) for ws,meta in scans]
             [publish(cfg,state,ws,r,root,True,heads) for ws,meta in cfg["workspaces"].items() if ws in ready and ws in active and meta["kind"]=="personal" and f"{ws}:{meta['epoch']}" in cfg["keys"] for heads in [{r[0]:r[1] for r in state.execute("SELECT entity,revision FROM publication_heads WHERE workspace=? AND owner=?",(ws,cfg["user"])).fetchall()}] for r in bridge_records(root,state,ws,meta["kind"])]; state.commit(); upload(cfg,state,root,ready)
             for ws,meta in cfg["workspaces"].items():

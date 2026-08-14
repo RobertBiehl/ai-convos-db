@@ -8,9 +8,9 @@ from pathlib import Path
 import duckdb
 from ai_convos.cli import ARCHIVE_COLUMNS as COLUMNS, PROVENANCE_KINDS as PROVENANCE, init_schema, observe_provenance, project_archive_row, project_provenance, project_row_proof, project_workspace_controls, repository as resolve_repository, set_attachment_path
 from ai_convos_changegraph.provenance import query as graph_query
-from .protocol import digest, logical_row, row_proof
+from .protocol import digest, logical_row, row_proof, seal_replica
 
-STATE_VERSION="8"
+STATE_VERSION="9"
 STATE = """
 CREATE TABLE IF NOT EXISTS outbox(workspace TEXT,event TEXT,entity TEXT,revision TEXT,author TEXT,seq INT,epoch INT,kind TEXT,payload_v INT,status TEXT,path TEXT,size INT,PRIMARY KEY(workspace,event)) WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS receipts(workspace TEXT,event TEXT,cursor INT,author TEXT,seq INT,epoch INT,kind TEXT,payload_v INT,entity TEXT,revision TEXT,status TEXT,PRIMARY KEY(workspace,event)) WITHOUT ROWID;
@@ -25,11 +25,13 @@ CREATE TABLE IF NOT EXISTS event_sequences(workspace TEXT,author TEXT,seq INT,ev
 CREATE TABLE IF NOT EXISTS sequence_gaps(workspace TEXT,author TEXT,seq INT,parents TEXT,PRIMARY KEY(workspace,author,seq)) WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS attachment_parts(workspace TEXT,author TEXT,blob TEXT,idx INT,total INT,attachment TEXT,sha256 TEXT,size INT,chunk_hash TEXT,path TEXT,PRIMARY KEY(workspace,author,blob,idx)) WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS attachment_blobs(workspace TEXT,author TEXT,attachment TEXT,path TEXT,PRIMARY KEY(workspace,author,attachment)) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS replica_outbox(workspace TEXT,revision TEXT,epoch INT,uploader TEXT,path TEXT,size INT,PRIMARY KEY(workspace,revision,epoch,uploader)) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS replica_receipts(workspace TEXT,revision TEXT,epoch INT,uploader TEXT,cursor INT,PRIMARY KEY(workspace,revision,epoch,uploader)) WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS policies(workspace TEXT,kind TEXT,value TEXT,PRIMARY KEY(workspace,kind,value)) WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS sync_states(workspace TEXT PRIMARY KEY,lifecycle TEXT NOT NULL,tail INT NOT NULL DEFAULT 0,floor INT NOT NULL DEFAULT 0,error TEXT) WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY,value TEXT) WITHOUT ROWID;
 """
-STATE_TABLES={"outbox","receipts","history_sources","publication_heads","cursors","heads","lazy_events","deferred_events","event_sequences","sequence_gaps","attachment_parts","attachment_blobs","policies","sync_states","meta"}
+STATE_TABLES={"outbox","receipts","history_sources","publication_heads","cursors","heads","lazy_events","deferred_events","event_sequences","sequence_gaps","attachment_parts","attachment_blobs","replica_outbox","replica_receipts","policies","sync_states","meta"}
 STATE_FORBIDDEN={"published","event_log","history_material","history_outbox","history_queue","attachment_chunks","imported_rows","raw_events","repositories","files","file_versions","changesets","edits","checkpoints","assertions","gaps","boundaries","sharing_boundaries"}
 TABLES={"conversation.record":"conversations","message.record":"messages","tool.record":"tool_calls","attachment.record":"attachments","artifact.record":"artifacts","file_edit.record":"file_edits"}
 CORE_EVENTS={(kind,1) for kind in set(TABLES)|PROVENANCE|{"workspace.policy","workspace.membership","workspace.device","attachment.chunk","history.republish"}}; AUXILIARY_EVENTS={"memory.canonical"}
@@ -174,6 +176,16 @@ def attest_rows(db_path,cfg,workspace,records):
             proof=row_proof(device,cfg["user"],workspace,cfg["workspaces"][workspace]["epoch"],row,heads[0][0] if heads else None); project_row_proof(db,proof,signer["root_public"],signer["certificate"]); made+=1
         db.execute("COMMIT"); return made
     except BaseException: db.execute("ROLLBACK"); raise
+    finally: db.close()
+def row_replicas(db_path,cfg,workspace,records,key,known=()):
+    fields=("workspace","row_kind","row_id","encoding_v","content_hash","revision","previous_revision","state","author_user_id","author_device_id","authorization_epoch","signature"); db=duckdb.connect(str(db_path),read_only=True); out=[]
+    try:
+        for record in (r for r in records if r["kind"] in TABLES):
+            p=record["payload"]; row=logical_row(p["table"],p["columns"],p["row"]); values=db.execute("SELECT workspace_id,row_kind,source_row_id,encoding_v,content_hash,revision,previous_revision,state,author_user_id,author_device_id,authorization_epoch,signature FROM remote.row_proofs p WHERE workspace_id=? AND row_kind=? AND source_row_id=? AND author_user_id=? AND content_hash=? AND NOT EXISTS (SELECT 1 FROM remote.row_proofs c WHERE c.previous_revision=p.revision)",(workspace,row["kind"],row["id"],cfg["user"],digest(row))).fetchall()
+            if len(values)!=1: raise ValueError(f"current row proof unavailable: {row['kind']}:{row['id']}")
+            proof={"v":1,"kind":"row.proof",**dict(zip(fields,values[0]))}
+            if proof["revision"] not in known: out.append(seal_replica(row,proof,workspace,cfg["workspaces"][workspace]["epoch"],key,cfg["device"]["id"]))
+        return out
     finally: db.close()
 def author_user(value,authors): return (authors or {}).get(value["author"]) or (_ for _ in ()).throw(ValueError("verified author user required"))
 def foreign_id(workspace,author_user,table,old): return digest(f"{workspace}:{author_user}:{table}:{old}")[:16] if old else old
