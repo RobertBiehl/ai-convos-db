@@ -1,5 +1,5 @@
 """Opaque self-hosted relay. It authorizes envelopes but never receives content keys."""
-import argparse, base64, hashlib, json, os, secrets, sqlite3, time
+import argparse, base64, hashlib, hmac, json, os, secrets, sqlite3, time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -7,7 +7,7 @@ from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 
 V=CONTROL_V=1
-APPROVAL_DELAY=int(os.environ.get("CONVOS_REMOTE_APPROVAL_DELAY","3600")); REPLICA_QUOTA=int(os.environ.get("CONVOS_REMOTE_REPLICA_QUOTA",str(10*1024**3))); BLOB_LIMIT=32*1024**2; BLOB_QUOTA=int(os.environ.get("CONVOS_REMOTE_BLOB_QUOTA",str(10*1024**3))); CLOCK_SKEW=30
+APPROVAL_DELAY=int(os.environ.get("CONVOS_REMOTE_APPROVAL_DELAY","3600")); REPLICA_QUOTA=int(os.environ.get("CONVOS_REMOTE_REPLICA_QUOTA",str(10*1024**3))); BLOB_LIMIT=32*1024**2; BLOB_QUOTA=int(os.environ.get("CONVOS_REMOTE_BLOB_QUOTA",str(10*1024**3))); CLOCK_SKEW=30; REGISTRATION_TTL=300
 def canon(v): return json.dumps(v,sort_keys=True,separators=(",",":"),ensure_ascii=True,allow_nan=False).encode()
 def unb64(v): return base64.urlsafe_b64decode(v+"="*(-len(v)%4))
 def b64(v): return base64.urlsafe_b64encode(v).decode().rstrip("=")
@@ -22,6 +22,8 @@ SCHEMA = """
 CREATE TABLE IF NOT EXISTS users(id TEXT PRIMARY KEY,name TEXT UNIQUE,root_public TEXT NOT NULL,recovery TEXT,created REAL);
 CREATE TABLE IF NOT EXISTS devices(id TEXT PRIMARY KEY,user_id TEXT NOT NULL,name TEXT,sign_public TEXT NOT NULL,box_public TEXT NOT NULL,token_hash TEXT UNIQUE NOT NULL,active INT NOT NULL DEFAULT 1,created REAL);
 CREATE TABLE IF NOT EXISTS device_certificates(device TEXT PRIMARY KEY,certificate TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS relay_meta(key TEXT PRIMARY KEY,value TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS registration_uses(challenge TEXT PRIMARY KEY,expires REAL NOT NULL);
 CREATE TABLE IF NOT EXISTS workspaces(id TEXT PRIMARY KEY,kind TEXT NOT NULL,epoch INT NOT NULL,created_by TEXT NOT NULL,created REAL);
 CREATE TABLE IF NOT EXISTS members(workspace TEXT,user_id TEXT,role TEXT,active INT,joined_epoch INT,history_from INT,PRIMARY KEY(workspace,user_id));
 CREATE TABLE IF NOT EXISTS key_envelopes(workspace TEXT,epoch INT,device TEXT,envelope TEXT,PRIMARY KEY(workspace,epoch,device));
@@ -44,7 +46,7 @@ CREATE TABLE IF NOT EXISTS device_votes(proposal TEXT,voter_user TEXT,voter_devi
 def connect(path):
     existed=Path(path).exists() and Path(path).stat().st_size>0; db=sqlite3.connect(path); db.row_factory=sqlite3.Row; old=existed and db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='events'").fetchone()
     if old and db.execute("PRAGMA user_version").fetchone()[0]!=1: db.close(); raise ValueError("relay database is incompatible; create a fresh relay")
-    db.executescript("PRAGMA journal_mode=WAL;PRAGMA foreign_keys=ON;PRAGMA secure_delete=ON;PRAGMA busy_timeout=30000;"+SCHEMA+"PRAGMA user_version=1;"); return db
+    db.executescript("PRAGMA journal_mode=WAL;PRAGMA foreign_keys=ON;PRAGMA secure_delete=ON;PRAGMA busy_timeout=30000;"+SCHEMA+"PRAGMA user_version=1;"); db.execute("INSERT OR IGNORE INTO relay_meta VALUES ('registration_secret',?)",(b64(os.urandom(32)),)); db.commit(); return db
 def token_hash(token): return hashlib.sha256(token.encode()).hexdigest()
 def auth(db, token):
     row = db.execute("SELECT * FROM devices WHERE token_hash=? AND active=1", (token_hash(token or ""),)).fetchone()
@@ -162,14 +164,33 @@ def apply_control(db,value,envelopes):
 def apply_history(db,value):
     [db.execute("UPDATE members SET history_from=? WHERE workspace=? AND user_id=?",(m["history_from"],value["workspace"],u)) for u,m in value["members"].items()]; db.execute("INSERT INTO workspace_controls VALUES (?,?,?,?)",(value["workspace"],value["revision"],control_hash(value),json.dumps(value))); return {"workspace":value["workspace"],"control":control_hash(value)}
 
-def register(db, req):
-    cert, root = req["certificate"], req["root_public"]; body = verify_certificate(cert, root); user, dev = body["user"], body["device"]
+def registration_identity(req):
+    cert,root=req["certificate"],req["root_public"]; body=verify_certificate(cert,root); user,dev=body["user"],body["device"]
     if user!=public_id(root) or dev["id"]!=public_id(dev["sign_public"]): raise ValueError("identity id does not match public key")
-    old = db.execute("SELECT root_public FROM users WHERE id=?", (user,)).fetchone()
-    if old and old[0] != root: raise PermissionError("user root mismatch")
-    if not old: db.execute("INSERT INTO users VALUES (?,?,?,?,?)", (user,req["user_name"],root,json.dumps(req.get("recovery")),time.time()))
-    token = secrets.token_urlsafe(32); db.execute("INSERT INTO devices VALUES (?,?,?,?,?,?,?,?)", (dev["id"],user,dev["name"],dev["sign_public"],dev["box_public"],token_hash(token),1,time.time())); db.execute("INSERT INTO device_certificates VALUES (?,?)",(dev["id"],json.dumps(cert)))
-    db.commit(); return dict(user=user, device=dev["id"], token=token)
+    return cert,root,user,dev
+def registration_challenge(db,req):
+    cert,root,user,dev=registration_identity(req); body={"v":V,"kind":"registration.challenge","user":user,"device":dev["id"],"certificate":digest(cert),"expires":int(time.time())+REGISTRATION_TTL,"nonce":b64(os.urandom(24))}; secret=unb64(db.execute("SELECT value FROM relay_meta WHERE key='registration_secret'").fetchone()[0]); return {**body,"mac":b64(hmac.new(secret,canon(body),hashlib.sha256).digest())}
+def verify_registration_challenge(db,value,cert,user,dev):
+    try:
+        body={k:value[k] for k in ("v","kind","user","device","certificate","expires","nonce")}; now=time.time(); secret=unb64(db.execute("SELECT value FROM relay_meta WHERE key='registration_secret'").fetchone()[0]); valid=set(value)==set(body)|{"mac"} and (body["v"],body["kind"],body["user"],body["device"],body["certificate"])==(V,"registration.challenge",user,dev["id"],digest(cert)) and type(body["expires"]) is int and now<=body["expires"]<=now+REGISTRATION_TTL+CLOCK_SKEW and isinstance(body["nonce"],str) and len(unb64(body["nonce"]))==24 and hmac.compare_digest(unb64(value["mac"]),hmac.new(secret,canon(body),hashlib.sha256).digest())
+    except (KeyError,TypeError,ValueError): valid=False
+    if not valid: raise PermissionError("invalid registration challenge")
+    return digest(value)
+def register(db,req):
+    cert,root,user,dev=registration_identity(req); challenge=verify_registration_challenge(db,req["challenge"],cert,user,dev); proof=req["proof"]; expected={"v":V,"kind":"device.registration","challenge":challenge,"root_public":root,"certificate":digest(cert),"user":user,"device":dev["id"]}
+    try:
+        if set(proof)!=set(expected)|{"signature"} or {k:proof[k] for k in expected}!=expected: raise ValueError
+        Ed25519PublicKey.from_public_bytes(unb64(dev["sign_public"])).verify(unb64(proof["signature"]),canon(expected))
+    except (InvalidSignature,KeyError,TypeError,ValueError) as e: raise PermissionError("invalid registration proof") from e
+    db.execute("BEGIN IMMEDIATE")
+    try:
+        db.execute("DELETE FROM registration_uses WHERE expires<?",(time.time(),))
+        if db.execute("SELECT 1 FROM registration_uses WHERE challenge=?",(challenge,)).fetchone(): raise PermissionError("registration challenge was already used")
+        db.execute("INSERT INTO registration_uses VALUES (?,?)",(challenge,req["challenge"]["expires"])); old=db.execute("SELECT root_public FROM users WHERE id=?",(user,)).fetchone()
+        if old and old[0]!=root: raise PermissionError("user root mismatch")
+        if not old: db.execute("INSERT INTO users VALUES (?,?,?,?,?)",(user,req["user_name"],root,json.dumps(req.get("recovery")),time.time()))
+        token=secrets.token_urlsafe(32); db.execute("INSERT INTO devices VALUES (?,?,?,?,?,?,?,?)",(dev["id"],user,dev["name"],dev["sign_public"],dev["box_public"],token_hash(token),1,time.time())); db.execute("INSERT INTO device_certificates VALUES (?,?)",(dev["id"],json.dumps(cert))); db.commit(); return dict(user=user,device=dev["id"],token=token)
+    except BaseException: db.rollback(); raise
 
 def rotate(db, actor, req):
     db.execute("BEGIN IMMEDIATE")
@@ -266,6 +287,7 @@ def purge_events(db,actor,req):
 
 def action(db, req, token=None):
     op = req["op"]
+    if op == "register_challenge": return {"challenge":registration_challenge(db,req)}
     if op == "register": return register(db, req)
     if op == "recovery_fetch":
         row = db.execute("SELECT recovery FROM users WHERE id=? OR name=?", (req["user"],req["user"])).fetchone()

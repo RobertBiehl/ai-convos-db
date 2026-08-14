@@ -52,6 +52,8 @@ def verify_certificate(cert, root_public):
     return body
 @lru_cache(maxsize=256)
 def verified_certificate(raw,root_public): return verify_certificate(json.loads(raw),root_public)
+def registration_proof(device,challenge,root_public,cert):
+    body={"v":V,"kind":"device.registration","challenge":digest(challenge),"root_public":root_public,"certificate":digest(cert),"user":public_id(root_public),"device":device["id"]}; body["signature"]=b64(_priv(Ed25519PrivateKey,device["sign_private"]).sign(canon(body))); return body
 
 def row_proof(device,user,workspace,epoch,row,previous=None,authorization_workspace=None,content_hash=None):
     claim={"row_kind":row["kind"],"row_id":row["id"],"encoding_v":row["v"],"content_hash":content_hash if content_hash is not None else digest(row),"previous_revision":previous,"state":row["state"]}; body={"v":1,"kind":"row.proof","workspace":workspace,"authorization_workspace":authorization_workspace or workspace,**claim,"revision":digest({"v":1,**claim}),"author_user_id":user,"author_device_id":device["id"],"authorization_epoch":epoch}; body["signature"]=b64(_priv(Ed25519PrivateKey,device["sign_private"]).sign(canon(body))); return body
