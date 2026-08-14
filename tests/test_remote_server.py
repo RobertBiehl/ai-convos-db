@@ -3,13 +3,15 @@ import copy, json, sqlite3, threading
 import pytest
 import ai_convos_remote_server as server_module
 from ai_convos_remote.control import CONTROL_V, record, sign, state_hash
-from ai_convos_remote.protocol import certificate, digest, event, identity, logical_row, open_blob, purge_certificate, row_proof, seal_blob, seal_event, seal_key, seal_replica, sign_control
+from ai_convos_remote.protocol import certificate, digest, event, identity, logical_row, open_blob, purge_certificate, registration_proof, row_proof, seal_blob, seal_event, seal_key, seal_replica, sign_control
 from ai_convos_remote_server import action, bounded, connect, ledger_state
 
 
+def register_device(db,name,root,dev,recovery=None):
+    cert=certificate(root,root["id"],dev); base={"root_public":root["sign_public"],"certificate":cert}; challenge=action(db,{"op":"register_challenge",**base})["challenge"]; return action(db,{"op":"register","user_name":name,**base,"challenge":challenge,"proof":registration_proof(dev,challenge,root["sign_public"],cert),**({"recovery":recovery} if recovery else {})})
 def account(db, name):
     root, dev = identity(name + " root"), identity(name + " laptop"); user = root["id"]
-    result = action(db, {"op":"register","user_name":name,"root_public":root["sign_public"],"certificate":certificate(root,user,dev),"recovery":{"ciphertext":"opaque"}})
+    result = register_device(db,name,root,dev,{"ciphertext":"opaque"})
     return {"root":root,"device":dev,"user":user,"token":result["token"]}
 def device_record(a): return record(a["user"],a["root"]["sign_public"],a["device"],certificate(a["root"],a["user"],a["device"]))
 def create_ws(db,a,ws,key,kind):
@@ -99,7 +101,7 @@ def test_device_certificate_recovery_and_author_acl(tmp_path):
     with pytest.raises(PermissionError,match="signature"): action(db,{"op":"create","workspace":"stolen","kind":"team","envelope":{}},a["token"])
     with pytest.raises(PermissionError,match="signature"): action(db,{"op":"recovery","bundle":{}},a["token"])
     assert action(db,{"op":"recovery_fetch","user":"alice"})["bundle"] == {"ciphertext":"opaque"}
-    second = identity("desktop"); registered = action(db,{"op":"register","user_name":"alice","root_public":a["root"]["sign_public"],"certificate":certificate(a["root"],a["user"],second)})
+    second = identity("desktop"); registered = register_device(db,"alice",a["root"],second)
     assert registered["device"] == second["id"]
     ws,key = "personal",bytes([5])*32; create_ws(db,a,ws,key,"personal")
     forged = seal_event(event(second,1,"x.future","x",{},[],"2026-01-01T00:00:00Z"),ws,1,key)
@@ -146,4 +148,11 @@ def test_restart_preserves_events_tokens_and_idempotency(tmp_path):
 
 def test_registration_rejects_public_key_identity_mismatch(tmp_path):
     db=connect(tmp_path/"server.db"); root,device=identity("root"),identity("device"); cert=certificate(root,"not-root-id",device)
-    with pytest.raises(ValueError,match="identity id"): action(db,{"op":"register","user_name":"bad","root_public":root["sign_public"],"certificate":cert})
+    with pytest.raises(ValueError,match="identity id"): action(db,{"op":"register_challenge","root_public":root["sign_public"],"certificate":cert})
+
+
+def test_registration_requires_fresh_device_key_proof_and_consumes_challenge(tmp_path):
+    db=connect(tmp_path/"server.db"); root,device,attacker=identity("root"),identity("device"),identity("attacker"); cert=certificate(root,root["id"],device); base={"root_public":root["sign_public"],"certificate":cert}; challenge=action(db,{"op":"register_challenge",**base})["challenge"]; proof=registration_proof(device,challenge,root["sign_public"],cert); forged={**registration_proof(attacker,challenge,root["sign_public"],cert),"device":device["id"]}; request={"op":"register","user_name":"alice",**base,"challenge":challenge}
+    with pytest.raises(PermissionError,match="registration proof"): action(db,{**request,"proof":forged})
+    assert action(db,{**request,"proof":proof})["device"]==device["id"]
+    with pytest.raises(PermissionError,match="already used"): action(db,{**request,"proof":proof})

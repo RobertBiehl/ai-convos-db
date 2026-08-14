@@ -12,7 +12,7 @@ from ai_convos.cli import PROJECT_ROOT, archive_changes as core_archive_changes,
 from .control import CONTROL_V, approved, electorate, proposal as device_proposal, record as control_record, sign as control_sign, state_hash, verify_proposal, verify_state, vote as device_vote
 from .projection import SIGNED, TABLES, apply_row_replicas, attest_rows, blob_replicas, bridge_purges, bridge_records, connect, control_chain, cutover_state, event_support, inspect_state, project, project_many, query as graph_query, read_state, relocate_attachments, reset_history, row_replicas, scan, sequence, stored_controls, verify_history
 from .protocol import (b64, certificate, digest, event, fingerprint, identity, open_blob, open_event, open_key, open_origin, open_replica, public, public_id, purge_certificate, recover,
-                       recovery_bundle, seal_event, seal_key, seal_origin, seal_replica, sign_control, signer, unb64, verify_certificate, verify_purge)
+                       recovery_bundle, registration_proof, seal_event, seal_key, seal_origin, seal_replica, sign_control, signer, unb64, verify_certificate, verify_purge)
 from .service import edit_hooks, enable
 
 remote=typer.Typer(help="End-to-end encrypted personal and team synchronization")
@@ -137,13 +137,15 @@ def refresh(cfg,root=None):
     return state
 def create(cfg,name,kind="team",root=None):
     ws,key_=digest(os.urandom(32))[:32],os.urandom(32); entry=own_record(cfg); control=control_sign(cfg["device"],{"v":CONTROL_V,"kind":"workspace.state","workspace":ws,"scope":kind,"revision":1,"prev":None,"epoch":1,"boundary":{"epoch":1,"tail":0,"heads":{}},"key_commitment":digest(key_),"members":{cfg["user"]:{"role":"admin","joined":1,"history_from":1}},"devices":{cfg["device"]["id"]:entry},"removed":[],"action":"create","approval":None,"approved_at":time.time()}); env=seal_key(key_,cfg["device"]["box_public"],f"workspace:{ws}:epoch:1"); request(cfg,sign_control(cfg["device"],{"op":"create","workspace":ws,"kind":kind,"control":control,"envelopes":{cfg["device"]["id"]:env}})); cfg["workspaces"][ws]={"name":name,"kind":kind,"epoch":1}; cfg["keys"][f"{ws}:1"]=b64(key_); cfg["controls"][ws]=control; update_recovery(cfg,root); membership_event(cfg,ws,1,{cfg["user"]:"admin"},root); return ws
+def enroll(url,name,root,device,recovery=None):
+    cert=certificate(root,root["id"],device); base={"root_public":root["sign_public"],"certificate":cert}; challenge=request({"url":url},{"op":"register_challenge",**base},False)["challenge"]; return request({"url":url},{"op":"register","user_name":name,**base,"challenge":challenge,"proof":registration_proof(device,challenge,root["sign_public"],cert),**({"recovery":recovery} if recovery else {})},False)
 def setup_client(url,user,device="computer",recovery=None,root=None):
     if recovery:
         bundle=request({"url":url},{"op":"recovery_fetch","user":user},False)["bundle"]; recovered=recover(bundle,recovery); root_id=recovered["root"]; keys,workspaces,controls=recovered["keys"],recovered["workspaces"],recovered.get("controls",{})
     else: root_id,keys,workspaces,controls=identity(user+" root"),{},{},{}
     dev=identity(device); uid=root_id["id"]
     if not recovery: recovery,bundle=recovery_bundle({"root":root_id,"keys":keys,"workspaces":workspaces})
-    registered=request({"url":url},{"op":"register","user_name":user,"root_public":root_id["sign_public"],"certificate":certificate(root_id,uid,dev),**({"recovery":bundle} if not workspaces else {})},False)
+    registered=enroll(url,user,root_id,dev,bundle if not workspaces else None)
     cfg={"url":url,"name":user,"user":uid,"token":registered["token"],"root":root_id,"device":dev,"recovery":recovery,"keys":keys,"workspaces":workspaces,"controls":controls,"bindings":{},"server_state":{}}; save(cfg,root)
     if not workspaces: create(cfg,"Personal","personal",root)
     else:
@@ -152,7 +154,7 @@ def setup_client(url,user,device="computer",recovery=None,root=None):
             rotate(cfg,ws["id"],{u:m["role"] for u,m in cfg["controls"][ws["id"]]["members"].items()},[],root=root); grant_all(cfg,ws["id"],uid,root)
     return cfg,recovery
 def rehome_client(cfg,url,root=None):
-    recovery,bundle=recovery_bundle({"root":cfg["root"],"keys":{},"workspaces":{}}); registered=request({"url":url},{"op":"register","user_name":cfg["name"],"root_public":cfg["root"]["sign_public"],"certificate":certificate(cfg["root"],cfg["user"],cfg["device"]),"recovery":bundle},False); fresh={**cfg,"url":url,"token":registered["token"],"recovery":recovery,"keys":{},"workspaces":{},"controls":{},"bindings":{},"server_state":{}}; save(fresh,root); create(fresh,"Personal","personal",root); return fresh,recovery
+    recovery,bundle=recovery_bundle({"root":cfg["root"],"keys":{},"workspaces":{}}); registered=enroll(url,cfg["name"],cfg["root"],cfg["device"],bundle); fresh={**cfg,"url":url,"token":registered["token"],"recovery":recovery,"keys":{},"workspaces":{},"controls":{},"bindings":{},"server_state":{}}; save(fresh,root); create(fresh,"Personal","personal",root); return fresh,recovery
 def rotate(cfg,ws,members,devices,deactivate=(),root=None):
     state=refresh(cfg,root); previous=cfg["controls"][ws]; epoch=previous["epoch"]+1; boundary=next_boundary(cfg,ws,root); new=os.urandom(32); devices=trusted(devices); old=previous["members"]; meta={u:old.get(u,{"joined":epoch,"history_from":epoch})|{"role":role} for u,role in members.items()}; removed=sorted(set(previous["removed"])|set(deactivate)|{d for d,r in previous["devices"].items() if r["user"] not in members}); records={d:r for d,r in previous["devices"].items() if r["user"] in members and d not in deactivate}
     if cfg["device"]["id"] not in previous["devices"] and previous["scope"]=="personal":
