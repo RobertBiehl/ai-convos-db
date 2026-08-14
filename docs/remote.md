@@ -328,8 +328,31 @@ encrypted events and predates their signed purge certificates. Treat relay-backu
 retention as part of the deletion policy; restoring such a backup can make that
 historical ciphertext available to newly recovered clients again.
 
-Client recovery requires the server backup plus the user's recovery key. Loss
-of every enrolled device and the recovery key is permanent data loss.
+If the relay itself is lost, a surviving device can establish fresh relay
+credentials without changing its signing identity, then explicitly re-found a
+team from the copies held by the members it still trusts:
+
+```bash
+convos remote rehome https://replacement.example.com
+convos remote origins
+convos remote workspace Replacement
+convos remote invite Replacement TRUSTED_USER_ID
+convos remote refound Replacement OLD_WORKSPACE_ID
+```
+
+`rehome` creates fresh personal/workspace keys and prints a new recovery key.
+It does not recreate the old relay's authority. `refound` binds one verified old
+signed control chain into the new workspace once; ordinary sync then advertises
+flat opaque proof identities and uploads only rows the new relay lacks. Any
+surviving authorized holder can deliver those rows without the original
+author's private key. Only the replacement workspace's explicitly invited
+members receive its encryption key. Old plaintext already held by an excluded
+member cannot be revoked.
+
+Loss of every copy of a row is permanent data loss. Loss of every enrolled
+device and recovery key also prevents recovery of the old personal authority,
+although intact rows and original proofs held by teammates remain repairable
+into an explicitly re-founded workspace.
 
 `state.db` is disposable synchronization metadata. Device `config.json` pins
 the last successfully synchronized DuckDB identity and generation, so deleting

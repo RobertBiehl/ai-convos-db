@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Add explicit fresh-relay rehoming and team re-founding with retained signing
+  identities, one shared encrypted origin-control bundle, portable row proofs,
+  fresh membership and keys, and excluded-member denial.
 - Add flat opaque row-replica reconciliation so state loss uploads only missing
   proofs and any authorized holder can repair an imported row without the
   original author's private key.

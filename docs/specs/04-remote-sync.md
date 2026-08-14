@@ -147,6 +147,14 @@ text is resolved from `messages` after projection.
 
 ## Envelopes and idempotency
 
+Canonical archive rows carry independently signed origin proofs and travel in
+separate repairable delivery replicas. A proof records both its immutable
+origin workspace and the workspace/epoch that authorized that revision. They
+are normally identical; after explicit team re-founding, a successor keeps its
+old origin and predecessor while naming the fresh authorization workspace.
+The old signed control chain is encrypted once per destination as a shared
+origin bundle rather than copied into every row replica.
+
 An event is signed, then encrypted independently under its workspace epoch key.
 The server accepts `PUT(workspace_id, event_id)` only from an active device in
 that workspace. Repeating the identical upload succeeds without allocating a
