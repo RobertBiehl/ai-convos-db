@@ -5,9 +5,9 @@ import pytest
 from cryptography.exceptions import InvalidSignature, InvalidTag
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
-from ai_convos_remote.protocol import (b64, certificate, digest, event, fingerprint, identity, logical_row, open_event, open_key,
+from ai_convos_remote.protocol import (b64, certificate, digest, event, fingerprint, identity, logical_row, open_event, open_key, public_id, row_proof,
                                        material_event, public, purge_certificate, recover, recovery_bundle, seal_event, seal_history, seal_key,
-                                       verify_certificate, verify_event, verify_purge)
+                                       verify_certificate, verify_event, verify_purge, verify_row_proof)
 
 def fixed_identity():
     sign, box = Ed25519PrivateKey.from_private_bytes(bytes(range(32))), X25519PrivateKey.from_private_bytes(bytes(range(32, 64)))
@@ -37,6 +37,21 @@ def test_logical_attachment_excludes_body_location_and_temporary_url():
     other=[*values]; other[5:7]=["/two","https://temporary/two"]
     assert logical_row("attachments",columns,values)==logical_row("attachments",columns,other)
     with pytest.raises(ValueError,match="logical row"): logical_row("messages",identity="m",state="unknown")
+
+
+def test_row_proof_binds_origin_revision_predecessor_and_deletion():
+    root,device=identity("root"),fixed_identity(); user=public_id(root["sign_public"]); cert=certificate(root,user,device); active=logical_row("messages",["id","conversation_id","role","content","thinking","created_at","model","metadata","parent_id"],["m","c","user","hello",None,datetime(2026,1,1),None,"{}",None]); first=row_proof(device,user,"origin",2,active)
+    assert first["previous_revision"] is None and set(first)=={"v","kind","workspace","row_kind","row_id","encoding_v","content_hash","revision","previous_revision","state","author_user_id","author_device_id","authorization_epoch","signature"} and verify_row_proof(first,active,cert,root["sign_public"])==first
+    deleted=logical_row("messages",identity="m",state="deleted"); tombstone=row_proof(device,user,"origin",3,deleted,first["revision"]); restored=row_proof(device,user,"origin",4,active,tombstone["revision"]); assert tombstone["revision"]!=first["revision"] and tombstone["previous_revision"]==first["revision"] and restored["content_hash"]==first["content_hash"] and restored["revision"]!=first["revision"] and verify_row_proof(tombstone,deleted,cert,root["sign_public"])
+    for changed in ({**first,"workspace":"other"},{**first,"previous_revision":"f"*64},{**first,"author_user_id":"0"*32},{**first,"authorization_epoch":3}):
+        with pytest.raises(ValueError,match="row proof"): verify_row_proof(changed,active,cert,root["sign_public"])
+
+
+def test_row_proof_rejects_wrong_body_signer_and_self_predecessor():
+    root,device=identity("root"),fixed_identity(); user=public_id(root["sign_public"]); cert=certificate(root,user,device); row=logical_row("attachments",identity="a",state="deleted"); proof=row_proof(device,user,"origin",1,row)
+    with pytest.raises(ValueError,match="row proof"): verify_row_proof(proof,logical_row("attachments",identity="b",state="deleted"),cert,root["sign_public"])
+    with pytest.raises(ValueError,match="row proof"): verify_row_proof(proof,row,certificate(root,user,identity("other")),root["sign_public"])
+    with pytest.raises(ValueError,match="row proof"): verify_row_proof({**proof,"previous_revision":proof["revision"]},row,cert,root["sign_public"])
 
 
 def test_event_encryption_tamper_signature_and_header_binding():
