@@ -23,9 +23,10 @@ def test_path_independent_repo_cross_repo_changeset_and_canonical_schema(tmp_pat
     a,b=repo(tmp_path/"a",content="new a\n"),repo(tmp_path/"b",content="new b\n"); clone=tmp_path/"clone"; subprocess.run(("git","clone","-q",str(a),str(clone)),check=True); assert repository(a)["id"]==repository(clone)["id"]
     path=tmp_path/"core.db"; db=core(path,a,[(a/"x.py","write","new a\n",None),(b/"x.py","write","new b\n",None)]); db.close(); records=capture(path); db=duckdb.connect(str(path)); wire=json.dumps(records); assert str(a) not in wire and str(b) not in wire and not any(r["kind"]=="changeset.observed" for r in records)
     assert len({r["payload"]["id"] for r in records if r["kind"]=="repository.observed"})==2 and {r["payload"]["id"] for r in records if r["kind"]=="edit.observed"}=={"e0","e1"}
+    observed=next(r for r in records if r["kind"]=="repository.observed"); head=db.execute("SELECT last_head FROM provenance.repositories WHERE id=?",[observed["entity"]]).fetchone()[0]; project(db,{**observed,"payload":{k:v for k,v in observed["payload"].items() if k!="head"},"observed_at":None}); assert db.execute("SELECT last_head FROM provenance.repositories WHERE id=?",[observed["entity"]]).fetchone()[0]==head
     row=query(db,"conversation_changes","c")[0]; assert row["repositories"]==2 and row["files"]==2 and row["prompt"]=="make the cross-repo change" and row["changeset_id"]=="m"
     assert len(query(db,"changeset_files","m"))==2 and query(db,"current_activity",str(a))[0]["repository"]==repository(a)["id"]
-    tables={r[0] for r in db.execute("SELECT table_name FROM information_schema.tables WHERE table_schema='provenance'").fetchall()}; assert tables=={"repositories","repository_checkouts","files","file_versions","file_edit_files","git_checkpoints","checkpoint_edits"}
+    tables={r[0] for r in db.execute("SELECT table_name FROM information_schema.tables WHERE table_schema='provenance'").fetchall()}; assert tables=={"repositories","repository_checkouts","files","file_versions","file_edit_files","git_checkpoints","checkpoint_edits","local_facts"}
     columns={r[0] for r in db.execute("SELECT column_name FROM information_schema.columns WHERE table_schema='provenance'").fetchall()}; assert not columns&{"prompt","content","payload","workspace","author"}
 
 
@@ -39,8 +40,8 @@ def test_existing_core_is_checkpointed_once_before_automatic_migration(tmp_path)
 
 
 def test_provenance_upgrade_preserves_edit_evidence_and_removes_unused_graph_tables(tmp_path):
-    db=graph(tmp_path/"graph.db"); db.execute("ALTER TABLE provenance.file_edit_files RENAME COLUMN old_content_hash TO before_hash"); db.execute("ALTER TABLE provenance.file_edit_files RENAME COLUMN new_content_hash TO after_hash"); db.execute("ALTER TABLE provenance.git_checkpoints DROP COLUMN capture_source"); db.execute("CREATE TABLE provenance.assertions(id VARCHAR)"); db.execute("CREATE TABLE provenance.capture_gaps(id VARCHAR)"); db.execute("INSERT INTO provenance.file_edit_files VALUES ('e','f','old','new','captured_exact')"); init_schema(db)
-    assert db.execute("SELECT old_content_hash,new_content_hash FROM provenance.file_edit_files").fetchone()==("old","new") and not {"assertions","capture_gaps"}&{r[0] for r in db.execute("SELECT table_name FROM information_schema.tables WHERE table_schema='provenance'").fetchall()}
+    db=graph(tmp_path/"graph.db"); db.execute("ALTER TABLE provenance.file_edit_files RENAME COLUMN old_content_hash TO before_hash"); db.execute("ALTER TABLE provenance.file_edit_files RENAME COLUMN new_content_hash TO after_hash"); db.execute("ALTER TABLE provenance.git_checkpoints DROP COLUMN capture_source"); db.execute("CREATE TABLE provenance.assertions(id VARCHAR)"); db.execute("CREATE TABLE provenance.capture_gaps(id VARCHAR)"); db.execute("INSERT INTO provenance.repositories VALUES ('r','l','[]','[]',NULL,'2026-01-01')"); db.execute("INSERT INTO provenance.file_edit_files VALUES ('e','f','old','new','captured_exact')"); db.execute("DROP TABLE provenance.local_facts"); init_schema(db)
+    assert db.execute("SELECT old_content_hash,new_content_hash FROM provenance.file_edit_files").fetchone()==("old","new") and db.execute("SELECT * FROM provenance.local_facts").fetchone()==("repository.observed","r") and not {"assertions","capture_gaps"}&{r[0] for r in db.execute("SELECT table_name FROM information_schema.tables WHERE table_schema='provenance'").fetchall()}
 
 
 def test_archive_generation_is_transactional_and_counts_only_owned_rows(tmp_path):

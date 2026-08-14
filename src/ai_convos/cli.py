@@ -74,12 +74,14 @@ CREATE TABLE IF NOT EXISTS provenance.file_versions(id VARCHAR PRIMARY KEY,file_
 CREATE TABLE IF NOT EXISTS provenance.file_edit_files(file_edit_id VARCHAR,file_id VARCHAR,old_content_hash VARCHAR,new_content_hash VARCHAR,evidence VARCHAR,PRIMARY KEY(file_edit_id,file_id));
 CREATE TABLE IF NOT EXISTS provenance.git_checkpoints(id VARCHAR PRIMARY KEY,repository VARCHAR,head VARCHAR,state_hash VARCHAR,paths JSON,observed_at TIMESTAMP,capture_source VARCHAR);
 CREATE TABLE IF NOT EXISTS provenance.checkpoint_edits(checkpoint_id VARCHAR,file_edit_id VARCHAR,evidence VARCHAR,PRIMARY KEY(checkpoint_id,file_edit_id));
+CREATE TABLE IF NOT EXISTS provenance.local_facts(kind VARCHAR,entity VARCHAR,PRIMARY KEY(kind,entity));
 CREATE SCHEMA IF NOT EXISTS remote;
 CREATE TABLE IF NOT EXISTS remote.row_origins(table_name VARCHAR,physical_row_id VARCHAR,workspace_id VARCHAR,author_user_id VARCHAR,author_device_id VARCHAR,source_row_id VARCHAR,source_event_id VARCHAR,content_key VARCHAR,observed_at TIMESTAMP,proof_id VARCHAR,PRIMARY KEY(table_name,physical_row_id));
 CREATE TABLE IF NOT EXISTS remote.row_signers(author_user_id VARCHAR,author_device_id VARCHAR,root_public VARCHAR,certificate JSON,PRIMARY KEY(author_user_id,author_device_id));
 CREATE TABLE IF NOT EXISTS remote.workspace_controls(workspace_id VARCHAR,revision UINTEGER,epoch UINTEGER,state_hash VARCHAR,control JSON,PRIMARY KEY(workspace_id,revision));
 CREATE TABLE IF NOT EXISTS remote.row_proofs(id VARCHAR PRIMARY KEY,workspace_id VARCHAR,authorization_workspace_id VARCHAR,row_kind VARCHAR,source_row_id VARCHAR,encoding_v USMALLINT,content_hash VARCHAR,revision VARCHAR,previous_revision VARCHAR,state VARCHAR,author_user_id VARCHAR,author_device_id VARCHAR,authorization_epoch UINTEGER,signature VARCHAR);
 CREATE TABLE IF NOT EXISTS remote.row_conflicts(proof_id VARCHAR PRIMARY KEY,body JSON);
+CREATE TABLE IF NOT EXISTS remote.provenance_origins(kind VARCHAR,physical_entity VARCHAR,workspace_id VARCHAR,author_user_id VARCHAR,source_entity VARCHAR,proof_id VARCHAR,PRIMARY KEY(kind,physical_entity,workspace_id,author_user_id));
 CREATE TABLE IF NOT EXISTS attachment_bodies(attachment_id VARCHAR PRIMARY KEY,content_hash VARCHAR NOT NULL,size UINTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS core_schema(singleton BOOLEAN PRIMARY KEY,version USMALLINT NOT NULL);
 CREATE TABLE IF NOT EXISTS archive_state(singleton BOOLEAN PRIMARY KEY,archive_id UUID NOT NULL,generation UBIGINT NOT NULL);
@@ -135,11 +137,20 @@ def _observe_provenance(edits,source="sync"):
             if r==rid and path not in cp["paths"] and after==full: records.append(_provenance_record("checkpoint.link",provenance_digest({"checkpoint":cp["id"],"edit":edit}),{"checkpoint":cp["id"],"edit":edit,"evidence":"full_content_match"},captured))
     return records,repos
 def observe_provenance(core): return _observe_provenance(_provenance_edits(core))[0]
+def provenance_records(db):
+    out=[]
+    for r in db.execute("SELECT id,lineage,CAST(roots AS VARCHAR),CAST(remotes AS VARCHAR),last_head,observed_at FROM provenance.repositories").fetchall(): out.append(_provenance_record("repository.observed",r[0],dict(id=r[0],lineage=r[1],roots=json.loads(r[2]),remotes=json.loads(r[3]),head=r[4]),r[5]))
+    for r in db.execute("SELECT * FROM provenance.files").fetchall(): out.append(_provenance_record("file.observed",r[0],dict(zip(("id","repository","path","kind"),r)),None))
+    for r in db.execute("SELECT * FROM provenance.file_versions").fetchall(): out.append(_provenance_record("file.version",r[0],dict(zip(("id","file","content_hash"),r[:3])),r[3]))
+    for r in db.execute("SELECT x.file_edit_id,fe.message_id,x.file_id,f.repository,x.old_content_hash,x.new_content_hash,x.evidence FROM provenance.file_edit_files x JOIN file_edits fe ON fe.id=x.file_edit_id JOIN provenance.files f ON f.id=x.file_id").fetchall(): out.append(_provenance_record("edit.observed",r[0],dict(zip(("id","turn","file","repository","old_content_hash","new_content_hash","evidence"),r)),None))
+    for r in db.execute("SELECT id,repository,head,state_hash,CAST(paths AS VARCHAR),observed_at,capture_source FROM provenance.git_checkpoints").fetchall(): out.append(_provenance_record("git.checkpoint",r[0],dict(id=r[0],repository=r[1],head=r[2],state_hash=r[3],paths=json.loads(r[4]),capture_source=r[6]),r[5]))
+    for r in db.execute("SELECT * FROM provenance.checkpoint_edits").fetchall(): out.append(_provenance_record("checkpoint.link",provenance_digest({"checkpoint":r[0],"edit":r[1]}),dict(zip(("checkpoint","edit","evidence"),r)),None))
+    return out
 def project_provenance(db,value,map_id=lambda table,value:value):
     p,k=value["payload"],value["kind"]; observed=value["observed_at"]
     if k not in PROVENANCE_KINDS: return False
     if k!="checkpoint.link" and p["id"]!=value["entity"]: raise ValueError("provenance entity mismatch")
-    if k=="repository.observed": db.execute("INSERT OR REPLACE INTO provenance.repositories VALUES (?,?,?,?,?,?)",(p["id"],p["lineage"],json.dumps(p["roots"]),json.dumps(p["remotes"]),p["head"],observed))
+    if k=="repository.observed": db.execute("INSERT INTO provenance.repositories VALUES (?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET lineage=excluded.lineage,roots=excluded.roots,remotes=excluded.remotes,last_head=COALESCE(excluded.last_head,repositories.last_head),observed_at=COALESCE(excluded.observed_at,repositories.observed_at)",(p["id"],p["lineage"],json.dumps(p["roots"]),json.dumps(p["remotes"]),p.get("head"),observed))
     elif k=="file.observed":
         if p["id"]!=provenance_digest({"repository":p["repository"],"path":p["path"]}): raise ValueError("provenance file identity mismatch")
         db.execute("INSERT OR IGNORE INTO provenance.files VALUES (?,?,?,?)",(p["id"],p["repository"],p["path"],p["kind"]))
@@ -163,7 +174,7 @@ def capture_provenance(path=None,edit_ids=None,source="sync"):
     try: edits=_provenance_edits(core,edit_ids)
     finally: core.close()
     records,repos=_observe_provenance(edits,source); core=connect(); core.execute("BEGIN")
-    try: [_observe_checkout(core,r) for r in repos.values()]; [project_provenance(core,r) for r in records]; core.execute("COMMIT")
+    try: [_observe_checkout(core,r) for r in repos.values()]; [project_provenance(core,r) for r in records]; records and core.executemany("INSERT OR IGNORE INTO provenance.local_facts VALUES (?,?)",[(r["kind"],r["entity"]) for r in records]); core.execute("COMMIT")
     except BaseException: core.execute("ROLLBACK"); raise
     finally: core.close()
     return records
@@ -188,6 +199,11 @@ def project_workspace_controls(db,controls):
     return len(controls)
 def project_logical_row(db,row,proof,proof_id,native=False):
     table,source=row["kind"],row["id"]; mapped=lambda kind,value:value if native or value is None else provenance_digest(f"{proof['workspace']}:{proof['author_user_id']}:{kind}:{value}")[:16]; physical=mapped(table,source); origin=None if native else {"workspace_id":proof["workspace"],"author_user_id":proof["author_user_id"],"author_device_id":proof["author_device_id"],"source_row_id":source,"source_event_id":proof["revision"],"content_key":f"{table}:{source}","observed_at":None,"proof_id":proof_id}
+    if table in PROVENANCE_KINDS:
+        data={"id":source,**row["data"]}; observed=data.pop("observed_at",None); value={"kind":table,"entity":source,"payload":data,"observed_at":observed}; project_provenance(db,value,mapped); physical=mapped("file_edits",source) if table=="edit.observed" else provenance_digest({"checkpoint":data["checkpoint"],"edit":mapped("file_edits",data["edit"])}) if table=="checkpoint.link" else source
+        if native: db.execute("INSERT OR IGNORE INTO provenance.local_facts VALUES (?,?)",(table,physical))
+        else: db.execute("INSERT OR REPLACE INTO remote.provenance_origins VALUES (?,?,?,?,?,?)",(table,physical,proof["workspace"],proof["author_user_id"],source,proof_id))
+        return physical
     if row["state"]=="deleted": db.execute(f"DELETE FROM {table} WHERE id=?",(physical,)); table=="attachments" and db.execute("DELETE FROM attachment_bodies WHERE attachment_id=?",(physical,)); origin and db.execute("INSERT OR REPLACE INTO remote.row_origins VALUES (?,?,?,?,?,?,?,?,?,?)",(table,physical,*(origin[k] for k in ("workspace_id","author_user_id","author_device_id","source_row_id","source_event_id","content_key","observed_at","proof_id")))); _archive_touch(db); return physical
     data={"id":source,**row["data"]}; values=[data[c] if c in data else None for c in ARCHIVE_COLUMNS[table]]; values[0]=physical
     for column,parent in {"messages":(("conversation_id","conversations"),("parent_id","messages")),"tool_calls":(("message_id","messages"),),"attachments":(("message_id","messages"),),"artifacts":(("conversation_id","conversations"),),"file_edits":(("message_id","messages"),)}.get(table,()): values[ARCHIVE_COLUMNS[table].index(column)]=mapped(parent,data[column])
@@ -241,11 +257,12 @@ def init_schema(conn):
         content TEXT, created_at TIMESTAMP)""")
     conn.execute("ALTER TABLE file_edits ADD COLUMN IF NOT EXISTS old_content TEXT")
     conn.execute("ALTER TABLE messages ADD COLUMN IF NOT EXISTS parent_id VARCHAR")  # thread tree; ALTER (not CREATE) keeps column order identical for fresh and migrated dbs
+    local_facts=bool(conn.execute("SELECT 1 FROM information_schema.tables WHERE table_schema='provenance' AND table_name='local_facts'").fetchone())
     conn.execute(_PROVENANCE_SCHEMA)
     conn.execute("BEGIN")
     try:
         cols={r[0] for r in conn.execute("SELECT column_name FROM information_schema.columns WHERE table_schema='provenance' AND table_name='file_edit_files'").fetchall()}; [(conn.execute(f"ALTER TABLE provenance.file_edit_files RENAME COLUMN {old} TO {new}"),cols.add(new)) for old,new in (("before_hash","old_content_hash"),("after_hash","new_content_hash")) if old in cols and new not in cols]
-        conn.execute("ALTER TABLE provenance.git_checkpoints ADD COLUMN IF NOT EXISTS capture_source VARCHAR"); conn.execute("ALTER TABLE remote.row_origins ADD COLUMN IF NOT EXISTS proof_id VARCHAR"); conn.execute("ALTER TABLE remote.row_proofs ADD COLUMN IF NOT EXISTS authorization_workspace_id VARCHAR"); conn.execute("UPDATE remote.row_proofs SET authorization_workspace_id=workspace_id WHERE authorization_workspace_id IS NULL"); [index_attachment_body(conn,*r) for r in conn.execute("SELECT id,path,size FROM attachments WHERE path IS NOT NULL AND id NOT IN (SELECT attachment_id FROM attachment_bodies)").fetchall()]; conn.execute("DROP TABLE IF EXISTS provenance.assertions"); conn.execute("DROP TABLE IF EXISTS provenance.capture_gaps"); conn.execute("INSERT OR REPLACE INTO core_schema VALUES (TRUE,1)"); conn.execute("COMMIT")
+        conn.execute("ALTER TABLE provenance.git_checkpoints ADD COLUMN IF NOT EXISTS capture_source VARCHAR"); conn.execute("ALTER TABLE remote.row_origins ADD COLUMN IF NOT EXISTS proof_id VARCHAR"); conn.execute("ALTER TABLE remote.row_proofs ADD COLUMN IF NOT EXISTS authorization_workspace_id VARCHAR"); conn.execute("UPDATE remote.row_proofs SET authorization_workspace_id=workspace_id WHERE authorization_workspace_id IS NULL"); [index_attachment_body(conn,*r) for r in conn.execute("SELECT id,path,size FROM attachments WHERE path IS NOT NULL AND id NOT IN (SELECT attachment_id FROM attachment_bodies)").fetchall()]; conn.execute("DROP TABLE IF EXISTS provenance.assertions"); conn.execute("DROP TABLE IF EXISTS provenance.capture_gaps"); conn.execute("INSERT OR REPLACE INTO core_schema VALUES (TRUE,1)"); facts=[(r["kind"],r["entity"]) for r in provenance_records(conn)] if not local_facts else []; facts and conn.executemany("INSERT OR IGNORE INTO provenance.local_facts VALUES (?,?)",facts); conn.execute("COMMIT")
     except BaseException: conn.execute("ROLLBACK"); raise
     conn.execute("INSERT INTO archive_state SELECT TRUE,uuid(),0 WHERE NOT EXISTS (SELECT 1 FROM archive_state)")
     conn.execute("INSTALL fts; LOAD fts")
