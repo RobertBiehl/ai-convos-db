@@ -7,7 +7,7 @@ from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 
 V=1
-APPROVAL_DELAY=int(os.environ.get("CONVOS_REMOTE_APPROVAL_DELAY","3600")); CLOCK_SKEW=30
+APPROVAL_DELAY=int(os.environ.get("CONVOS_REMOTE_APPROVAL_DELAY","3600")); REPLICA_QUOTA=int(os.environ.get("CONVOS_REMOTE_REPLICA_QUOTA",str(10*1024**3))); CLOCK_SKEW=30
 def canon(v): return json.dumps(v,sort_keys=True,separators=(",",":"),ensure_ascii=True,allow_nan=False).encode()
 def unb64(v): return base64.urlsafe_b64decode(v+"="*(-len(v)%4))
 def digest(v): return hashlib.sha256(v if isinstance(v,bytes) else canon(v)).hexdigest()
@@ -28,6 +28,7 @@ CREATE TABLE IF NOT EXISTS workspace_device_exclusions(workspace TEXT,device TEX
 CREATE TABLE IF NOT EXISTS ledger_cursors(cursor INTEGER PRIMARY KEY AUTOINCREMENT);
 CREATE TABLE IF NOT EXISTS events(cursor INTEGER PRIMARY KEY AUTOINCREMENT,workspace TEXT,event TEXT,author TEXT,epoch INT,seq INT,envelope TEXT,wire_hash TEXT,created REAL,UNIQUE(workspace,event));
 CREATE UNIQUE INDEX IF NOT EXISTS event_author_sequence ON events(workspace,author,seq);
+CREATE TABLE IF NOT EXISTS row_replicas(cursor INTEGER PRIMARY KEY AUTOINCREMENT,workspace TEXT,revision TEXT,epoch INT,uploader TEXT,envelope TEXT,wire_hash TEXT,created REAL,updated REAL,UNIQUE(workspace,revision,epoch,uploader));
 CREATE TABLE IF NOT EXISTS event_purges(workspace TEXT,event TEXT,author TEXT,epoch INT,seq INT,superseded_by TEXT,certificate TEXT,cursor INT,deleted REAL,PRIMARY KEY(workspace,event));
 CREATE UNIQUE INDEX IF NOT EXISTS purge_author_sequence ON event_purges(workspace,author,seq);
 CREATE INDEX IF NOT EXISTS purge_anchor ON event_purges(workspace,superseded_by);
@@ -38,8 +39,8 @@ CREATE TABLE IF NOT EXISTS device_votes(proposal TEXT,voter_user TEXT,voter_devi
 
 def connect(path):
     existed=Path(path).exists() and Path(path).stat().st_size>0; db=sqlite3.connect(path); db.row_factory=sqlite3.Row; old=existed and db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='events'").fetchone()
-    if old and db.execute("PRAGMA user_version").fetchone()[0]!=5: db.close(); raise ValueError("relay database is incompatible; create a fresh relay")
-    db.executescript("PRAGMA journal_mode=WAL;PRAGMA foreign_keys=ON;PRAGMA secure_delete=ON;PRAGMA busy_timeout=30000;"+SCHEMA+"PRAGMA user_version=5;"); return db
+    if old and db.execute("PRAGMA user_version").fetchone()[0]!=6: db.close(); raise ValueError("relay database is incompatible; create a fresh relay")
+    db.executescript("PRAGMA journal_mode=WAL;PRAGMA foreign_keys=ON;PRAGMA secure_delete=ON;PRAGMA busy_timeout=30000;"+SCHEMA+"PRAGMA user_version=6;"); return db
 def token_hash(token): return hashlib.sha256(token.encode()).hexdigest()
 def auth(db, token):
     row = db.execute("SELECT * FROM devices WHERE token_hash=? AND active=1", (token_hash(token or ""),)).fetchone()
@@ -195,6 +196,13 @@ def store_event(db,actor,env):
     if db.execute("SELECT 1 FROM event_purges WHERE workspace=? AND event=?",(ws,env["event"])).fetchone(): raise ValueError("event was purged")
     if (used:=db.execute("SELECT event FROM event_purges WHERE workspace=? AND author=? AND seq=?",(ws,env["author"],env["seq"])).fetchone()) and used[0]!=env["event"]: raise ValueError("event author sequence was purged")
     cursor=db.execute("INSERT INTO ledger_cursors DEFAULT VALUES").lastrowid; db.execute("INSERT INTO events VALUES (?,?,?,?,?,?,?,?,?)",(cursor,ws,env["event"],env["author"],env["epoch"],env["seq"],json.dumps(env),wire,time.time())); return {"cursor":cursor,"created":True}
+def store_replica(db,actor,env):
+    fields={"v","kind","workspace","revision","epoch","uploader","nonce","ciphertext"}; ws=env["workspace"]; device_member(db,ws,actor); current=db.execute("SELECT epoch FROM workspaces WHERE id=?",(ws,)).fetchone()[0]
+    if set(env)!=fields or env["v"]!=1 or env["kind"]!="row.replica" or env["uploader"]!=actor["id"] or env["epoch"]!=current or not isinstance(env["revision"],str) or len(env["revision"])!=64 or any(c not in "0123456789abcdef" for c in env["revision"]): raise PermissionError("row replica envelope rejected")
+    key=(ws,env["revision"],env["epoch"],actor["id"]); wire=digest(env); old=db.execute("SELECT cursor,wire_hash,LENGTH(envelope) size FROM row_replicas WHERE workspace=? AND revision=? AND epoch=? AND uploader=?",key).fetchone(); now=time.time(); size=len(canon(env)); used=db.execute("SELECT COALESCE(SUM(LENGTH(envelope)),0) FROM row_replicas WHERE workspace=? AND uploader=?",(ws,actor["id"])).fetchone()[0]
+    if used-(old["size"] if old else 0)+size>REPLICA_QUOTA: raise ValueError("row replica quota exceeded")
+    if old: db.execute("UPDATE row_replicas SET envelope=?,wire_hash=?,updated=? WHERE workspace=? AND revision=? AND epoch=? AND uploader=?",(json.dumps(env),wire,now,*key)); return {"cursor":old["cursor"],"created":False,"replaced":old["wire_hash"]!=wire}
+    cursor=db.execute("INSERT INTO ledger_cursors DEFAULT VALUES").lastrowid; db.execute("INSERT INTO row_replicas VALUES (?,?,?,?,?,?,?,?,?)",(cursor,*key,json.dumps(env),wire,now,now)); return {"cursor":cursor,"created":True,"replaced":False}
 def purge_events(db,actor,req):
     certs=req.get("certificates"); ws=req.get("workspace")
     if not isinstance(certs,list) or not certs or len(certs)>500: raise ValueError("purge requires 1 to 500 certificates")
@@ -275,6 +283,13 @@ def action(db, req, token=None):
     if op == "upload_many":
         if len(req["envelopes"])>500: raise ValueError("upload batch limit is 500")
         result=[store_event(db,actor,env) for env in req["envelopes"]]; db.commit(); return {"events":result}
+    if op == "replica_upload_many":
+        if not isinstance(req["envelopes"],list) or not 1<=len(req["envelopes"])<=500: raise ValueError("replica upload batch limit is 1 to 500")
+        result=[store_replica(db,actor,env) for env in req["envelopes"]]; db.commit(); return {"replicas":result}
+    if op == "replica_pull":
+        ws=req["workspace"]; m=device_member(db,ws,actor); after,limit=req.get("after",0),req.get("limit",500)
+        if not isinstance(after,int) or isinstance(after,bool) or after<0 or not isinstance(limit,int) or isinstance(limit,bool) or not 1<=limit<=500: raise ValueError("replica page is invalid")
+        access="workspace=? AND epoch>=? AND EXISTS(SELECT 1 FROM key_envelopes k WHERE k.workspace=row_replicas.workspace AND k.epoch=row_replicas.epoch AND k.device=?)"; args=(ws,m["history_from"],actor["id"]); bounds=db.execute(f"SELECT MIN(cursor),MAX(cursor) FROM row_replicas WHERE {access}",args).fetchone(); values=rows(db,f"SELECT cursor,envelope FROM row_replicas WHERE {access} AND cursor>? ORDER BY cursor LIMIT ?",args+(after,limit)); return {"floor":bounds[0] or 0,"tail":bounds[1] or 0,"replicas":[{"cursor":r["cursor"],"envelope":json.loads(r["envelope"])} for r in values]}
     if op == "purge": return purge_events(db,actor,req)
     if op == "pull":
         ws=req["workspace"]; m=device_member(db,ws,actor); limit=req.get("limit",500)

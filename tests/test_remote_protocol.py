@@ -5,9 +5,9 @@ import pytest
 from cryptography.exceptions import InvalidSignature, InvalidTag
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
-from ai_convos_remote.protocol import (b64, certificate, digest, event, fingerprint, identity, logical_row, open_event, open_key, public_id, row_proof,
+from ai_convos_remote.protocol import (b64, certificate, digest, event, fingerprint, identity, logical_row, open_event, open_key, open_replica, public_id, row_proof,
                                        material_event, public, purge_certificate, recover, recovery_bundle, seal_event, seal_history, seal_key,
-                                       verify_certificate, verify_event, verify_purge, verify_row_proof)
+                                       seal_replica, verify_certificate, verify_event, verify_purge, verify_row_proof)
 
 def fixed_identity():
     sign, box = Ed25519PrivateKey.from_private_bytes(bytes(range(32))), X25519PrivateKey.from_private_bytes(bytes(range(32, 64)))
@@ -52,6 +52,12 @@ def test_row_proof_rejects_wrong_body_signer_and_self_predecessor():
     with pytest.raises(ValueError,match="row proof"): verify_row_proof(proof,logical_row("attachments",identity="b",state="deleted"),cert,root["sign_public"])
     with pytest.raises(ValueError,match="row proof"): verify_row_proof(proof,row,certificate(root,user,identity("other")),root["sign_public"])
     with pytest.raises(ValueError,match="row proof"): verify_row_proof({**proof,"previous_revision":proof["revision"]},row,cert,root["sign_public"])
+
+
+def test_delivery_replica_separates_origin_author_from_uploader():
+    root,author,uploader=identity("root"),fixed_identity(),identity("peer"); user=public_id(root["sign_public"]); cert=certificate(root,user,author); row=logical_row("messages",identity="m",state="deleted"); proof=row_proof(author,user,"origin",2,row,"a"*64); key=bytes(range(32)); env=seal_replica(row,proof,"replacement",1,key,uploader["id"]); opened=open_replica(env,key)
+    assert env["uploader"]==uploader["id"]!=proof["author_device_id"] and verify_row_proof(opened["proof"],opened["row"],cert,root["sign_public"])
+    with pytest.raises(ValueError,match="replica"): open_replica({**env,"revision":"0"*64},key)
 
 
 def test_event_encryption_tamper_signature_and_header_binding():
