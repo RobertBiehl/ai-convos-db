@@ -5,7 +5,7 @@ from functools import lru_cache
 from importlib.metadata import entry_points
 from pathlib import Path
 
-from ai_convos.cli import ARCHIVE_COLUMNS as COLUMNS, PROVENANCE_KINDS as PROVENANCE, index_attachment_body, init_schema, open_db, project_archive_row, project_logical_row, project_provenance, project_row_proof, project_workspace_controls, provenance_records, repository as resolve_repository, set_attachment_path
+from ai_convos.cli import ARCHIVE_COLUMNS as COLUMNS, PROVENANCE_KINDS as PROVENANCE, _insert_pages, index_attachment_body, init_schema, open_db, project_logical_rows, project_provenance, project_row_proofs, project_workspace_controls, provenance_records, set_attachment_path
 from ai_convos_changegraph.provenance import query as graph_query
 from .control import verify_state
 from .protocol import digest, fingerprint, logical_fact, logical_row, row_proof, seal_blob, seal_replica, verify_row_proof
@@ -17,24 +17,24 @@ CREATE TABLE IF NOT EXISTS receipts(workspace TEXT,event TEXT,cursor INT,author 
 CREATE INDEX IF NOT EXISTS receipt_cursor ON receipts(workspace,cursor);
 CREATE TABLE IF NOT EXISTS publication_heads(workspace TEXT,owner TEXT,entity TEXT,revision TEXT,event TEXT,PRIMARY KEY(workspace,owner,entity)) WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS cursors(workspace TEXT PRIMARY KEY,cursor INT) WITHOUT ROWID;
-CREATE TABLE IF NOT EXISTS heads(workspace TEXT,author_user TEXT,entity TEXT,sort_key TEXT,event TEXT,PRIMARY KEY(workspace,author_user,entity)) WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS lazy_events(workspace TEXT,event TEXT,cursor INT,size INT,PRIMARY KEY(workspace,event)) WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS deferred_events(workspace TEXT,event TEXT,cursor INT,kind TEXT,payload_v INT,required INT,PRIMARY KEY(workspace,event)) WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS event_sequences(workspace TEXT,author TEXT,seq INT,event TEXT,PRIMARY KEY(workspace,author,seq)) WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS sequence_gaps(workspace TEXT,author TEXT,seq INT,parents TEXT,PRIMARY KEY(workspace,author,seq)) WITHOUT ROWID;
-CREATE TABLE IF NOT EXISTS replica_outbox(workspace TEXT,replica TEXT,epoch INT,uploader TEXT,path TEXT,size INT,PRIMARY KEY(workspace,replica,epoch,uploader)) WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS replica_receipts(workspace TEXT,replica TEXT,epoch INT,cursor INT,PRIMARY KEY(workspace,replica,epoch)) WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS blob_outbox(workspace TEXT,blob TEXT,epoch INT,uploader TEXT,path TEXT,size INT,PRIMARY KEY(workspace,blob,epoch,uploader)) WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS blob_receipts(workspace TEXT,blob TEXT,epoch INT,cursor INT,PRIMARY KEY(workspace,blob,epoch)) WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS origin_bindings(workspace TEXT,origin TEXT,bundle TEXT,epoch INT,cursor INT,PRIMARY KEY(workspace,origin)) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS control_dependencies(workspace TEXT,origin TEXT,bundle TEXT,epoch INT,cursor INT,PRIMARY KEY(workspace,origin)) WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS policies(workspace TEXT,kind TEXT,value TEXT,PRIMARY KEY(workspace,kind,value)) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS team_scopes(workspace TEXT,conversation TEXT,PRIMARY KEY(workspace,conversation)) WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS sync_states(workspace TEXT PRIMARY KEY,lifecycle TEXT NOT NULL,tail INT NOT NULL DEFAULT 0,floor INT NOT NULL DEFAULT 0,error TEXT) WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY,value TEXT) WITHOUT ROWID;
 """
-STATE_TABLES={"outbox","receipts","publication_heads","cursors","heads","lazy_events","deferred_events","event_sequences","sequence_gaps","replica_outbox","replica_receipts","blob_outbox","blob_receipts","origin_bindings","policies","sync_states","meta"}
+STATE_TABLES={"outbox","receipts","publication_heads","cursors","lazy_events","deferred_events","event_sequences","sequence_gaps","replica_receipts","blob_outbox","blob_receipts","origin_bindings","control_dependencies","policies","team_scopes","sync_states","meta"}
 STATE_FORBIDDEN={"published","event_log","history_material","history_outbox","history_queue","attachment_chunks","imported_rows","raw_events","repositories","files","file_versions","changesets","edits","checkpoints","assertions","gaps","boundaries","sharing_boundaries"}
 TABLES={"conversation.record":"conversations","message.record":"messages","tool.record":"tool_calls","attachment.record":"attachments","artifact.record":"artifacts","file_edit.record":"file_edits"}
-CORE_EVENTS={(kind,1) for kind in set(TABLES)|{"workspace.policy","workspace.membership","workspace.device"}}; AUXILIARY_EVENTS={"memory.canonical"}; SIGNED=set(TABLES)|PROVENANCE
+CORE_EVENTS={(kind,1) for kind in {"workspace.policy","workspace.membership","workspace.device"}}; AUXILIARY_EVENTS={"memory.canonical"}; SIGNED=set(TABLES)|PROVENANCE
 FKS={"messages":(("conversation_id","conversations"),("parent_id","messages")),"tool_calls":(("message_id","messages"),),"attachments":(("message_id","messages"),),"artifacts":(("conversation_id","conversations"),),"file_edits":(("message_id","messages"),)}
 
 def _connect(path,journal="WAL"):
@@ -142,107 +142,126 @@ def relocate_attachments(db_path,remote_root):
         raise
     finally: db.close()
     [source.unlink(missing_ok=True) for row_id,source,target in moved if source!=target]; return len(moved)
-def _records(core,state,blobs=True):
+def _records(core,state,blobs=True,changes=None):
     out=[]; imported=set(core.execute("SELECT table_name,physical_row_id FROM remote.row_origins").fetchall())
     for kind,table in TABLES.items():
-        cur=core.execute(f"SELECT * EXCLUDE (embedding) FROM {table}" if table=="messages" else "SELECT a.*,b.content_hash body_hash FROM attachments a LEFT JOIN attachment_bodies b ON b.attachment_id=a.id" if table=="attachments" else f"SELECT * FROM {table}"); cols=[d[0] for d in cur.description]
+        wanted=[entity for changed,entity in changes or () if changed==table]
+        if changes is not None and not wanted: continue
+        where=f" WHERE {'a.id' if table=='attachments' else 'id'} IN (SELECT UNNEST(?))" if changes is not None else ""; cur=core.execute((f"SELECT * EXCLUDE (embedding) FROM {table}" if table=="messages" else "SELECT a.*,b.content_hash body_hash FROM attachments a LEFT JOIN attachment_bodies b ON b.attachment_id=a.id" if table=="attachments" else f"SELECT * FROM {table}")+where,[wanted] if changes is not None else []); cols=[d[0] for d in cur.description]
+        found=set()
         for values in cur.fetchall():
             row=dict(zip(cols,map(clean,values))); row["embedding"]=None if "embedding" in row else row.get("embedding"); row["cwd"]=None if table=="conversations" else row.get("cwd"); row["path"]=None if table=="attachments" else row.get("path")
+            found.add(row["id"])
             if (table,row["id"]) not in imported: out.append(dict(kind=kind,entity=f"{table}:{row['id']}",payload=dict(table=table,columns=cols,row=[row[c] for c in cols])))
+        out += [dict(kind=kind,entity=f"{table}:{row_id}",payload=dict(table=table,state="deleted",id=row_id)) for row_id in wanted if row_id not in found and (table,row_id) not in imported]
     return out
+def signed_row(record):
+    p=record["payload"]; return logical_row(p["table"],identity=p["id"],state="deleted") if p.get("state")=="deleted" else logical_row(p["table"],p["columns"],p["row"])
 def _under(path,cwd,roots):
     p=Path(path); p=(Path(cwd)/p if not p.is_absolute() and cwd else p).expanduser().resolve(); return any(p.is_relative_to(root) for root in roots)
-def _team_scope(core,provenance,repositories,roots):
-    roots=[Path(p).expanduser().resolve() for p in roots]; checkouts=[Path(r[0]).expanduser().resolve() for r in core.execute("SELECT root FROM provenance.repository_checkouts WHERE repository IN (SELECT UNNEST(?))",[list(repositories)]).fetchall()] if repositories else []; allowed=roots+checkouts; edit_repos={r["payload"]["id"]:r["payload"]["repository"] for r in provenance if r["kind"]=="edit.observed"}; rows=core.execute("SELECT fe.id,fe.file_path,m.conversation_id,c.cwd FROM file_edits fe JOIN messages m ON m.id=fe.message_id JOIN conversations c ON c.id=m.conversation_id").fetchall(); cwd_rows=core.execute("SELECT id,cwd FROM conversations WHERE cwd IS NOT NULL").fetchall(); cwd_repos={cwd:repo["id"] if (repo:=resolve_repository(cwd)) else None for cwd in {cwd for cid,cwd in cwd_rows if not allowed or not _under(cwd,None,allowed)}}
-    return {cid for eid,path,cid,cwd in rows if edit_repos.get(eid) in repositories or _under(path,cwd,roots)}|{cid for cid,cwd in cwd_rows if allowed and _under(cwd,None,allowed) or cwd_repos.get(cwd) in repositories}
-def scan(core,graph,kind="personal",repositories=(),roots=()):
-    local={tuple(r) for r in core.execute("SELECT kind,entity FROM provenance.local_facts").fetchall()}; provenance=[clean(r) for r in provenance_records(core) if (r["kind"],r["entity"]) in local]; records=_records(core,graph,kind=="personal")
+def _team_scope(core,provenance,repositories,roots,candidates=None):
+    roots=[Path(p).expanduser().resolve() for p in roots]; checkouts=[Path(r[0]).expanduser().resolve() for r in core.execute("SELECT root FROM provenance.repository_checkouts WHERE repository IN (SELECT UNNEST(?))",[list(repositories)]).fetchall()] if repositories else []; allowed=roots+checkouts; edit_repos={r["payload"]["id"]:r["payload"]["repository"] for r in provenance if r["kind"]=="edit.observed"}; where=" WHERE c.id IN (SELECT UNNEST(?))" if candidates is not None else ""; args=[list(candidates)] if candidates is not None else []; rows=core.execute("SELECT fe.id,fe.file_path,m.conversation_id,c.cwd FROM file_edits fe JOIN messages m ON m.id=fe.message_id JOIN conversations c ON c.id=m.conversation_id"+where,args).fetchall(); cwd_rows=core.execute("SELECT id,cwd FROM conversations WHERE cwd IS NOT NULL"+(" AND id IN (SELECT UNNEST(?))" if candidates is not None else ""),args).fetchall()
+    return {cid for eid,path,cid,cwd in rows if edit_repos.get(eid) in repositories or _under(path,cwd,roots)}|{cid for cid,cwd in cwd_rows if allowed and _under(cwd,None,allowed)}
+def scan(core,graph,kind="personal",repositories=(),roots=(),changes=None,workspace=None,new_scope=None):
+    selected=changes; local={tuple(r) for r in core.execute("SELECT kind,entity FROM provenance.local_facts"+(" WHERE entity IN (SELECT UNNEST(?))" if selected is not None else ""),[[r[1] for r in selected]] if selected is not None else []).fetchall()}; all_provenance=[clean(r) for r in provenance_records(core,selected) if (r["kind"],r["entity"]) in local]; prior={r[0] for r in graph.execute("SELECT conversation FROM team_scopes WHERE workspace=?",(workspace,)).fetchall()} if kind=="team" and workspace and changes is not None else set(); changed={table:{entity for name,entity in changes or () if name==table} for table in TABLES.values()}; candidates=changed["conversations"]|{r[0] for r in core.execute("SELECT conversation_id FROM messages WHERE id IN (SELECT UNNEST(?))",[list(changed["messages"])]).fetchall()}|{r[0] for r in core.execute("SELECT m.conversation_id FROM messages m JOIN (SELECT message_id FROM tool_calls WHERE id IN (SELECT UNNEST(?)) UNION SELECT message_id FROM attachments WHERE id IN (SELECT UNNEST(?)) UNION SELECT message_id FROM file_edits WHERE id IN (SELECT UNNEST(?))) x ON x.message_id=m.id",[list(changed["tool_calls"]),list(changed["attachments"]),list(changed["file_edits"])]).fetchall()}|{r[0] for r in core.execute("SELECT conversation_id FROM artifacts WHERE id IN (SELECT UNNEST(?))",[list(changed["artifacts"])]).fetchall()} if changes is not None else None; convs=(prior|_team_scope(core,all_provenance,set(repositories),roots,candidates)) if kind=="team" else set()
+    if changes is not None and workspace and (new:=convs-{r[0] for r in graph.execute("SELECT conversation FROM team_scopes WHERE workspace=?",(workspace,)).fetchall()}):
+        local={tuple(r) for r in core.execute("SELECT kind,entity FROM provenance.local_facts").fetchall()}; all_provenance=[clean(r) for r in provenance_records(core) if (r["kind"],r["entity"]) in local]; msgs={r[0] for r in core.execute("SELECT id FROM messages WHERE conversation_id IN (SELECT UNNEST(?))",[list(new)]).fetchall()}; changes=set(changes)|{("conversations",x) for x in new}|{("messages",x) for x in msgs}|{(table,r[0]) for table in ("tool_calls","attachments","file_edits") for r in core.execute(f"SELECT id FROM {table} WHERE message_id IN (SELECT UNNEST(?))",[list(msgs)]).fetchall()}|{("artifacts",r[0]) for r in core.execute("SELECT id FROM artifacts WHERE conversation_id IN (SELECT UNNEST(?))",[list(new)]).fetchall()}|local
+    if workspace and new_scope is not None: new_scope.update(convs)
+    provenance=[r for r in all_provenance if changes is None or (r["kind"],r["entity"]) in changes]; records=_records(core,graph,kind=="personal",changes)
     edit_paths={r["payload"]["id"]:r["payload"]["file"] for r in provenance if r["kind"]=="edit.observed"}; file_paths={r["payload"]["id"]:r["payload"]["path"] for r in provenance if r["kind"]=="file.observed"}
     for r in records:
-        if r["kind"]=="file_edit.record" and (fid:=edit_paths.get(r["payload"]["row"][0])): r["payload"]["row"][2]=file_paths[fid]
+        if r["kind"]=="file_edit.record" and r["payload"].get("state")!="deleted" and (fid:=edit_paths.get(r["payload"]["row"][0])): r["payload"]["row"][2]=file_paths[fid]
     if kind=="personal": return records+provenance
-    convs=_team_scope(core,provenance,set(repositories),roots); keep=[]; msgs={r["payload"]["row"][0] for r in records if r["kind"]=="message.record" and r["payload"]["row"][1] in convs}; edits={r["payload"]["row"][0] for r in records if r["kind"]=="file_edit.record" and r["payload"]["row"][1] in msgs}
+    keep=[]; parents={r["payload"]["row"][1] for r in records if r["payload"]["table"] in ("tool_calls","attachments","file_edits") and r["payload"].get("state")!="deleted"}; msg_convs=dict(core.execute("SELECT id,conversation_id FROM messages WHERE id IN (SELECT UNNEST(?))",[list(parents)]).fetchall()) if parents else {}; edits={r[0] for r in core.execute("SELECT fe.id FROM file_edits fe JOIN messages m ON m.id=fe.message_id WHERE m.conversation_id IN (SELECT UNNEST(?))",[list(convs)]).fetchall()}; shared=set(core.execute("SELECT row_kind,source_row_id FROM remote.row_proofs WHERE authorization_workspace_id=?",(workspace,)).fetchall()) if workspace else set()
     for r in records:
-        table,row=r["payload"]["table"],r["payload"]["row"]
-        if table=="conversations" and row[0] in convs or table=="messages" and row[0] in msgs or table in ("tool_calls","attachments","file_edits") and row[1] in msgs or table=="artifacts" and row[1] in convs: keep.append(r)
-    allowed_files={r["payload"]["file"] for r in provenance if r["kind"]=="edit.observed" and r["payload"]["id"] in edits}; allowed_repos={r["payload"]["repository"] for r in provenance if r["kind"]=="edit.observed" and r["payload"]["id"] in edits}
+        table,row=r["payload"]["table"],r["payload"]["row"] if "row" in r["payload"] else [r["payload"]["id"]]
+        if r["payload"].get("state")=="deleted" and (table,row[0]) in shared or table=="conversations" and row[0] in convs or len(row)>1 and (table=="messages" and row[1] in convs or table in ("tool_calls","attachments","file_edits") and msg_convs.get(row[1]) in convs or table=="artifacts" and row[1] in convs): keep.append(r)
+    allowed_files={r["payload"]["file"] for r in all_provenance if r["kind"]=="edit.observed" and r["payload"]["id"] in edits}; allowed_repos={r["payload"]["repository"] for r in all_provenance if r["kind"]=="edit.observed" and r["payload"]["id"] in edits}
     for r in provenance:
         p,k=r["payload"],r["kind"]
         if k=="edit.observed" and p["id"] in edits or k=="file.observed" and p["id"] in allowed_files or k=="file.version" and p["file"] in allowed_files or k in ("repository.observed","git.checkpoint") and p.get("repository",p.get("id")) in allowed_repos or k=="checkpoint.link" and p["edit"] in edits: keep.append(r)
     return keep
 def attest_rows(db_path,cfg,workspace,records,origins=()):
-    controls=next(w["controls"] for w in cfg["server_state"]["workspaces"] if w["id"]==workspace); device=cfg["device"]; signer=cfg["controls"][workspace]["devices"][device["id"]]; db=open_db(db_path); init_schema(db); made=0; db.execute("BEGIN")
+    controls=next(w["controls"] for w in cfg["server_state"]["workspaces"] if w["id"]==workspace); device=cfg["device"]; signer=cfg["controls"][workspace]["devices"][device["id"]]; selected=[r for r in records if r["kind"] in SIGNED]; ids=[r["payload"].get("id",r["payload"].get("row",[None])[0]) if r["kind"] in TABLES else r["entity"] for r in selected]; db=open_db(db_path); init_schema(db); made=0; batch=[]; begun=False
     try:
-        project_workspace_controls(db,controls)
-        scopes=(workspace,*origins); marks=','.join('?'*len(scopes))
-        for record in (r for r in records if r["kind"] in SIGNED):
-            p=record["payload"]; row=logical_row(p["table"],p["columns"],p["row"]) if record["kind"] in TABLES else logical_fact(record); heads=db.execute(f"SELECT DISTINCT p.workspace_id,p.revision,p.content_hash FROM remote.row_proofs p WHERE p.workspace_id IN ({marks}) AND p.row_kind=? AND p.source_row_id=? AND p.author_user_id=? AND NOT EXISTS (SELECT 1 FROM remote.row_proofs c WHERE c.workspace_id=p.workspace_id AND c.row_kind=p.row_kind AND c.source_row_id=p.source_row_id AND c.author_user_id=p.author_user_id AND c.previous_revision=p.revision)",(*scopes,row["kind"],row["id"],cfg["user"])).fetchall(); current=digest(row)
-            if any(h[2]==current for h in heads): continue
-            if len(heads)>1: raise ValueError(f"row revision conflict: {row['kind']}:{row['id']}")
-            proof=row_proof(device,cfg["user"],heads[0][0] if heads else workspace,cfg["workspaces"][workspace]["epoch"],row,heads[0][1] if heads else None,workspace); project_row_proof(db,proof,signer["root_public"],signer["certificate"]); made+=1
-        db.execute("COMMIT"); return made
-    except BaseException: db.execute("ROLLBACK"); raise
+        db.execute("BEGIN"); project_workspace_controls(db,controls); db.execute("COMMIT"); scopes=(workspace,*origins); marks=','.join('?'*len(scopes)); heads={}
+        [heads.setdefault((r[1],r[2]),[]).append((r[0],r[3],r[4])) for r in (db.execute(f"SELECT DISTINCT p.workspace_id,p.row_kind,p.source_row_id,p.revision,p.content_hash FROM remote.row_proofs p WHERE p.workspace_id IN ({marks}) AND p.author_user_id=? AND p.source_row_id IN (SELECT UNNEST(?)) AND NOT EXISTS (SELECT 1 FROM remote.row_proofs c WHERE c.workspace_id=p.workspace_id AND c.row_kind=p.row_kind AND c.source_row_id=p.source_row_id AND c.author_user_id=p.author_user_id AND c.previous_revision=p.revision)",(*scopes,cfg["user"],ids)).fetchall() if selected else [])]
+        for record in selected:
+            row=signed_row(record) if record["kind"] in TABLES else logical_fact(record)
+            found=heads.get((row["kind"],row["id"]),[]); current=digest(row)
+            if any(h[2]==current for h in found): continue
+            if len(found)>1: raise ValueError(f"row revision conflict: {row['kind']}:{row['id']}")
+            batch.append(row_proof(device,cfg["user"],found[0][0] if found else workspace,cfg["workspaces"][workspace]["epoch"],row,found[0][1] if found else None,workspace,current)); made+=1
+            if len(batch)==500: db.execute("BEGIN"); begun=True; project_row_proofs(db,batch,signer["root_public"],signer["certificate"]); db.execute("COMMIT"); begun=False; batch=[]
+        if batch: db.execute("BEGIN"); begun=True; project_row_proofs(db,batch,signer["root_public"],signer["certificate"]); db.execute("COMMIT"); begun=False
+        return made
+    except BaseException: begun and db.execute("ROLLBACK"); raise
     finally: db.close()
-def row_replicas(db_path,cfg,workspace,records,keys,known=(),origins=(),origin_epochs=None):
+def row_replicas(db_path,cfg,workspace,records,keys,known=(),origins=(),origin_epochs=None,inventory=None,retained=True):
     fields=("workspace","authorization_workspace","row_kind","row_id","encoding_v","content_hash","revision","previous_revision","state","author_user_id","author_device_id","authorization_epoch","signature"); db=open_db(db_path,True); bodies={}
     proof=lambda values:{"v":1,"kind":"row.proof",**dict(zip(fields,values))}
-    keep=lambda row,p:bodies.setdefault(digest(p),(row,p))
+    keep=lambda row,p,content_hash=None:bodies.setdefault(digest(p),(row,p,content_hash))
     try:
-        scopes=(workspace,*origins); marks=','.join('?'*len(scopes))
-        for record in (r for r in records if r["kind"] in SIGNED):
-            p=record["payload"]; row=logical_row(p["table"],p["columns"],p["row"]) if record["kind"] in TABLES else logical_fact(record); values=db.execute(f"SELECT workspace_id,authorization_workspace_id,row_kind,source_row_id,encoding_v,content_hash,revision,previous_revision,state,author_user_id,author_device_id,authorization_epoch,signature FROM remote.row_proofs p WHERE workspace_id IN ({marks}) AND row_kind=? AND source_row_id=? AND author_user_id=? AND content_hash=? AND NOT EXISTS (SELECT 1 FROM remote.row_proofs c WHERE c.workspace_id=p.workspace_id AND c.previous_revision=p.revision)",(*scopes,row["kind"],row["id"],cfg["user"],digest(row))).fetchall()
+        scopes=(workspace,*origins); marks=','.join('?'*len(scopes)); prepared=[(signed_row(r) if r["kind"] in TABLES else logical_fact(r)) for r in records if r["kind"] in SIGNED]; local={}
+        [local.setdefault((r[2],r[3],r[5]),[]).append(proof(r)) for r in (db.execute(f"SELECT workspace_id,authorization_workspace_id,row_kind,source_row_id,encoding_v,content_hash,revision,previous_revision,state,author_user_id,author_device_id,authorization_epoch,signature FROM remote.row_proofs p WHERE workspace_id IN ({marks}) AND author_user_id=? AND source_row_id IN (SELECT UNNEST(?)) AND NOT EXISTS (SELECT 1 FROM remote.row_proofs c WHERE c.workspace_id=p.workspace_id AND c.row_kind=p.row_kind AND c.source_row_id=p.source_row_id AND c.author_user_id=p.author_user_id AND c.previous_revision=p.revision)",(*scopes,cfg["user"],[row["id"] for row in prepared])).fetchall() if prepared else [])]
+        for row in prepared:
+            values=local.get((row["kind"],row["id"],digest(row)),[])
             if len(values)!=1: raise ValueError(f"current row proof unavailable: {row['kind']}:{row['id']}")
-            keep(row,proof(values[0]))
-        for table,physical,source,pid,user,origin in db.execute(f"SELECT table_name,physical_row_id,source_row_id,proof_id,author_user_id,workspace_id FROM remote.row_origins WHERE workspace_id IN ({marks}) AND proof_id IS NOT NULL",scopes).fetchall():
-            values=db.execute("SELECT workspace_id,authorization_workspace_id,row_kind,source_row_id,encoding_v,content_hash,revision,previous_revision,state,author_user_id,author_device_id,authorization_epoch,signature FROM remote.row_proofs WHERE id=?",(pid,)).fetchone(); p=proof(values); cur=db.execute(f"SELECT * EXCLUDE (embedding) FROM {table} WHERE id=?",(physical,)) if table=="messages" else db.execute("SELECT a.*,b.content_hash body_hash FROM attachments a LEFT JOIN attachment_bodies b ON b.attachment_id=a.id WHERE a.id=?",(physical,)) if table=="attachments" else db.execute(f"SELECT * FROM {table} WHERE id=?",(physical,)); cols=[d[0] for d in cur.description]; raw=cur.fetchone()
-            if p["state"]=="deleted": row=logical_row(table,identity=source,state="deleted")
-            elif raw:
-                raw=list(map(clean,raw)); raw[cols.index("id")]=source
-                for column,parent in FKS.get(table,()):
-                    i=cols.index(column); mapped=db.execute("SELECT source_row_id FROM remote.row_origins WHERE table_name=? AND physical_row_id=? AND workspace_id=? AND author_user_id=?",(parent,raw[i],origin,user)).fetchone(); raw[i]=mapped[0] if mapped else raw[i]
-                row=logical_row(table,cols,raw,source)
-            else: continue
-            keep(row,p)
-        facts={(r["kind"],r["entity"]):r for r in provenance_records(db)}
-        for kind,physical,source,pid,user,origin in db.execute(f"SELECT kind,physical_entity,source_entity,proof_id,author_user_id,workspace_id FROM remote.provenance_origins WHERE workspace_id IN ({marks})",scopes).fetchall():
-            values=db.execute("SELECT workspace_id,authorization_workspace_id,row_kind,source_row_id,encoding_v,content_hash,revision,previous_revision,state,author_user_id,author_device_id,authorization_epoch,signature FROM remote.row_proofs WHERE id=?",(pid,)).fetchone(); p=proof(values); record=facts.get((kind,physical))
+            keep(row,values[0],values[0]["content_hash"])
+        for values in (db.execute(f"SELECT workspace_id,authorization_workspace_id,row_kind,source_row_id,encoding_v,content_hash,revision,previous_revision,state,author_user_id,author_device_id,authorization_epoch,signature FROM remote.row_proofs p WHERE workspace_id IN ({marks}) AND author_user_id=? AND state='deleted' AND row_kind IN (SELECT UNNEST(?)) AND NOT EXISTS (SELECT 1 FROM remote.row_proofs c WHERE c.workspace_id=p.workspace_id AND c.row_kind=p.row_kind AND c.source_row_id=p.source_row_id AND c.author_user_id=p.author_user_id AND c.previous_revision=p.revision)",(*scopes,cfg["user"],list(TABLES.values()))).fetchall() if retained else []): p=proof(values); keep(logical_row(p["row_kind"],identity=p["row_id"],state="deleted"),p)
+        imported=(db.execute(f"SELECT o.table_name,o.physical_row_id,o.source_row_id,o.author_user_id,o.workspace_id,p.workspace_id,p.authorization_workspace_id,p.row_kind,p.source_row_id,p.encoding_v,p.content_hash,p.revision,p.previous_revision,p.state,p.author_user_id,p.author_device_id,p.authorization_epoch,p.signature FROM remote.row_origins o JOIN remote.row_proofs p ON p.id=o.proof_id WHERE o.workspace_id IN ({marks})",scopes).fetchall() if retained else []); mapped={(r[0],r[1],r[4],r[3]):r[2] for r in imported}
+        for table in TABLES.values():
+            selected=[r for r in imported if r[0]==table]; ids=[r[1] for r in selected]; cur=db.execute(f"SELECT * EXCLUDE (embedding) FROM {table} WHERE id IN (SELECT UNNEST(?))",[ids]) if table=="messages" else db.execute("SELECT a.*,b.content_hash body_hash FROM attachments a LEFT JOIN attachment_bodies b ON b.attachment_id=a.id WHERE a.id IN (SELECT UNNEST(?))",[ids]) if table=="attachments" else db.execute(f"SELECT * FROM {table} WHERE id IN (SELECT UNNEST(?))",[ids]); cols=[d[0] for d in cur.description]; raws={r[0]:list(map(clean,r)) for r in cur.fetchall()}
+            for name,physical,source,user,origin,*values in selected:
+                p=proof(values); raw=raws.get(physical)
+                if p["state"]=="deleted": row=logical_row(table,identity=source,state="deleted")
+                elif raw:
+                    raw=raw.copy(); raw[cols.index("id")]=source; [raw.__setitem__(cols.index(column),mapped.get((parent,raw[cols.index(column)],origin,user),raw[cols.index(column)])) for column,parent in FKS.get(table,())]; row=logical_row(table,cols,raw,source)
+                else: continue
+                keep(row,p)
+        facts={(r["kind"],r["entity"]):r for r in provenance_records(db)} if retained else {}
+        for kind,physical,source,user,origin,*values in (db.execute(f"SELECT o.kind,o.physical_entity,o.source_entity,o.author_user_id,o.workspace_id,p.workspace_id,p.authorization_workspace_id,p.row_kind,p.source_row_id,p.encoding_v,p.content_hash,p.revision,p.previous_revision,p.state,p.author_user_id,p.author_device_id,p.authorization_epoch,p.signature FROM remote.provenance_origins o JOIN remote.row_proofs p ON p.id=o.proof_id WHERE o.workspace_id IN ({marks})",scopes).fetchall() if retained else []):
+            p=proof(values); record=facts.get((kind,physical))
             if not record: continue
             payload={**record["payload"],**({"id":source} if kind!="checkpoint.link" else {})}
             for field,parent in (("turn","messages"),("edit","file_edits")):
-                if field in payload and (mapped:=db.execute("SELECT source_row_id FROM remote.row_origins WHERE table_name=? AND physical_row_id=? AND workspace_id=? AND author_user_id=?",(parent,payload[field],origin,user)).fetchone()): payload[field]=mapped[0]
+                if field in payload and (source_id:=mapped.get((parent,payload[field],origin,user))): payload[field]=source_id
             keep(logical_fact({**record,"entity":source,"payload":payload}),p)
-        for raw,values in db.execute(f"SELECT CAST(c.body AS VARCHAR),p.workspace_id,p.authorization_workspace_id,p.row_kind,p.source_row_id,p.encoding_v,p.content_hash,p.revision,p.previous_revision,p.state,p.author_user_id,p.author_device_id,p.authorization_epoch,p.signature FROM remote.row_conflicts c JOIN remote.row_proofs p ON p.id=c.proof_id WHERE p.workspace_id IN ({marks})",scopes).fetchall(): keep(json.loads(raw),proof(values))
-        delivery=lambda p:p["authorization_epoch"] if p["authorization_workspace"]==workspace else (origin_epochs or {})[p["workspace"]]; return [seal_replica(row,p,workspace,epoch,keys[epoch],cfg["device"]["id"]) for row,p in bodies.values() for epoch in [delivery(p)] if epoch in keys and fingerprint(keys[epoch],digest(p)) not in known]
+        for raw,*values in (db.execute(f"SELECT CAST(c.body AS VARCHAR),p.workspace_id,p.authorization_workspace_id,p.row_kind,p.source_row_id,p.encoding_v,p.content_hash,p.revision,p.previous_revision,p.state,p.author_user_id,p.author_device_id,p.authorization_epoch,p.signature FROM remote.row_conflicts c JOIN remote.row_proofs p ON p.id=c.proof_id WHERE p.workspace_id IN ({marks})",scopes).fetchall() if retained else []): keep(json.loads(raw),proof(values))
+        delivery=lambda p:p["authorization_epoch"] if p["authorization_workspace"]==workspace else (origin_epochs or {})[p["workspace"]]; candidates=[(row,p,content_hash,epoch,fingerprint(keys[epoch],digest(p))) for row,p,content_hash in bodies.values() for epoch in [delivery(p)] if epoch in keys]; known=set(inventory([(r[4],r[3]) for r in candidates])) if inventory else set(known); return [seal_replica(row,p,workspace,epoch,keys[epoch],cfg["device"]["id"],content_hash) for row,p,content_hash,epoch,replica in candidates if replica not in known]
     finally: db.close()
-def blob_replicas(db_path,cfg,workspace,records,keys,known=(),origins=(),origin_epochs=None):
+def blob_replicas(db_path,cfg,workspace,records,keys,known=(),origins=(),origin_epochs=None,retained=True):
     if cfg["workspaces"][workspace]["kind"]!="personal": return []
-    allowed={dict(zip(r["payload"]["columns"],r["payload"]["row"])).get("body_hash") for r in records if r["kind"]=="attachment.record"}; db=open_db(db_path,True); scopes=(workspace,*origins); marks=','.join('?'*len(scopes)); rows=db.execute(f"SELECT a.path,b.content_hash,b.size,p.workspace_id,p.authorization_workspace_id,p.authorization_epoch,o.proof_id IS NOT NULL FROM attachments a JOIN attachment_bodies b ON b.attachment_id=a.id LEFT JOIN remote.row_origins o ON o.table_name='attachments' AND o.physical_row_id=a.id JOIN remote.row_proofs p ON p.id=o.proof_id OR o.proof_id IS NULL AND p.workspace_id IN ({marks}) AND p.row_kind='attachments' AND p.source_row_id=a.id AND p.author_user_id=? WHERE a.path IS NOT NULL AND p.workspace_id IN ({marks}) AND NOT EXISTS (SELECT 1 FROM remote.row_proofs c WHERE c.workspace_id=p.workspace_id AND c.row_kind='attachments' AND c.source_row_id=p.source_row_id AND c.author_user_id=p.author_user_id AND c.previous_revision=p.revision)",(*scopes,cfg["user"],*scopes)).fetchall(); db.close(); out=[]
+    allowed={dict(zip(r["payload"]["columns"],r["payload"]["row"])).get("body_hash") for r in records if r["kind"]=="attachment.record" and r["payload"].get("state")!="deleted"}; db=open_db(db_path,True); scopes=(workspace,*origins); marks=','.join('?'*len(scopes)); rows=db.execute(f"SELECT a.path,b.content_hash,b.size,p.workspace_id,p.authorization_workspace_id,p.authorization_epoch,o.proof_id IS NOT NULL FROM attachments a JOIN attachment_bodies b ON b.attachment_id=a.id LEFT JOIN remote.row_origins o ON o.table_name='attachments' AND o.physical_row_id=a.id JOIN remote.row_proofs p ON p.id=o.proof_id OR o.proof_id IS NULL AND p.workspace_id IN ({marks}) AND p.row_kind='attachments' AND p.source_row_id=a.id AND p.author_user_id=? WHERE a.path IS NOT NULL AND p.workspace_id IN ({marks}) AND NOT EXISTS (SELECT 1 FROM remote.row_proofs c WHERE c.workspace_id=p.workspace_id AND c.row_kind=p.row_kind AND c.source_row_id=p.source_row_id AND c.author_user_id=p.author_user_id AND c.previous_revision=p.revision)",(*scopes,cfg["user"],*scopes)).fetchall(); rows+=db.execute(f"SELECT concat(?,'/',json_extract_string(c.body,'$.data.body_hash')),json_extract_string(c.body,'$.data.body_hash'),CAST(json_extract_string(c.body,'$.data.size') AS UINTEGER),p.workspace_id,p.authorization_workspace_id,p.authorization_epoch,TRUE FROM remote.row_conflicts c JOIN remote.row_proofs p ON p.id=c.proof_id WHERE p.workspace_id IN ({marks}) AND p.row_kind='attachments' AND p.state='active'",(str(Path(db_path).parent/"attachments"),*scopes)).fetchall() if retained else []; db.close(); out=[]
     for path,body_hash,size,origin,authorization,authorized_epoch,imported in rows:
-        if not imported and body_hash not in allowed: continue
+        if not retained and (imported or body_hash not in allowed) or not imported and body_hash not in allowed: continue
         epoch=authorized_epoch if authorization==workspace else (origin_epochs or {})[origin]
-        if epoch not in keys or fingerprint(keys[epoch],body_hash) in known: continue
+        if epoch not in keys: continue
         path=Path(path)
         if path.is_symlink() or not path.is_file() or path.stat().st_size!=size or size>32*1024**2 or file_hash(path)!=body_hash: raise ValueError("retained attachment body is inconsistent")
         out.append(seal_blob(path.read_bytes(),workspace,epoch,keys[epoch],cfg["device"]["id"]))
     return out
-def apply_row_replica(db_path,body,workspace,controls,recover=None,local_user=None,db=None):
-    row,proof=body["row"],body["proof"]; allowed={workspace,*[c["workspace"] for c in controls]}; candidates=[{k:r[k] for k in ("user","root_public","device","certificate")} for c in controls if proof["workspace"] in allowed and c["workspace"]==proof["authorization_workspace"] and c["epoch"]==proof["authorization_epoch"] and proof["author_device_id"] in c["devices"] for r in [c["devices"][proof["author_device_id"]]]]; signer_=candidates[0] if candidates and all(c==candidates[0] for c in candidates) else (_ for _ in ()).throw(ValueError("row proof authorization unavailable")); verify_row_proof(proof,row,signer_["certificate"],signer_["root_public"]); own=db is None
-    if own: db=open_db(db_path); init_schema(db); db.execute("BEGIN")
-    try:
-        scope=(proof["workspace"],proof["row_kind"],proof["row_id"],proof["author_user_id"]); old=db.execute("SELECT 1 FROM remote.row_proofs WHERE revision=? AND workspace_id=? AND row_kind=? AND source_row_id=? AND author_user_id=?",(proof["revision"],*scope)).fetchone(); heads={r[0] for r in db.execute("SELECT DISTINCT p.revision FROM remote.row_proofs p WHERE p.workspace_id=? AND p.row_kind=? AND p.source_row_id=? AND p.author_user_id=? AND NOT EXISTS (SELECT 1 FROM remote.row_proofs c WHERE c.workspace_id=p.workspace_id AND c.row_kind=p.row_kind AND c.source_row_id=p.source_row_id AND c.author_user_id=p.author_user_id AND c.previous_revision=p.revision)",scope).fetchall()}; stale=db.execute("SELECT 1 FROM remote.row_proofs WHERE previous_revision=? AND workspace_id=? AND row_kind=? AND source_row_id=? AND author_user_id=?",(proof["revision"],*scope)).fetchone(); project_workspace_controls(db,controls); pid=project_row_proof(db,proof,signer_["root_public"],signer_["certificate"])
-        if old or stale: own and db.execute("COMMIT"); return False
-        if heads and (proof["previous_revision"] not in heads or len(heads)>1): db.execute("INSERT OR REPLACE INTO remote.row_conflicts VALUES (?,?)",(pid,json.dumps(row,sort_keys=True,separators=(",",":")))); own and db.execute("COMMIT"); return False
-        owned=proof["author_user_id"]==local_user
-        if not (owned and recover=="adopt"): project_logical_row(db,row,proof,pid,owned and recover=="native")
-        own and db.execute("COMMIT"); return True
-    except BaseException: own and db.execute("ROLLBACK"); raise
-    finally: own and db.close()
-def apply_row_replicas(db_path,bodies,workspace,controls,recover=None,local_user=None):
+def verified_replica(body,workspace,controls):
+    row,proof=body["row"],body["proof"]; allowed={workspace,*[c["workspace"] for c in controls]}; candidates=[{k:r[k] for k in ("user","root_public","device","certificate")} for c in controls if proof["workspace"] in allowed and c["workspace"]==proof["authorization_workspace"] and c["epoch"]==proof["authorization_epoch"] and proof["author_device_id"] in c["devices"] for r in [c["devices"][proof["author_device_id"]]]]; signer_=candidates[0] if candidates and all(c==candidates[0] for c in candidates) else (_ for _ in ()).throw(ValueError("row proof authorization unavailable")); verify_row_proof(proof,row,signer_["certificate"],signer_["root_public"]); return row,proof,signer_
+def temp_rows(db,name,columns,rows): db.execute(f"CREATE OR REPLACE TEMP TABLE {name} AS SELECT x.* FROM UNNEST(from_json(?,?)) t(x)",(json.dumps([dict(zip(columns,row)) for row in rows]),json.dumps([{c:"VARCHAR" for c in columns}])))
+def apply_row_replicas(db_path,bodies,workspace,controls,recover=None,local_user=None,db=None):
     if not bodies: return []
-    order=("conversations","repository.observed","messages","file.observed","tool_calls","attachments","artifacts","file_edits","file.version","edit.observed","git.checkpoint","checkpoint.link"); db=open_db(db_path); init_schema(db); db.execute("BEGIN")
-    try: result=[apply_row_replica(db_path,body,workspace,controls,recover,local_user,db) for body in sorted(bodies,key=lambda b:order.index(b["row"]["kind"]))]; db.execute("COMMIT"); return result
+    names=("workspace","authorization_workspace","row_kind","row_id","encoding_v","content_hash","revision","previous_revision","state","author_user_id","author_device_id","authorization_epoch","signature"); proof=lambda values:{"v":1,"kind":"row.proof",**dict(zip(names,values))}; own=db is None; db=db or open_db(db_path); own and init_schema(db); db.execute("BEGIN")
+    try:
+        items=[verified_replica(body,workspace,controls) for body in bodies]; columns=("workspace","kind","row_id","author","revision"); temp_rows(db,"incoming",columns,[tuple(p[k] for k in ("workspace","row_kind","row_id","author_user_id","revision")) for row,p,signer_ in items]); old={tuple(r) for r in db.execute("SELECT p.workspace_id,p.row_kind,p.source_row_id,p.author_user_id,p.revision FROM remote.row_proofs p JOIN incoming i ON (p.workspace_id,p.row_kind,p.source_row_id,p.author_user_id,p.revision)=(i.workspace,i.kind,i.row_id,i.author,i.revision)").fetchall()}; project_workspace_controls(db,controls); groups={}
+        [groups.setdefault((p["author_user_id"],p["author_device_id"]),(signer_,[]))[1].append(p) for row,p,signer_ in items]; [project_row_proofs(db,proofs,signer_["root_public"],signer_["certificate"]) for signer_,proofs in groups.values()]; fresh=[(digest(p),json.dumps(row,sort_keys=True,separators=(",",":"))) for row,p,signer_ in items if (*((p[k] for k in ("workspace","row_kind","row_id","author_user_id"))),p["revision"]) not in old]; fresh and _insert_pages(db,"remote.row_conflicts",fresh,("proof_id","body"),mode=" OR IGNORE"); projected=[]; chosen={}; resolved=[]
+        fields="p.workspace_id,p.authorization_workspace_id,p.row_kind,p.source_row_id,p.encoding_v,p.content_hash,p.revision,p.previous_revision,p.state,p.author_user_id,p.author_device_id,p.authorization_epoch,p.signature"; chains={}
+        for r in db.execute(f"SELECT p.id,CAST(c.body AS VARCHAR),{fields} FROM remote.row_proofs p JOIN (SELECT DISTINCT workspace,kind,row_id,author FROM incoming) i ON (p.workspace_id,p.row_kind,p.source_row_id,p.author_user_id)=(i.workspace,i.kind,i.row_id,i.author) LEFT JOIN remote.row_conflicts c ON c.proof_id=p.id").fetchall(): chains.setdefault((r[2],r[4],r[5],r[11]),{})[r[8]]=(r[0],json.loads(r[1]) if r[1] else None,proof(r[2:]))
+        for scope,nodes in chains.items():
+            leaves=set(nodes)-{v[2]["previous_revision"] for v in nodes.values() if v[2]["previous_revision"]}
+            if len(leaves)==1:
+                revision=leaves.pop(); pid,row,p=nodes[revision]; chosen[scope]=revision; resolved.append(scope)
+                if row is not None and not (p["author_user_id"]==local_user and recover=="adopt"): projected.append((row,p,pid,p["author_user_id"]==local_user and recover=="native"))
+        if resolved: temp_rows(db,"resolved_scopes",columns[:4],resolved); db.execute("DELETE FROM remote.row_conflicts c USING remote.row_proofs p,resolved_scopes r WHERE c.proof_id=p.id AND (p.workspace_id,p.row_kind,p.source_row_id,p.author_user_id)=(r.workspace,r.kind,r.row_id,r.author)")
+        project_logical_rows(db,projected)
+        db.execute("COMMIT"); return [(*((p[k] for k in ("workspace","row_kind","row_id","author_user_id"))),p["revision"]) not in old and chosen.get(tuple(p[k] for k in ("workspace","row_kind","row_id","author_user_id")))==p["revision"] for row,p,signer_ in items]
     except BaseException: db.execute("ROLLBACK"); raise
-    finally: db.close()
+    finally: own and db.close()
 def author_user(value,authors): return (authors or {}).get(value["author"]) or (_ for _ in ()).throw(ValueError("verified author user required"))
 def foreign_id(workspace,author_user,table,old): return digest(f"{workspace}:{author_user}:{table}:{old}")[:16] if old else old
 def sequence(state,workspace,value):
@@ -256,7 +275,7 @@ def sequence(state,workspace,value):
     if after: state.execute("DELETE FROM sequence_gaps WHERE workspace=? AND author=? AND seq=?",(workspace,value["author"],value["seq"]+1))
     return True
 def reset_history(state,workspace,boundary):
-    [state.execute(f"DELETE FROM {table} WHERE workspace=?",(workspace,)) for table in ("receipts","cursors","heads","lazy_events","deferred_events","event_sequences","sequence_gaps")]; [state.execute("INSERT INTO event_sequences VALUES (?,?,?,?)",(workspace,author,head["seq"],head["event"])) for author,head in boundary["heads"].items()]
+    [state.execute(f"DELETE FROM {table} WHERE workspace=?",(workspace,)) for table in ("receipts","cursors","lazy_events","deferred_events","event_sequences","sequence_gaps")]; [state.execute("INSERT INTO event_sequences VALUES (?,?,?,?)",(workspace,author,head["seq"],head["event"])) for author,head in boundary["heads"].items()]
 def verify_history(state,workspace,controls,start):
     gaps=state.execute("SELECT author,seq FROM sequence_gaps WHERE workspace=? ORDER BY author,seq LIMIT 1",(workspace,)).fetchone()
     if gaps: raise ValueError(f"required event sequence is incomplete at {gaps[0]}:{gaps[1]}")
@@ -265,33 +284,8 @@ def verify_history(state,workspace,controls,start):
         if control["boundary"]["epoch"]>=start:
             for author,head in control["boundary"]["heads"].items():
                 if (state.execute("SELECT event FROM event_sequences WHERE workspace=? AND author=? AND seq=?",(workspace,author,head["seq"])).fetchone() or [None])[0]!=head["event"]: raise ValueError("signed history checkpoint is incomplete")
-def apply_record(db_path,state,value,workspace,local_device=None,db=None,authors=None,recover=None,local_user=None):
-    table=TABLES[value["kind"]]; p=value["payload"]; columns=COLUMNS[table]+(["body_hash"] if table=="attachments" else [])
-    if value["entity"] != f"{table}:{p['row'][0]}" or p["table"] != table or p["columns"]!=columns or len(p["row"])!=len(p["columns"]): raise ValueError("record schema/entity mismatch")
-    user=author_user(value,authors); sort=f"{value['observed_at']}:{value['id']}"; old=state.execute("SELECT sort_key FROM heads WHERE workspace=? AND author_user=? AND entity=?",(workspace,user,value["entity"])).fetchone()
-    if old and old[0]>=sort: return False
-    owned=bool(recover and user==local_user); native=owned and recover=="native"
-    if owned and recover=="adopt": return False
-    if value["author"]==local_device and not owned: return False
-    mapped=lambda table,old:old if native else foreign_id(workspace,user,table,old); values=list(p["row"]); body_hash=values.pop() if table=="attachments" else None; values[0]=mapped(table,values[0])
-    for column,parent in FKS.get(table,()): idx=p["columns"].index(column); values[idx]=mapped(parent,values[idx])
-    own=db is None
-    if own: Path(db_path).parent.mkdir(parents=True,exist_ok=True); db=open_db(db_path); init_schema(db); db.execute("BEGIN")
-    try:
-        project_archive_row(db,table,COLUMNS[table],values,None if native else {"workspace_id":workspace,"author_user_id":user,"author_device_id":value["author"],"source_row_id":p["row"][0],"source_event_id":value["id"],"content_key":value["entity"],"observed_at":value["observed_at"]})
-        if body_hash: db.execute("INSERT OR REPLACE INTO attachment_bodies VALUES (?,?,?)",(values[0],body_hash,values[COLUMNS[table].index("size")]))
-        if own: db.execute("COMMIT")
-    except BaseException:
-        if own: db.execute("ROLLBACK")
-        raise
-    finally:
-        if own: db.close()
-    state.execute("INSERT OR REPLACE INTO heads VALUES (?,?,?,?,?)",(workspace,user,value["entity"],sort,value["id"]));
-    if own: state.commit()
-    return True
 def project(db_path,state,value,workspace,local_device=None,db=None,root=None,batch=False,authors=None,recover=None,local_user=None):
     if event_support(value)!="supported": return False
-    if value["kind"] in TABLES: return apply_record(db_path,state,value,workspace,local_device,db,authors,recover,local_user)
     if value["kind"]=="workspace.policy":
         p=value["payload"]; state.execute("INSERT OR REPLACE INTO policies VALUES (?,?,?)",(workspace,p["kind"],p["value"])); batch or state.commit(); return True
     if root is not None:
@@ -310,7 +304,7 @@ def project(db_path,state,value,workspace,local_device=None,db=None,root=None,ba
     finally:
         if own: db.close()
 def project_many(db_path,state,items,local_device=None,root=None,commit=True,authors=None,recover=None,local_user=None):
-    records=any(v["kind"] in set(TABLES)|PROVENANCE and (v["author"]!=local_device or recover and author_user(v,authors)==local_user) for _,v in items); db=None
+    records=any(v["kind"] in PROVENANCE and (v["author"]!=local_device or recover and author_user(v,authors)==local_user) for _,v in items); db=None
     if records: Path(db_path).parent.mkdir(parents=True,exist_ok=True); db=open_db(db_path); init_schema(db)
     committed=False
     try:

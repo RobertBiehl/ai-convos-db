@@ -3,11 +3,11 @@ from pathlib import Path
 
 import duckdb
 import pytest
-from ai_convos.cli import capture_provenance, init_schema, project_row_proof
+from ai_convos.cli import capture_provenance, init_schema, project_attachment_body, project_row_proof
 import ai_convos_remote.projection as projection_module
 from ai_convos_remote import publish
-from ai_convos_remote.projection import apply_row_replica, apply_row_replicas, attest_rows, blob_replicas, bridges, connect, cutover_state, event_support, foreign_id, inspect_state, project, project_many, relocate_attachments, row_replicas, scan, sequence
-from ai_convos_remote.protocol import b64, certificate, digest, event, identity, logical_row, open_replica, public, public_id, row_proof
+from ai_convos_remote.projection import apply_row_replicas, attest_rows, blob_replicas, bridges, connect, cutover_state, event_support, foreign_id, inspect_state, project, project_many, relocate_attachments, row_replicas, scan, sequence
+from ai_convos_remote.protocol import b64, certificate, digest, event, identity, logical_row, open_blob, open_replica, public, public_id, row_proof
 
 
 def git(path,*args): return subprocess.run(("git","-C",str(path),*args),check=True,capture_output=True).stdout.decode().strip()
@@ -75,15 +75,38 @@ def test_row_attestation_refuses_to_guess_between_concurrent_heads(tmp_path):
     with pytest.raises(ValueError,match="row revision conflict"): attest_rows(tmp_path/"source.db",cfg,"w",current)
 
 
-def test_incoming_concurrent_row_is_retained_without_overwrite(tmp_path):
-    root,device=identity("root"),identity("device"); user=public_id(root["sign_public"]); cert=certificate(root,user,device); entry={"user":user,"root_public":root["sign_public"],"device":public(device),"certificate":cert,"history":True}; control={"workspace":"w","revision":1,"epoch":1,"devices":{device["id"]:entry}}; fields=["id","source","title","created_at","updated_at","model","cwd","git_branch","project_id","metadata"]; row=lambda title:logical_row("conversations",fields,["c","codex",title,"2026-01-01","2026-01-01",None,None,None,None,"{}"]); first=row_proof(device,user,"w",1,row("base")); a=row_proof(device,user,"w",1,row("branch-a"),first["revision"]); b=row_proof(device,user,"w",1,row("branch-b"),first["revision"])
-    assert apply_row_replica(tmp_path/"db",{"row":row("base"),"proof":first},"w",[control]) and apply_row_replica(tmp_path/"db",{"row":row("branch-a"),"proof":a},"w",[control]) and not apply_row_replica(tmp_path/"db",{"row":row("branch-b"),"proof":b},"w",[control]); db=duckdb.connect(str(tmp_path/"db"),read_only=True); assert db.execute("SELECT title FROM conversations").fetchone()[0]=="branch-a" and json.loads(db.execute("SELECT CAST(body AS VARCHAR) FROM remote.row_conflicts").fetchone()[0])["data"]["title"]=="branch-b" and db.execute("SELECT COUNT(DISTINCT revision) FROM remote.row_proofs").fetchone()[0]==3 and db.execute("SELECT proof_id IS NOT NULL FROM remote.row_origins").fetchone()[0]; db.close()
+def test_row_dag_converges_across_arrival_order_and_preserves_true_fork(tmp_path):
+    root,device=identity("root"),identity("device"); user=public_id(root["sign_public"]); entry={"user":user,"root_public":root["sign_public"],"device":public(device),"certificate":certificate(root,user,device),"history":True}; control={"workspace":"w","revision":1,"epoch":1,"devices":{device["id"]:entry}}; fields=["id","source","title","created_at","updated_at","model","cwd","git_branch","project_id","metadata"]; row=lambda title:logical_row("conversations",fields,["c","codex",title,"2026-01-01","2026-01-01",None,None,None,None,"{}"]); parent=row_proof(device,user,"w",1,row("parent")); child=row_proof(device,user,"w",1,row("child"),parent["revision"]); body=lambda value,proof:{"row":value,"proof":proof}
+    assert apply_row_replicas(tmp_path/"late",[body(row("child"),child)],"w",[control])==[True] and apply_row_replicas(tmp_path/"late",[body(row("parent"),parent)],"w",[control])==[False]; assert duckdb.connect(str(tmp_path/"late"),read_only=True).execute("SELECT title FROM conversations").fetchone()[0]=="child"
+    assert apply_row_replicas(tmp_path/"batch",[body(row("child"),child),body(row("parent"),parent)],"w",[control])==[True,False] and duckdb.connect(str(tmp_path/"batch"),read_only=True).execute("SELECT title FROM conversations").fetchone()[0]=="child"
+    shared=duckdb.connect(str(tmp_path/"shared")); init_schema(shared); assert apply_row_replicas(tmp_path/"shared",[body(row("parent"),parent)],"w",[control],db=shared)==[True] and apply_row_replicas(tmp_path/"shared",[body(row("child"),child)],"w",[control],db=shared)==[True]; shared.close()
+    fork=row_proof(device,user,"w",1,row("fork"),parent["revision"]); apply_row_replicas(tmp_path/"fork",[body(row("parent"),parent)],"w",[control]); assert apply_row_replicas(tmp_path/"fork",[body(row("child"),child),body(row("fork"),fork)],"w",[control])==[False,False]; db=duckdb.connect(str(tmp_path/"fork"),read_only=True); assert db.execute("SELECT title FROM conversations").fetchone()[0]=="parent" and db.execute("SELECT COUNT(*) FROM remote.row_conflicts").fetchone()[0]==2; db.close()
+
+
+def test_native_tombstone_and_author_heads_are_repairable_from_duckdb(tmp_path):
+    roots,devices=[identity("root-a"),identity("root-b")],[identity("device-a"),identity("device-b")]; users=[public_id(r["sign_public"]) for r in roots]; entries=[{"user":u,"root_public":r["sign_public"],"device":public(d),"certificate":certificate(r,u,d),"history":True} for r,d,u in zip(roots,devices,users)]; control={"workspace":"w","revision":1,"epoch":1,"devices":{d["id"]:e for d,e in zip(devices,entries)}}; fields=["id","source","title","created_at","updated_at","model","cwd","git_branch","project_id","metadata"]; values=["c","codex","kept","2026-01-01T00:00:00","2026-01-01T00:00:00",None,None,None,None,"{}"]; active=logical_row("conversations",fields,values); deleted=logical_row("conversations",identity="c",state="deleted"); pa=row_proof(devices[0],users[0],"w",1,active); tomb=row_proof(devices[0],users[0],"w",1,deleted,pa["revision"]); pb=row_proof(devices[1],users[1],"w",1,active); path=tmp_path/"db"; apply_row_replicas(path,[{"row":active,"proof":pa},{"row":deleted,"proof":tomb},{"row":active,"proof":pb}],"w",[control]); cfg={"user":users[0],"device":devices[0],"workspaces":{"w":{"kind":"personal"}}}; envs=row_replicas(path,cfg,"w",[],{1:bytes(32)}); bodies=[open_replica(e,bytes(32)) for e in envs]
+    assert any(b["row"]["state"]=="deleted" and b["proof"]["author_user_id"]==users[0] for b in bodies); cfg["user"],cfg["device"]=users[1],devices[1]; bodies=[open_replica(e,bytes(32)) for e in row_replicas(path,cfg,"w",[dict(kind="conversation.record",entity="conversations:c",payload=dict(table="conversations",columns=fields,row=values))],{1:bytes(32)})]; assert sum(b["row"]["state"]=="active" and b["proof"]["author_user_id"]==users[1] for b in bodies)==1
+
+
+def test_conflicting_attachment_bodies_remain_repairable(tmp_path):
+    root,device=identity("root"),identity("device"); user=public_id(root["sign_public"]); entry={"user":user,"root_public":root["sign_public"],"device":public(device),"certificate":certificate(root,user,device),"history":True}; control={"workspace":"w","revision":1,"epoch":1,"devices":{device["id"]:entry}}; fields=["id","message_id","filename","mime_type","size","path","url","created_at","body_hash"]; data=[b"one",b"two"]; hash_=lambda value:__import__("hashlib").sha256(value).hexdigest(); hashes=[hash_(value) for value in data]; row=lambda name,body:logical_row("attachments",fields,["a","m",name,None,len(body),None,None,"2026-01-01T00:00:00",hash_(body)]); base=row("base",b"old"); parent=row_proof(device,user,"w",1,base); children=[row_proof(device,user,"w",1,row(str(i),body),parent["revision"]) for i,body in enumerate(data)]; path=tmp_path/"data/convos.db"; apply_row_replicas(path,[{"row":base,"proof":parent}],"w",[control]); apply_row_replicas(path,[{"row":row(str(i),body),"proof":proof} for i,(body,proof) in enumerate(zip(data,children))],"w",[control]); [project_attachment_body(path,body,body_hash) for body,body_hash in zip(data,hashes)]; cfg={"user":user,"device":device,"workspaces":{"w":{"kind":"personal"}}}; blobs=blob_replicas(path,cfg,"w",[],{1:bytes(32)}); recovered={open_blob(env,bytes(32))[0] for env in blobs}
+    assert recovered==set(data) and duckdb.connect(str(path),read_only=True).execute("SELECT COUNT(*) FROM remote.row_conflicts").fetchone()[0]==2
 
 
 def test_row_replica_page_is_atomic(tmp_path):
     root,device=identity("root"),identity("device"); user=public_id(root["sign_public"]); cert=certificate(root,user,device); entry={"user":user,"root_public":root["sign_public"],"device":public(device),"certificate":cert,"history":True}; control={"workspace":"w","revision":1,"epoch":1,"devices":{device["id"]:entry}}; fields=["id","source","title","created_at","updated_at","model","cwd","git_branch","project_id","metadata"]; row=logical_row("conversations",fields,["c","codex","valid","2026-01-01","2026-01-01",None,None,None,None,"{}"]); proof=row_proof(device,user,"w",1,row); bad={**row,"data":{**row["data"],"title":"tampered"}}
     with pytest.raises(ValueError,match="invalid row proof"): apply_row_replicas(tmp_path/"db",[{"row":row,"proof":proof},{"row":bad,"proof":proof}],"w",[control])
     db=duckdb.connect(str(tmp_path/"db"),read_only=True); assert db.execute("SELECT COUNT(*) FROM conversations").fetchone()[0]==db.execute("SELECT COUNT(*) FROM remote.row_proofs").fetchone()[0]==db.execute("SELECT COUNT(*) FROM remote.workspace_controls").fetchone()[0]==0; db.close()
+
+
+def test_row_projection_preserves_heterogeneous_json_shapes(tmp_path):
+    root,device=identity("root"),identity("device"); user=public_id(root["sign_public"]); entry={"user":user,"root_public":root["sign_public"],"device":public(device),"certificate":certificate(root,user,device),"history":True}; control={"workspace":"w","revision":1,"epoch":1,"devices":{device["id"]:entry}}; fields=["id","conversation_id","role","content","thinking","created_at","model","metadata","parent_id"]; rows=[logical_row("messages",fields,[str(i),"c","user","x",None,"2026-01-01",None,json.dumps(value),None]) for i,value in enumerate(({"ref_index":1,"ref_type":"x","turn_index":2},"hidden"))]; bodies=[{"row":row,"proof":row_proof(device,user,"w",1,row)} for row in rows]; assert apply_row_replicas(tmp_path/"db",bodies,"w",[control])==[True,True]
+    db=duckdb.connect(str(tmp_path/"db"),read_only=True); physical={r[0] for r in db.execute("SELECT id FROM messages").fetchall()}; assert {json.dumps(json.loads(r[0]),sort_keys=True) for r in db.execute("SELECT CAST(metadata AS VARCHAR) FROM messages").fetchall()}=={json.dumps({"ref_index":1,"ref_type":"x","turn_index":2},sort_keys=True),json.dumps("hidden")} and {r[0] for r in db.execute("SELECT entity FROM archive_changes WHERE kind='messages'").fetchall()}==physical and not physical&{"0","1"}; db.close()
+
+
+def test_equal_revisions_from_different_authors_project_independently(tmp_path):
+    roots,devices=[identity("root-a"),identity("root-b")],[identity("device-a"),identity("device-b")]; users=[public_id(r["sign_public"]) for r in roots]; entries=[{"user":u,"root_public":r["sign_public"],"device":public(d),"certificate":certificate(r,u,d),"history":True} for r,d,u in zip(roots,devices,users)]; control={"workspace":"w","revision":1,"epoch":1,"devices":{d["id"]:e for d,e in zip(devices,entries)}}; fields=["id","source","title","created_at","updated_at","model","cwd","git_branch","project_id","metadata"]; row=logical_row("conversations",fields,["c","codex","same","2026-01-01","2026-01-01",None,None,None,None,"{}"]) ; bodies=[{"row":row,"proof":row_proof(d,u,"w",1,row)} for d,u in zip(devices,users)]
+    assert bodies[0]["proof"]["revision"]==bodies[1]["proof"]["revision"] and apply_row_replicas(tmp_path/"db",bodies,"w",[control])==[True,True]; db=duckdb.connect(str(tmp_path/"db"),read_only=True); assert db.execute("SELECT COUNT(*) FROM conversations").fetchone()[0]==db.execute("SELECT COUNT(*) FROM remote.row_origins").fetchone()[0]==db.execute("SELECT COUNT(*) FROM remote.row_proofs").fetchone()[0]==2; db.close()
 
 
 def test_optional_projection_bridge_contract_fails_closed(monkeypatch):
@@ -95,43 +118,7 @@ def test_optional_projection_bridge_contract_fails_closed(monkeypatch):
 
 
 def test_event_support_is_exact_and_unknowns_fail_closed(monkeypatch):
-    monkeypatch.setattr(projection_module,"bridges",lambda:[]); classify=lambda kind,version:event_support({"kind":kind,"payload_v":version}); assert classify("conversation.record",1)=="supported" and classify("conversation.record",2)==classify("future.opaque",1)=="required" and classify("memory.canonical",2)=="optional"; monkeypatch.setattr(projection_module,"bridges",lambda:[{"events":{("memory.canonical",1)}}]); assert classify("memory.canonical",2)=="required"
-
-
-def test_out_of_order_revisions_converge_and_replay_deduplicates(tmp_path):
-    state=connect(tmp_path/"state.db"); device=identity(); cols=["id","source","title","created_at","updated_at","model","cwd","git_branch","project_id","metadata"]
-    old=event(device,1,"conversation.record","conversations:c",{"table":"conversations","columns":cols,"row":["c","codex","old","2026-01-01","2026-01-01",None,None,None,None,"{}"]},[],"2026-01-01T00:00:00Z")
-    new=event(device,2,"conversation.record","conversations:c",{"table":"conversations","columns":cols,"row":["c","codex","new","2026-01-01","2026-01-02",None,None,None,None,"{}"]},[old["id"]],"2026-01-02T00:00:00Z")
-    authors={device["id"]:"user"}; assert project(tmp_path/"db",state,new,"w","different",authors=authors) and not project(tmp_path/"db",state,old,"w","different",authors=authors) and not project(tmp_path/"db",state,new,"w","different",authors=authors)
-    assert duckdb.connect(str(tmp_path/"db"),read_only=True).execute("SELECT title FROM conversations").fetchone()[0]=="new"
-
-
-def test_projection_batch_rolls_back_duckdb_and_state_together(tmp_path):
-    state=connect(tmp_path/"state.db"); device=identity(); cols=["id","source","title","created_at","updated_at","model","cwd","git_branch","project_id","metadata"]; payload={"table":"conversations","columns":cols,"row":["c","codex","valid","2026-01-01","2026-01-01",None,None,None,None,"{}"]}
-    good=event(device,1,"conversation.record","conversations:c",payload,[],"2026-01-01T00:00:00Z"); bad=event(device,2,"conversation.record","conversations:wrong",{**payload,"row":["bad",*payload["row"][1:]]},[good["id"]],"2026-01-01T00:00:01Z")
-    with pytest.raises(ValueError,match="schema"): project_many(tmp_path/"db",state,[("w",good),("w",bad)],"other",authors={device["id"]:"user"})
-    db=duckdb.connect(str(tmp_path/"db"),read_only=True); assert db.execute("SELECT COUNT(*) FROM conversations").fetchone()[0]==0 and db.execute("SELECT COUNT(*) FROM remote.row_origins").fetchone()[0]==0; db.close(); assert not state.execute("SELECT * FROM heads").fetchall()
-
-
-def test_record_schema_is_fixed_and_same_origin_ids_from_authors_do_not_collide(tmp_path):
-    state=connect(tmp_path/"state.db"); a,b=identity("a"),identity("b"); cols=["id","source","title","created_at","updated_at","model","cwd","git_branch","project_id","metadata"]
-    for i,device in enumerate((a,b)): value=event(device,1,"conversation.record","conversations:c",{"table":"conversations","columns":cols,"row":["c","codex",device["name"],"2026-01-01","2026-01-01",None,None,None,None,"{}"]},[],f"2026-01-0{i+1}T00:00:00Z"); assert project(tmp_path/"db",state,value,"w","other",authors={device["id"]:f"user-{i}"})
-    db=duckdb.connect(str(tmp_path/"db"),read_only=True); assert {r[0] for r in db.execute("SELECT title FROM conversations").fetchall()}=={"a","b"} and {r[0] for r in db.execute("SELECT author_user_id FROM remote.row_origins").fetchall()}=={"user-0","user-1"}; db.close()
-    bad=event(a,2,"conversation.record","conversations:x",{"table":"conversations","columns":["id); DROP TABLE conversations; --"],"row":["x"]},[],"2026-01-03T00:00:00Z")
-    import pytest
-    with pytest.raises(ValueError,match="schema"): project(tmp_path/"db",state,bad,"w","other")
-
-
-def test_same_user_source_identity_converges_across_devices_and_requires_verified_owner(tmp_path):
-    state=connect(tmp_path/"state.db"); a,b=identity("a"),identity("b"); cols=["id","source","title","created_at","updated_at","model","cwd","git_branch","project_id","metadata"]; authors={a["id"]:"user",b["id"]:"user"}
-    values=[event(device,1,"conversation.record","conversations:c",{"table":"conversations","columns":cols,"row":["c","codex",device["name"],"2026-01-01","2026-01-01",None,None,None,None,"{}"]},[],f"2026-01-0{i+1}T00:00:00Z") for i,device in enumerate((a,b))]
-    with pytest.raises(ValueError,match="verified author user"): project(tmp_path/"db",state,values[0],"w","other")
-    assert all(project(tmp_path/"db",state,value,"w","other",authors=authors) for value in values); db=duckdb.connect(str(tmp_path/"db"),read_only=True); origin=db.execute("SELECT physical_row_id,author_user_id,author_device_id FROM remote.row_origins").fetchone(); assert db.execute("SELECT COUNT(*),MAX(title) FROM conversations").fetchone()==(1,"b") and origin==(foreign_id("w","user","conversations","c"),"user",b["id"]); db.close(); assert tuple(state.execute("SELECT author_user,entity,event FROM heads").fetchone())==("user","conversations:c",values[1]["id"])
-
-
-def test_publication_head_allows_exact_reversion(tmp_path):
-    state=connect(tmp_path/"state.db"); device=identity(); ws="personal"; cfg={"user":"user","device":device,"workspaces":{ws:{"kind":"personal","epoch":1}},"keys":{f"{ws}:1":b64(bytes(range(32)))}}; record=lambda title:{"kind":"conversation.record","entity":"conversations:c","payload":{"table":"conversations","columns":["id","source","title","created_at","updated_at","model","cwd","git_branch","project_id","metadata"],"row":["c","codex",title,"2026-01-01","2026-01-01",None,None,None,None,"{}"]}}
-    first=publish(cfg,state,ws,record("a"),tmp_path,True); assert publish(cfg,state,ws,record("a"),tmp_path,True)==first; second=publish(cfg,state,ws,record("b"),tmp_path,True); reverted=publish(cfg,state,ws,record("a"),tmp_path,True); head=state.execute("SELECT owner,revision,event FROM publication_heads").fetchone(); assert len({first,second,reverted})==3 and state.execute("SELECT COUNT(*) FROM outbox").fetchone()[0]==3 and tuple(head)==("user",digest(record("a")["payload"]),reverted)
+    monkeypatch.setattr(projection_module,"bridges",lambda:[]); classify=lambda kind,version:event_support({"kind":kind,"payload_v":version}); assert classify("conversation.record",1)==classify("conversation.record",2)==classify("future.opaque",1)=="required" and classify("memory.canonical",2)=="optional"; monkeypatch.setattr(projection_module,"bridges",lambda:[{"events":{("memory.canonical",1)}}]); assert classify("memory.canonical",2)=="required"
 
 
 def test_team_scope_includes_prompt_turn_and_linked_repo_only(tmp_path):
@@ -139,9 +126,14 @@ def test_team_scope_includes_prompt_turn_and_linked_repo_only(tmp_path):
     kinds=[r["kind"] for r in team]; assert kinds.count("conversation.record")==1 and kinds.count("message.record")==2 and "file_edit.record" in kinds and "edit.observed" in kinds and "changeset.observed" not in kinds
 
 
-def test_repository_policy_resolves_unobserved_worktree_conversation(tmp_path):
+def test_team_incremental_uses_changed_rows_after_scope_seed(tmp_path):
+    repo,core=source(tmp_path); state=connect(tmp_path/"state.db"); rid=next(r["payload"]["id"] for r in scan(core,state) if r["kind"]=="repository.observed"); seeded=set(); first=scan(core,state,"team",[rid],[],None,"w",seeded); state.executemany("INSERT INTO team_scopes VALUES (?,?)",[("w",c) for c in seeded]); changed=scan(core,state,"team",[rid],[],{("messages","u")},"w",set()); state.execute("DELETE FROM team_scopes"); reentered=scan(core,state,"team",[rid],[],{("conversations","c")},"w",set())
+    assert seeded=={"c"} and len(first)>len(changed)==1 and changed[0]["kind"]=="message.record" and changed[0]["payload"]["row"][0]=="u" and len(reentered)==len(first)
+
+
+def test_repository_policy_does_not_reclassify_uncaptured_live_worktree(tmp_path):
     repo,core=source(tmp_path); worktree=tmp_path/"worktree"; git(repo,"worktree","add","-qb","worktree-test",str(worktree)); core.execute("INSERT INTO conversations VALUES ('w','codex','worktree','2026-01-02','2026-01-02','m',?,NULL,NULL,'{}')",[str(worktree)]); core.execute("INSERT INTO messages VALUES ('wm','w','user','inspect',NULL,'2026-01-02','m','{}',NULL,NULL)"); state=connect(tmp_path/"state.db"); rid=next(r["payload"]["id"] for r in scan(core,state) if r["kind"]=="repository.observed"); team=scan(core,state,"team",[rid],[])
-    assert {r["payload"]["row"][0] for r in team if r["kind"]=="conversation.record"}=={"c","w"}
+    assert {r["payload"]["row"][0] for r in team if r["kind"]=="conversation.record"}=={"c"}
 
 
 def test_team_projection_never_reads_attachment_bodies(tmp_path,monkeypatch):

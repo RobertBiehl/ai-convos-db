@@ -3,6 +3,7 @@ from pathlib import Path
 import duckdb, pytest
 from typer.testing import CliRunner
 from ai_convos import cli
+POPEN=subprocess.Popen
 
 @pytest.fixture
 def hooks(tmp_path, monkeypatch):
@@ -74,6 +75,13 @@ def test_hook_defers_fts_until_fresh_search(hooks):
     hits = json.loads(CliRunner().invoke(cli.app, ["search", "remember alpha", "-f", "json"]).output)
     assert hits[0]["content"] == "remember alpha" and not (data/"hook_fts_dirty").exists()
 
+def test_search_uses_last_fts_snapshot_when_refresh_is_locked(hooks):
+    sessions, data = hooks; path = sessions/"s.jsonl"; transcript(path); enqueue(path); runner = CliRunner(); assert json.loads(runner.invoke(cli.app,["search","remember alpha","-f","json"]).output)
+    hold=POPEN([sys.executable,"-c","import duckdb,sys; c=duckdb.connect(sys.argv[1],read_only=True); print('ready',flush=True); sys.stdin.read()",str(data/"convos.db")],stdin=subprocess.PIPE,stdout=subprocess.PIPE,text=True)
+    try: assert hold.stdout.readline().strip()=="ready"; (data/"hook_fts_dirty").touch(); result=runner.invoke(cli.app,["search","remember alpha","-f","json"])
+    finally: hold.stdin.close(); hold.wait(timeout=5)
+    assert result.exit_code == 0 and json.loads(result.stdout)[0]["content"] == "remember alpha" and "using last indexed snapshot" in result.stderr and (data/"hook_fts_dirty").exists()
+
 def test_sync_defers_fts_and_embeddings(hooks, tmp_path, monkeypatch):
     _, data = hooks; src = tmp_path/"import.json"; src.write_text("[]"); monkeypatch.setenv("CONVOS_IMPORT_PATHS", str(src)); monkeypatch.setattr(cli, "STATE_PATH", data/"sync_state.json")
     result = cli.ParseResult(convs=[dict(id="sync-c", source="chatgpt", title="T", created_at=None, updated_at=None, model=None, cwd=None, git_branch=None, project_id=None, metadata="{}")], msgs=[dict(id="sync-m", conversation_id="sync-c", role="user", content="alpha", thinking=None, created_at=None, model=None, metadata="{}", parent_id=None)])
@@ -84,7 +92,7 @@ def test_sync_defers_fts_and_embeddings(hooks, tmp_path, monkeypatch):
     assert (data/"hook_fts_dirty").exists() and json.loads((data/"hook_embeddings_dirty").read_text()) == ["sync-m"]
 
 def test_local_only_sync_imports_configured_agent_roots_without_web(hooks, tmp_path, monkeypatch):
-    sessions, data = hooks; transcript(sessions/"local.jsonl", "offline codex history"); claude=tmp_path/"claude"; project=claude/"projects"/"-repo"; project.mkdir(parents=True); (project/"local.jsonl").write_text("\n".join([json.dumps({"type":"system","timestamp":"2026-01-01T00:00:00Z","cwd":"/repo"}),json.dumps({"type":"human","timestamp":"2026-01-01T00:00:01Z","message":{"content":"offline claude history"}})])); monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(claude)); monkeypatch.setattr(cli, "STATE_PATH", data/"sync_state.json"); blocked = lambda *_a,**_k: (_ for _ in ()).throw(AssertionError("local-only sync touched web"))
+    sessions, data = hooks; transcript(sessions/"local.jsonl", "offline codex history"); (sessions/"gone.jsonl").symlink_to(tmp_path/"missing-codex.jsonl"); claude=tmp_path/"claude"; project=claude/"projects"/"-repo"; project.mkdir(parents=True); (project/"local.jsonl").write_text("\n".join([json.dumps({"type":"system","timestamp":"2026-01-01T00:00:00Z","cwd":"/repo"}),json.dumps({"type":"human","timestamp":"2026-01-01T00:00:01Z","message":{"content":"offline claude history"}})])); (project/"gone.jsonl").symlink_to(tmp_path/"missing-claude.jsonl"); monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(claude)); monkeypatch.setattr(cli, "STATE_PATH", data/"sync_state.json"); blocked = lambda *_a,**_k: (_ for _ in ()).throw(AssertionError("local-only sync touched web"))
     monkeypatch.setattr(cli, "chatgpt_profiles", blocked); monkeypatch.setattr(cli, "get_cookies", blocked); first = CliRunner().invoke(cli.app, ["sync","--local-only"]); second = CliRunner().invoke(cli.app, ["sync","--local-only"])
     db=duckdb.connect(str(data/"convos.db"),read_only=True); rows=db.execute("SELECT source,content FROM conversations c JOIN messages m ON m.conversation_id=c.id").fetchall(); db.close()
     assert first.exit_code == second.exit_code == 0 and set(rows) == {("codex","offline codex history"),("claude-code","offline claude history")} and "2 new, 0 updated" in first.output and "0 new, 0 updated" in second.output

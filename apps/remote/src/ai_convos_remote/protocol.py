@@ -1,6 +1,7 @@
 """Canonical signed/encrypted event protocol. Wire format v1; server sees envelopes only."""
 import base64, hashlib, hmac, json, os
 from datetime import datetime, timezone
+from functools import lru_cache
 
 from cryptography.exceptions import InvalidSignature, InvalidTag
 from cryptography.hazmat.primitives import hashes
@@ -49,13 +50,15 @@ def verify_certificate(cert, root_public):
     sig, body = unb64(cert["signature"]), {k:v for k,v in cert.items() if k != "signature"}; _pub(Ed25519PublicKey, root_public).verify(sig, canon(body))
     if body["v"] != V: raise ValueError(f"Unsupported certificate version {body['v']}")
     return body
+@lru_cache(maxsize=256)
+def verified_certificate(raw,root_public): return verify_certificate(json.loads(raw),root_public)
 
-def row_proof(device,user,workspace,epoch,row,previous=None,authorization_workspace=None):
-    claim={"row_kind":row["kind"],"row_id":row["id"],"encoding_v":row["v"],"content_hash":digest(row),"previous_revision":previous,"state":row["state"]}; body={"v":1,"kind":"row.proof","workspace":workspace,"authorization_workspace":authorization_workspace or workspace,**claim,"revision":digest({"v":1,**claim}),"author_user_id":user,"author_device_id":device["id"],"authorization_epoch":epoch}; body["signature"]=b64(_priv(Ed25519PrivateKey,device["sign_private"]).sign(canon(body))); return body
+def row_proof(device,user,workspace,epoch,row,previous=None,authorization_workspace=None,content_hash=None):
+    claim={"row_kind":row["kind"],"row_id":row["id"],"encoding_v":row["v"],"content_hash":content_hash if content_hash is not None else digest(row),"previous_revision":previous,"state":row["state"]}; body={"v":1,"kind":"row.proof","workspace":workspace,"authorization_workspace":authorization_workspace or workspace,**claim,"revision":digest({"v":1,**claim}),"author_user_id":user,"author_device_id":device["id"],"authorization_epoch":epoch}; body["signature"]=b64(_priv(Ed25519PrivateKey,device["sign_private"]).sign(canon(body))); return body
 
 def verify_row_proof(value,row,cert,root_public):
     try:
-        signed={k:v for k,v in value.items() if k!="signature"}; device=verify_certificate(cert,root_public)["device"]; previous=value["previous_revision"]
+        signed={k:v for k,v in value.items() if k!="signature"}; device=verified_certificate(canon(cert),root_public)["device"]; previous=value["previous_revision"]
         claim={k:value[k] for k in ("row_kind","row_id","encoding_v","content_hash","previous_revision","state")}
         if set(row)!={"v","kind","id","state","data"} or row["kind"] not in SEMANTIC_FIELDS_V1 or not isinstance(row["id"],str) or not row["id"] or row["v"]!=1 or row["state"] not in ("active","deleted") or row["kind"] in PROVENANCE_FIELDS_V1 and row["state"]!="active" or row["data"] is not None and (row["state"]!="active" or set(row["data"])!=set(SEMANTIC_FIELDS_V1[row["kind"]])) or row["state"]=="deleted" and row["data"] is not None: raise ValueError
         if set(value)!=ROW_PROOF_FIELDS or value["v"]!=1 or value["kind"]!="row.proof" or any(not isinstance(value[k],str) or not value[k] for k in ("workspace","authorization_workspace")) or (value["row_kind"],value["row_id"],value["encoding_v"],value["content_hash"],value["state"])!=(row["kind"],row["id"],row["v"],digest(row),row["state"]) or value["revision"]!=digest({"v":1,**claim}) or previous is not None and (not isinstance(previous,str) or len(previous)!=64 or any(c not in "0123456789abcdef" for c in previous) or previous==value["revision"]) or not isinstance(value["authorization_epoch"],int) or isinstance(value["authorization_epoch"],bool) or value["authorization_epoch"]<1 or (cert["user"],device["id"],public_id(root_public),public_id(device["sign_public"]))!=(value["author_user_id"],value["author_device_id"],value["author_user_id"],value["author_device_id"]): raise ValueError
@@ -95,8 +98,8 @@ def open_event(envelope, key, sign_public):
     if (value["id"], value["author"], value["seq"], value["parents"]) != (header["event"], header["author"], header["seq"], header["parents"]): raise ValueError("Envelope header mismatch")
     return value
 
-def seal_replica(row,proof,workspace,epoch,key,uploader):
-    if proof["revision"]!=digest({"v":1,**{k:proof[k] for k in ("row_kind","row_id","encoding_v","content_hash","previous_revision","state")}}) or proof["content_hash"]!=digest(row): raise ValueError("row replica proof mismatch")
+def seal_replica(row,proof,workspace,epoch,key,uploader,content_hash=None):
+    if proof["revision"]!=digest({"v":1,**{k:proof[k] for k in ("row_kind","row_id","encoding_v","content_hash","previous_revision","state")}}) or proof["content_hash"]!=(content_hash if content_hash is not None else digest(row)): raise ValueError("row replica proof mismatch")
     nonce=os.urandom(12); header={"v":1,"kind":"row.replica","workspace":workspace,"replica":fingerprint(key,digest(proof)),"epoch":epoch,"uploader":uploader,"nonce":b64(nonce)}; return {**header,"ciphertext":b64(AESGCM(key).encrypt(nonce,canon({"row":row,"proof":proof}),canon(header)))}
 
 def open_replica(value,key):
@@ -107,10 +110,10 @@ def open_replica(value,key):
         return body
     except (InvalidTag,KeyError,TypeError,ValueError) as e: raise ValueError("invalid row replica") from e
 
-def seal_origin(controls,workspace,epoch,key,uploader):
-    nonce=os.urandom(12); header={"v":1,"kind":"origin.bundle","workspace":workspace,"origin":fingerprint(key,digest(controls)),"epoch":epoch,"uploader":uploader,"nonce":b64(nonce)}; return {**header,"ciphertext":b64(AESGCM(key).encrypt(nonce,canon({"controls":controls}),canon(header)))}
+def seal_origin(controls,workspace,epoch,key,uploader,rows=True):
+    body={"controls":controls,"rows":rows}; nonce=os.urandom(12); header={"v":1,"kind":"origin.bundle","workspace":workspace,"origin":fingerprint(key,digest(body)),"epoch":epoch,"uploader":uploader,"nonce":b64(nonce)}; return {**header,"ciphertext":b64(AESGCM(key).encrypt(nonce,canon(body),canon(header)))}
 def open_origin(value,key):
-    try: header={k:value[k] for k in ("v","kind","workspace","origin","epoch","uploader","nonce")}; body=json.loads(AESGCM(key).decrypt(unb64(value["nonce"]),unb64(value["ciphertext"]),canon(header))); controls=body["controls"]; return controls if set(value)==set(header)|{"ciphertext"} and value["v"]==1 and value["kind"]=="origin.bundle" and isinstance(controls,list) and controls and value["origin"]==fingerprint(key,digest(controls)) else (_ for _ in ()).throw(ValueError)
+    try: header={k:value[k] for k in ("v","kind","workspace","origin","epoch","uploader","nonce")}; body=json.loads(AESGCM(key).decrypt(unb64(value["nonce"]),unb64(value["ciphertext"]),canon(header))); return body if set(value)==set(header)|{"ciphertext"} and value["v"]==1 and value["kind"]=="origin.bundle" and set(body)=={"controls","rows"} and isinstance(body["controls"],list) and body["controls"] and isinstance(body["rows"],bool) and value["origin"]==fingerprint(key,digest(body)) else (_ for _ in ()).throw(ValueError)
     except (InvalidTag,KeyError,TypeError,ValueError) as e: raise ValueError("invalid origin bundle") from e
 
 def seal_blob(data,workspace,epoch,key,uploader):

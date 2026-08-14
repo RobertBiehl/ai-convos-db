@@ -608,7 +608,7 @@ def test_parse_failures_are_visible(capsys):
 
 def test_latest_mtime_includes_export_formats(tmp_path):
     from ai_convos.cli import latest_mtime
-    (tmp_path / "export.json").write_text("[]")
+    (tmp_path / "export.json").write_text("[]"); (tmp_path/"gone.json").symlink_to(tmp_path/"missing.json")
     assert latest_mtime(tmp_path) == (tmp_path / "export.json").stat().st_mtime
 
 

@@ -3,7 +3,7 @@ import json, subprocess, sys
 import duckdb
 import pytest
 import ai_convos.cli as core_module
-from ai_convos.cli import ARCHIVE_COLUMNS, archive_state, capture_provenance as capture, init_schema, project_archive_row, project_provenance as project, project_row_proof, project_workspace_controls, provenance_digest as digest, repository
+from ai_convos.cli import ARCHIVE_COLUMNS, archive_changes, archive_state, capture_provenance as capture, init_schema, project_archive_row, project_provenance as project, project_row_proof, project_row_proofs, project_workspace_controls, provenance_digest as digest, repository
 from ai_convos_changegraph.provenance import query
 from ai_convos_remote.protocol import certificate, event, identity, logical_row, public_id, row_proof
 
@@ -39,6 +39,10 @@ def test_existing_core_is_checkpointed_once_before_automatic_migration(tmp_path)
     path=tmp_path/"legacy.db"; db=duckdb.connect(str(path)); db.execute("CREATE TABLE conversations(id VARCHAR,title VARCHAR)"); db.execute("INSERT INTO conversations VALUES ('keep','preserved')"); db.close(); db=duckdb.connect(str(path)); init_schema(db); db.close(); backup=path.with_name("legacy.db.pre-v1.bak"); check=duckdb.connect(str(backup),read_only=True); assert check.execute("SELECT * FROM conversations").fetchall()==[("keep","preserved")]; check.close(); stamp=backup.stat().st_mtime_ns; db=duckdb.connect(str(path)); init_schema(db); assert db.execute("SELECT version FROM core_schema").fetchone()[0]==1; db.close(); assert backup.stat().st_mtime_ns==stamp and backup.stat().st_mode&0o777==0o600
 
 
+def test_stale_fixed_migration_backup_is_preserved_not_reused(tmp_path):
+    path=tmp_path/"legacy.db"; stale=path.with_name("legacy.db.pre-v1.bak"); db=duckdb.connect(str(stale)); db.execute("CREATE TABLE conversations(id VARCHAR,title VARCHAR)"); db.execute("INSERT INTO conversations VALUES ('old','stale')"); db.close(); db=duckdb.connect(str(path)); db.execute("CREATE TABLE conversations(id VARCHAR,title VARCHAR)"); db.execute("INSERT INTO conversations VALUES ('new','current')"); db.close(); db=duckdb.connect(str(path)); init_schema(db); db.close(); backups=list(tmp_path.glob("legacy.db.pre-v1.bak.*")); assert len(backups)==1 and duckdb.connect(str(stale),read_only=True).execute("SELECT id FROM conversations").fetchone()[0]=="old" and duckdb.connect(str(backups[0]),read_only=True).execute("SELECT id FROM conversations").fetchone()[0]=="new"
+
+
 def test_provenance_upgrade_preserves_edit_evidence_and_removes_unused_graph_tables(tmp_path):
     db=graph(tmp_path/"graph.db"); db.execute("ALTER TABLE provenance.file_edit_files RENAME COLUMN old_content_hash TO before_hash"); db.execute("ALTER TABLE provenance.file_edit_files RENAME COLUMN new_content_hash TO after_hash"); db.execute("ALTER TABLE provenance.git_checkpoints DROP COLUMN capture_source"); db.execute("CREATE TABLE provenance.assertions(id VARCHAR)"); db.execute("CREATE TABLE provenance.capture_gaps(id VARCHAR)"); db.execute("INSERT INTO provenance.repositories VALUES ('r','l','[]','[]',NULL,'2026-01-01')"); db.execute("INSERT INTO provenance.file_edit_files VALUES ('e','f','old','new','captured_exact')"); db.execute("DROP TABLE provenance.local_facts"); init_schema(db)
     assert db.execute("SELECT old_content_hash,new_content_hash FROM provenance.file_edit_files").fetchone()==("old","new") and db.execute("SELECT * FROM provenance.local_facts").fetchone()==("repository.observed","r") and not {"assertions","capture_gaps"}&{r[0] for r in db.execute("SELECT table_name FROM information_schema.tables WHERE table_schema='provenance'").fetchall()}
@@ -46,12 +50,12 @@ def test_provenance_upgrade_preserves_edit_evidence_and_removes_unused_graph_tab
 
 def test_archive_generation_is_transactional_and_counts_only_owned_rows(tmp_path):
     db=duckdb.connect(str(tmp_path/"core.db")); init_schema(db); initial=archive_state(db); row=["c","codex","one","2026-01-01","2026-01-01",None,None,None,None,"{}"]
-    db.execute("BEGIN"); project_archive_row(db,"conversations",ARCHIVE_COLUMNS["conversations"],row); assert archive_state(db)[1:]==(initial[1]+1,1); db.execute("ROLLBACK"); assert archive_state(db)==initial
+    db.execute("BEGIN"); project_archive_row(db,"conversations",ARCHIVE_COLUMNS["conversations"],row); assert archive_state(db)[1:]==(initial[1]+1,1) and archive_changes(db,initial[1])[1]==[("conversations","c")]; db.execute("ROLLBACK"); assert archive_state(db)==initial and archive_changes(db,initial[1])[1]==[]
 
 
 def test_row_proofs_and_signers_are_durable_idempotent_core_metadata(tmp_path):
-    db=graph(tmp_path/"graph.db"); root,device=identity("root"),identity("device"); user=public_id(root["sign_public"]); cert=certificate(root,user,device); row=logical_row("messages",identity="m",state="deleted"); proof=row_proof(device,user,"origin",2,row); generation=archive_state(db)[1]; db.execute("BEGIN"); pid=project_row_proof(db,proof,root["sign_public"],cert); assert project_row_proof(db,proof,root["sign_public"],cert)==pid; db.execute("COMMIT")
-    assert db.execute("SELECT workspace_id,row_kind,source_row_id,state,revision,previous_revision FROM remote.row_proofs").fetchone()==("origin","messages","m","deleted",proof["revision"],None) and db.execute("SELECT COUNT(*) FROM remote.row_signers").fetchone()[0]==1 and archive_state(db)[1]==generation and project_row_proof(db,proof,root["sign_public"],certificate(root,user,device))==pid
+    db=graph(tmp_path/"graph.db"); root,device=identity("root"),identity("device"); user=public_id(root["sign_public"]); cert=certificate(root,user,device); row=logical_row("messages",identity="m",state="deleted"); proof=row_proof(device,user,"origin",2,row); other=row_proof(device,user,"origin",2,logical_row("messages",identity="n",state="deleted")); generation=archive_state(db)[1]; db.execute("BEGIN"); pid=project_row_proof(db,proof,root["sign_public"],cert); assert project_row_proof(db,proof,root["sign_public"],cert)==pid and project_row_proofs(db,[proof,other],root["sign_public"],cert)==[pid,digest(other)]; db.execute("COMMIT")
+    assert db.execute("SELECT workspace_id,row_kind,source_row_id,state,revision,previous_revision FROM remote.row_proofs WHERE source_row_id='m'").fetchone()==("origin","messages","m","deleted",proof["revision"],None) and db.execute("SELECT COUNT(*) FROM remote.row_proofs").fetchone()[0]==2 and db.execute("SELECT COUNT(*) FROM remote.row_signers").fetchone()[0]==1 and archive_state(db)[1]==generation and project_row_proof(db,proof,root["sign_public"],certificate(root,user,device))==pid
     with pytest.raises(ValueError,match="signer conflict"): project_row_proof(db,proof,identity("other")["sign_public"],cert)
 
 
@@ -60,11 +64,11 @@ def test_core_upgrade_adds_origin_proof_link_without_losing_attribution(tmp_path
 
 
 def test_core_upgrade_backfills_proof_authorization_workspace(tmp_path):
-    db=graph(tmp_path/"graph.db"); root,device=identity("root"),identity("device"); user=public_id(root["sign_public"]); proof=row_proof(device,user,"origin",1,logical_row("messages",identity="m",state="deleted")); project_row_proof(db,proof,root["sign_public"],certificate(root,user,device)); db.execute("ALTER TABLE remote.row_proofs DROP COLUMN authorization_workspace_id"); init_schema(db); assert db.execute("SELECT workspace_id,authorization_workspace_id FROM remote.row_proofs").fetchone()==("origin","origin")
+    db=graph(tmp_path/"graph.db"); root,device=identity("root"),identity("device"); user=public_id(root["sign_public"]); proof=row_proof(device,user,"origin",1,logical_row("messages",identity="m",state="deleted")); cert=certificate(root,user,device); project_row_proof(db,proof,root["sign_public"],cert); db.execute("ALTER TABLE remote.row_proofs DROP COLUMN authorization_workspace_id"); init_schema(db); project_row_proof(db,row_proof(device,user,"origin",1,logical_row("messages",identity="n",state="deleted")),root["sign_public"],cert); assert db.execute("SELECT workspace_id,authorization_workspace_id FROM remote.row_proofs ORDER BY source_row_id").fetchall()==[("origin","origin"),("origin","origin")]
 
 
 def test_core_upgrade_indexes_existing_retained_attachment_body(tmp_path):
-    body=tmp_path/"body"; body.write_bytes(b"retained"); db=graph(tmp_path/"graph.db"); db.execute("INSERT INTO conversations VALUES ('c','codex','x','2026-01-01','2026-01-01',NULL,NULL,NULL,NULL,'{}')"); db.execute("INSERT INTO messages VALUES ('m','c','user','x',NULL,'2026-01-01',NULL,'{}',NULL,NULL)"); db.execute("INSERT INTO attachments VALUES ('a','m','body',NULL,8,?,NULL,'2026-01-01')",[str(body)]); init_schema(db); assert db.execute("SELECT content_hash,size FROM attachment_bodies").fetchone()==(digest(b"retained"),8)
+    body=tmp_path/"body"; body.write_bytes(b"retained"); db=graph(tmp_path/"graph.db"); db.execute("INSERT INTO conversations VALUES ('c','codex','x','2026-01-01','2026-01-01',NULL,NULL,NULL,NULL,'{}')"); db.execute("INSERT INTO messages VALUES ('m','c','user','x',NULL,'2026-01-01',NULL,'{}',NULL,NULL)"); db.execute("INSERT INTO attachments VALUES ('a','m','body',NULL,NULL,?,NULL,'2026-01-01')",[str(body)]); init_schema(db); assert db.execute("SELECT content_hash,size FROM attachment_bodies").fetchone()==(digest(b"retained"),8) and db.execute("SELECT size FROM attachments").fetchone()[0]==8
 
 
 def test_workspace_authorization_chain_is_normalized_and_conflicts_fail(tmp_path):

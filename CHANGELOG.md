@@ -18,6 +18,13 @@
 - Make provenance canonical core facts with logical-row proofs, so Remote is a
   read-only consumer and another authorized holder can repair the facts with
   their original authorship after relay loss.
+- Add a content-free core change-generation index and per-workspace cursor so
+  normal personal and team replication reads only changed rows, including
+  signed tombstones and complete expansion when a conversation enters scope.
+- Bound proof transactions, replica sealing, reconciliation, verification, and
+  projection; retries inventory deterministic replica IDs before encryption,
+  acknowledged local copies are not reprocessed, and relay quota accounting is
+  constant-time.
 - Simplify team history to future-only or complete-history access, remove
   per-row grants and carrier events, and define the first client/server
   protocol, signed workspace state, rebuildable state schema, optional-app

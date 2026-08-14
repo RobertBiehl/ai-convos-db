@@ -49,10 +49,11 @@ def inspect(value,path="$"):
     return value,[]
 def _root(root=None): return Path(root or os.environ.get("CONVOS_PROJECT_ROOT",Path.home()/".convos")).expanduser()
 def _private_json(path,data):
+    from ai_convos.cli import durable_replace
     if path.parent.is_symlink(): raise ValueError("Redaction state directory must not be a symlink")
     path.parent.mkdir(parents=True,exist_ok=True); os.chmod(path.parent,0o700)
     if path.is_symlink() or path.exists() and not path.is_file(): raise ValueError("Redaction state must be a regular non-symlink file")
-    tmp=path.with_name(f".{path.name}.{os.getpid()}"); tmp.touch(mode=0o600,exist_ok=False); tmp.write_text(json.dumps(data)); os.replace(tmp,path)
+    tmp=path.with_name(f".{path.name}.{os.getpid()}"); tmp.touch(mode=0o600,exist_ok=False); tmp.write_text(json.dumps(data)); durable_replace(tmp,path)
 def _audit(root,workspace,record,findings):
     if not findings: return
     path=_root(root)/"redact/audit.db"; path.parent.is_symlink() and (_ for _ in ()).throw(ValueError("Redaction audit directory must not be a symlink")); path.parent.mkdir(parents=True,exist_ok=True); os.chmod(path.parent,0o700)
@@ -64,11 +65,21 @@ def _audit(root,workspace,record,findings):
     db.commit(); db.close()
 def protect(record,root=None,workspace="team"):
     if record["kind"] in ("attachment.record","attachment.chunk"):
+        if record["kind"]=="attachment.chunk": _audit(root,workspace,record,[dict(kind="attachment_redacted",path="$.payload",line=1,start=0)]); return None
+        if record["payload"].get("state")=="deleted": return record
         _audit(root,workspace,record,[dict(kind="attachment_redacted",path="$.payload",line=1,start=0)])
-        if record["kind"]=="attachment.chunk": return None
         p=record["payload"]; row=dict(zip(p["columns"],p["row"])); row.update(filename="[REDACTED:attachment]",mime_type=None,size=None,path=None,url=None,**({"body_hash":None} if "body_hash" in row else {})); return dict(record,payload={**p,"row":[row[c] for c in p["columns"]]})
     payload,findings=inspect(record["payload"],"$.payload"); _audit(root,workspace,record,findings)
     return dict(record,payload=payload)
+def protect_all(records,root=None,workspace="team"):
+    pairs=[(r,protect(r,root,workspace)) for r in records]; edits={r["payload"]["row"][0]:(r,s) for r,s in pairs if s and r["kind"]=="file_edit.record" and r!=s and r["payload"].get("state")!="deleted"}; facts={r["payload"]["id"]:r["payload"] for r,s in pairs if r["kind"]=="edit.observed" and r["payload"]["id"] in edits}; files={p["file"] for p in facts.values()}; repos={p["repository"] for p in facts.values()}; out=[]
+    for original,safe in pairs:
+        if not safe or safe["kind"]=="file.version" and safe["payload"]["file"] in files or safe["kind"]=="git.checkpoint" and safe["payload"]["repository"] in repos or safe["kind"]=="checkpoint.link" and safe["payload"]["edit"] in edits: continue
+        if safe["kind"]=="edit.observed" and safe["payload"]["id"] in edits:
+            record=edits[safe["payload"]["id"]][1]["payload"]; row=dict(zip(record["columns"],record["row"])); safe=dict(safe,payload={**safe["payload"],"old_content_hash":hashlib.sha256(row["old_content"].encode()).hexdigest() if row["old_content"] is not None else None,"new_content_hash":hashlib.sha256((row["content"] or "").encode()).hexdigest()})
+        if safe["kind"]=="repository.observed" and safe["payload"]["id"] in repos: safe=dict(safe,payload={**safe["payload"],"lineage":None,"roots":[],"head":None})
+        out.append(safe)
+    return out
 def scan_data(cache=False):
     from ai_convos.cli import DB_PATH,get_db
     before=(str(DB_PATH.resolve()),DB_PATH.stat().st_mtime_ns,DB_PATH.stat().st_size); saved=_root()/"redact/scan.json"
