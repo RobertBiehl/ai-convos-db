@@ -1,10 +1,11 @@
 import copy, json
+from datetime import datetime
 
 import pytest
 from cryptography.exceptions import InvalidSignature, InvalidTag
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
-from ai_convos_remote.protocol import (b64, certificate, digest, event, fingerprint, identity, open_event, open_key,
+from ai_convos_remote.protocol import (b64, certificate, digest, event, fingerprint, identity, logical_row, open_event, open_key,
                                        material_event, public, purge_certificate, recover, recovery_bundle, seal_event, seal_history, seal_key,
                                        verify_certificate, verify_event, verify_purge)
 
@@ -20,6 +21,22 @@ def test_identity_certificate_and_event_vector():
     value = event(device, 1, "message.record", "m1", {"content":"hello"}, [], "2026-01-01T00:00:00.000000Z")
     assert value["id"] == "6ee3c8b0416343604b05cad40bed9f9b1d5ebde1af2fbe76f08ac3731d7da1d2"
     assert verify_event(value, device["sign_public"])["payload"]["content"] == "hello"
+
+
+def test_logical_row_vector_ignores_storage_layout_and_local_fields():
+    columns=["id","source","title","created_at","updated_at","model","cwd","git_branch","project_id","metadata","embedding"]; values=["physical","codex","Hello",datetime(2026,1,2,3,4,5,6),None,"gpt","/one","main",None,'{"z":1,"a":[2,1]}',[1.0]]
+    row=logical_row("conversations",columns,values,"stable"); shuffled=list(reversed(list(zip(columns,values))))
+    assert digest(row)=="84d853103ea3ca17ff92d876f9ff5f736b1322da7a027189f4ff40a331b5326a" and row==logical_row("conversations",[x[0] for x in shuffled],[x[1] for x in shuffled],"stable")
+    changed=[*values]; changed[6:8]=["/other","feature"]; changed[9]='{"a":[2,1],"z":1}'; changed[-1]=[9.0]; assert logical_row("conversations",columns,changed,"stable")==row
+    changed[2]="Changed"; assert digest(logical_row("conversations",columns,changed,"stable"))!=digest(row)
+    assert logical_row("conversations",columns,values)["id"]=="physical" and logical_row("conversations",columns,values,"stable")["id"]=="stable" and logical_row("messages",identity="m",state="deleted")["data"] is None
+
+
+def test_logical_attachment_excludes_body_location_and_temporary_url():
+    columns=["id","message_id","filename","mime_type","size","path","url","created_at"]; values=["a","m","x.png","image/png",3,"/one","https://temporary/one",datetime(2026,1,1)]
+    other=[*values]; other[5:7]=["/two","https://temporary/two"]
+    assert logical_row("attachments",columns,values)==logical_row("attachments",columns,other)
+    with pytest.raises(ValueError,match="logical row"): logical_row("messages",identity="m",state="unknown")
 
 
 def test_event_encryption_tamper_signature_and_header_binding():

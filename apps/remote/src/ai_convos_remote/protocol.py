@@ -10,12 +10,21 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 
 V = 1
+ROW_FIELDS_V1={"conversations":("source","title","created_at","updated_at","model","project_id","metadata"),"messages":("conversation_id","role","content","thinking","created_at","model","metadata","parent_id"),"tool_calls":("message_id","tool_name","input","output","status","duration_ms","created_at"),"attachments":("message_id","filename","mime_type","size","created_at"),"artifacts":("conversation_id","artifact_type","title","content","language","created_at","version"),"file_edits":("message_id","file_path","edit_type","content","created_at","old_content")}
+ROW_JSON_V1={"metadata","input","output"}; ROW_TIME_V1={"created_at","updated_at"}
 def canon(v): return json.dumps(v, sort_keys=True, separators=(",", ":"), ensure_ascii=True, allow_nan=False).encode()
 def b64(v): return base64.urlsafe_b64encode(v).decode().rstrip("=")
 def unb64(v): return base64.urlsafe_b64decode(v + "=" * (-len(v) % 4))
 def digest(v): return hashlib.sha256(v if isinstance(v, bytes) else canon(v)).hexdigest()
 def public_id(value): return digest(unb64(value))[:32]
 def now(): return datetime.now(timezone.utc).isoformat(timespec="microseconds").replace("+00:00", "Z")
+def logical_row(table,columns=(),values=(),identity=None,v=1,state="active"):
+    if v!=1 or table not in ROW_FIELDS_V1 or state not in ("active","deleted") or state=="deleted" and (not identity or columns or values) or len(columns)!=len(values) or len(set(columns))!=len(columns): raise ValueError("invalid logical row schema")
+    if state=="deleted": return {"v":v,"kind":table,"id":identity,"state":state,"data":None}
+    row=dict(zip(columns,values)); required={"id",*ROW_FIELDS_V1[table]}
+    if not required<=set(row): raise ValueError("incomplete logical row")
+    norm=lambda k,v: json.loads(v) if v is not None and k in ROW_JSON_V1 and isinstance(v,str) else v.isoformat(timespec="microseconds") if v is not None and k in ROW_TIME_V1 and isinstance(v,datetime) else v
+    return {"v":v,"kind":table,"id":identity or row["id"],"state":state,"data":{k:norm(k,row[k]) for k in ROW_FIELDS_V1[table]}}
 def _priv(cls, value): return cls.from_private_bytes(unb64(value))
 def _pub(cls, value): return cls.from_public_bytes(unb64(value))
 def _raw(k): return b64(k.private_bytes_raw() if hasattr(k, "private_bytes_raw") else k.public_bytes_raw())
