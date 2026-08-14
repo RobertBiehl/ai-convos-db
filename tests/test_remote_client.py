@@ -141,25 +141,36 @@ def test_unknown_events_survive_client_projection(tmp_path,monkeypatch):
     assert json.loads(state.execute("SELECT event_json FROM event_log WHERE event=?",(eid,)).fetchone()[0])["payload"]["new_field"]==[1,2,3]
 
 
-def test_large_record_is_lazy_until_explicit_fetch(tmp_path,monkeypatch):
+def test_large_record_is_fetched_during_convergent_pull(tmp_path,monkeypatch):
     server=server_connect(tmp_path/"server.db"); monkeypatch.setattr("ai_convos_remote.request",transport(server)); a,b=tmp_path/"a",tmp_path/"b"; alice,recovery=setup_client("http://server","alice",root=a); desktop,_=setup_client("http://server","alice","desktop",recovery,root=b); alice=load(a); ws=workspace(alice,"Personal"); state_a,state_b=connect(a/"remote/state.db"),connect(b/"remote/state.db")
-    publish(alice,state_a,ws,conversation("x"*70000),a); upload(alice,state_a,a); pull(desktop,state_b,b); assert state_b.execute("SELECT COUNT(*) FROM lazy_events").fetchone()[0]==1 and not (b/"data/convos.db").exists()
-    assert fetch_lazy(desktop,state_b,root=b)==1 and duckdb.connect(str(b/"data/convos.db"),read_only=True).execute("SELECT length(title) FROM conversations").fetchone()[0]==70000
+    publish(alice,state_a,ws,conversation("x"*70000),a); upload(alice,state_a,a); result=pull(desktop,state_b,b); assert state_b.execute("SELECT COUNT(*) FROM lazy_events").fetchone()[0]==0 and result[ws]["cursor"]==result[ws]["tail"] and duckdb.connect(str(b/"data/convos.db"),read_only=True).execute("SELECT length(title) FROM conversations").fetchone()[0]==70000
 
 
 def test_lazy_fetch_rejects_swapped_envelope(tmp_path,monkeypatch):
-    server=server_connect(tmp_path/"server.db"); direct=transport(server); monkeypatch.setattr("ai_convos_remote.request",direct); a,b=tmp_path/"a",tmp_path/"b"; alice,recovery=setup_client("http://server","alice",root=a); desktop,_=setup_client("http://server","alice","desktop",recovery,root=b); alice=load(a); ws=workspace(alice,"Personal"); sa,sb=connect(a/"remote/state.db"),connect(b/"remote/state.db"); [publish(alice,sa,ws,conversation(str(i)*70000,str(i)),a) for i in range(2)]; upload(alice,sa,a); pull(desktop,sb,b); ids=[r[0] for r in sb.execute("SELECT event FROM lazy_events ORDER BY event").fetchall()]
-    def swapped(cfg,body,auth=True): return direct(cfg,{**body,"event":ids[1]} if body["op"]=="fetch" else body,auth)
+    server=server_connect(tmp_path/"server.db"); direct=transport(server); monkeypatch.setattr("ai_convos_remote.request",direct); a,b=tmp_path/"a",tmp_path/"b"; alice,recovery=setup_client("http://server","alice",root=a); desktop,_=setup_client("http://server","alice","desktop",recovery,root=b); alice=load(a); ws=workspace(alice,"Personal"); sa,sb=connect(a/"remote/state.db"),connect(b/"remote/state.db"); [publish(alice,sa,ws,conversation(str(i)*70000,str(i)),a) for i in range(2)]; upload(alice,sa,a); ids=[r[0] for r in server.execute("SELECT event FROM events WHERE LENGTH(envelope)>65536 ORDER BY event").fetchall()]
+    def swapped(cfg,body,auth=True): return direct(cfg,{**body,"event":ids[1]} if body["op"]=="fetch" and body["event"]==ids[0] else body,auth)
     monkeypatch.setattr("ai_convos_remote.request",swapped)
-    with pytest.raises(ValueError,match="mismatch"): fetch_lazy(desktop,sb,ids[0],b)
-    assert sb.execute("SELECT COUNT(*) FROM lazy_events").fetchone()[0]==2 and not (b/"data/convos.db").exists()
+    with pytest.raises(ValueError,match="mismatch"): pull(desktop,sb,b)
+    assert sb.execute("SELECT lifecycle FROM sync_states WHERE workspace=?",(ws,)).fetchone()[0]=="blocked"
 
 
 def test_attachment_bytes_are_redacted_lazy_and_reassembled(tmp_path,monkeypatch):
     server=server_connect(tmp_path/"server.db"); monkeypatch.setattr("ai_convos_remote.request",transport(server)); a,b=tmp_path/"a",tmp_path/"b"; alice,recovery=setup_client("http://server","alice",root=a); desktop,_=setup_client("http://server","alice","desktop",recovery,root=b); alice=load(a); ws=workspace(alice,"Personal"); state_a,state_b=connect(a/"remote/state.db"),connect(b/"remote/state.db")
     payload=bytes(range(256))*800; source=tmp_path/"private"/"evidence.bin"; source.parent.mkdir(); source.write_bytes(payload); (a/"data").mkdir(); core=duckdb.connect(str(a/"data/convos.db")); init_schema(core); core.execute("INSERT INTO conversations VALUES ('c','codex','attachment','2026-01-01','2026-01-01',NULL,NULL,NULL,NULL,'{}')"); core.execute("INSERT INTO messages VALUES ('m','c','user','see file',NULL,'2026-01-01',NULL,'{}',NULL,NULL)"); core.execute("INSERT INTO attachments VALUES ('a','m','evidence.bin','application/octet-stream',?,?,NULL,'2026-01-01')",(len(payload),str(source))); records=scan(core,state_a,alice["device"]["id"]); core.close()
-    assert str(source) not in json.dumps(records) and sum(r["kind"]=="attachment.chunk" for r in records)>1; [publish(alice,state_a,ws,r,a) for r in records]; upload(alice,state_a,a); pull(desktop,state_b,b); target=duckdb.connect(str(b/"data/convos.db"),read_only=True); assert target.execute("SELECT path FROM attachments").fetchone()[0] is None; target.close(); chunks=state_b.execute("SELECT COUNT(*) FROM lazy_events").fetchone()[0]; assert chunks>1
-    assert fetch_lazy(desktop,state_b,root=b)==chunks; path=duckdb.connect(str(b/"data/convos.db"),read_only=True).execute("SELECT path FROM attachments").fetchone()[0]; assert open(path,"rb").read()==payload and os.stat(path).st_mode&0o777==0o600
+    assert str(source) not in json.dumps(records) and sum(r["kind"]=="attachment.chunk" for r in records)>1; [publish(alice,state_a,ws,r,a) for r in records]; upload(alice,state_a,a); pull(desktop,state_b,b); path=duckdb.connect(str(b/"data/convos.db"),read_only=True).execute("SELECT path FROM attachments").fetchone()[0]; assert open(path,"rb").read()==payload and os.stat(path).st_mode&0o777==0o600 and state_b.execute("SELECT COUNT(*) FROM lazy_events").fetchone()[0]==state_b.execute("SELECT COUNT(*) FROM attachment_chunks").fetchone()[0]==0
+
+
+def test_deleted_state_rebaselines_before_publishing_existing_archive(tmp_path,monkeypatch):
+    server=server_connect(tmp_path/"server.db"); direct=transport(server); monkeypatch.setattr("ai_convos_remote.request",direct); monkeypatch.setattr("ai_convos_remote.drain_hooks",lambda:None); a,b=tmp_path/"a",tmp_path/"b"; alice,recovery=setup_client("http://server","alice","laptop",root=a); setup_client("http://server","alice","desktop",recovery,root=b); alice=load(a); ws=workspace(alice,"Personal"); sa=connect(a/"remote/state.db"); publish(alice,sa,ws,conversation("remote","remote"),a); upload(alice,sa,a); sa.close(); sync_once(b,True); state=connect(b/"remote/state.db"); imported=state.execute("SELECT table_name,row_id,event FROM imported_rows").fetchall(); state.close(); assert imported
+    before=server.execute("SELECT COUNT(*) FROM events").fetchone()[0]; (b/"remote/state.db").unlink(); db=duckdb.connect(str(b/"data/convos.db")); db.execute("INSERT INTO conversations VALUES ('local','codex','new local','2026-01-02','2026-01-02',NULL,NULL,NULL,NULL,'{}')"); db.close()
+    def offline(cfg,body,auth=True):
+        if body["op"]=="pull": raise ConnectionError("relay unavailable")
+        return direct(cfg,body,auth)
+    monkeypatch.setattr("ai_convos_remote.request",offline)
+    with pytest.raises(ConnectionError,match="unavailable"): sync_once(b,True)
+    assert server.execute("SELECT COUNT(*) FROM events").fetchone()[0]==before
+    monkeypatch.setattr("ai_convos_remote.request",direct); sync_once(b,True); assert server.execute("SELECT COUNT(*) FROM events").fetchone()[0]==before+1
+    state=connect(b/"remote/state.db"); assert state.execute("SELECT lifecycle FROM sync_states WHERE workspace=?",(ws,)).fetchone()[0]=="ready" and state.execute("SELECT table_name,row_id,event FROM imported_rows").fetchall()==imported; state.close()
 
 
 def test_team_user_multiple_devices_and_admin_device_removal(tmp_path,monkeypatch):
