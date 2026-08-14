@@ -96,7 +96,7 @@ def test_conflicting_attachment_bodies_remain_repairable(tmp_path):
 def test_row_replica_page_is_atomic(tmp_path):
     root,device=identity("root"),identity("device"); user=public_id(root["sign_public"]); cert=certificate(root,user,device); entry={"user":user,"root_public":root["sign_public"],"device":public(device),"certificate":cert,"history":True}; control={"workspace":"w","revision":1,"epoch":1,"devices":{device["id"]:entry}}; fields=["id","source","title","created_at","updated_at","model","cwd","git_branch","project_id","metadata"]; row=logical_row("conversations",fields,["c","codex","valid","2026-01-01","2026-01-01",None,None,None,None,"{}"]); proof=row_proof(device,user,"w",1,row); bad={**row,"data":{**row["data"],"title":"tampered"}}
     with pytest.raises(ValueError,match="invalid row proof"): apply_row_replicas(tmp_path/"db",[{"row":row,"proof":proof},{"row":bad,"proof":proof}],"w",[control])
-    db=duckdb.connect(str(tmp_path/"db"),read_only=True); assert db.execute("SELECT COUNT(*) FROM conversations").fetchone()[0]==db.execute("SELECT COUNT(*) FROM remote.row_proofs").fetchone()[0]==db.execute("SELECT COUNT(*) FROM remote.workspace_controls").fetchone()[0]==0; db.close()
+    assert not (tmp_path/"db").exists()
 
 
 def test_row_projection_preserves_heterogeneous_json_shapes(tmp_path):
@@ -111,14 +111,14 @@ def test_equal_revisions_from_different_authors_project_independently(tmp_path):
 
 def test_optional_projection_bridge_contract_fails_closed(monkeypatch):
     class Entry:
-        def load(self): return lambda:{"v":2,"records":lambda *_:[],"project":lambda *_:None}
+        def load(self): return lambda:{"v":2,"objects":{"x"},"records":lambda *_:[],"accept":lambda *_:None}
     bridges.cache_clear(); monkeypatch.setattr(projection_module,"entry_points",lambda **_:[Entry()])
     with pytest.raises(ValueError,match="Unsupported remote bridge"): bridges()
     bridges.cache_clear()
 
 
 def test_event_support_is_exact_and_unknowns_fail_closed(monkeypatch):
-    monkeypatch.setattr(projection_module,"bridges",lambda:[]); classify=lambda kind,version:event_support({"kind":kind,"payload_v":version}); assert classify("conversation.record",1)==classify("conversation.record",2)==classify("future.opaque",1)=="required" and classify("memory.canonical",2)=="optional"; monkeypatch.setattr(projection_module,"bridges",lambda:[{"events":{("memory.canonical",1)}}]); assert classify("memory.canonical",2)=="required"
+    monkeypatch.setattr(projection_module,"bridges",lambda:[]); classify=lambda kind,version:event_support({"kind":kind,"payload_v":version}); assert classify("workspace.policy",1)=="supported" and classify("conversation.record",1)==classify("conversation.record",2)==classify("future.opaque",1)==classify("memory.canonical",1)=="required"
 
 
 def test_team_scope_includes_prompt_turn_and_linked_repo_only(tmp_path):

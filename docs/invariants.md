@@ -49,11 +49,10 @@ questions do not become invariants by implication.
 > controls and grants. Superseded revisions survive only when explicitly
 > retained or pinned.
 
-Current implementation status: archive rows, provenance, and attachment blobs
-use peer-held repair proofs. `memory.canonical` still uses the older event and
-purge-certificate adapter, so simultaneous relay and `state.db` loss can lose
-its portable deletion evidence. This is tracked protocol debt to remove, not a
-permanent exception to the invariant.
+Current implementation status: archive rows, provenance, attachment blobs, and
+personal-memory canonicals use peer-held repair proofs. Memory tombstones are
+self-contained semantic descendants retained with the current object state;
+they do not depend on relay or `state.db` history.
 
 > Any currently authorized holder of an object may repair its relay replica
 > using the original author's signed proof. The repairing peer never needs and

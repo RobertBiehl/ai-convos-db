@@ -148,25 +148,16 @@ The relay sees ciphertext and envelope metadata, not memory text or absolute
 checkout paths. Preserve the recovery key and continue taking private
 `convos memory backup` snapshots: the remote synchronizes canonical state, not
 native Codex/Claude files, hooks, or the complete device-local ledger.
-Large canonical records are encrypted in bounded parts and reassembled locally,
-so they continue through background sync without opting unrelated large remote
-records into eager download.
+Each canonical is one signed object and one encrypted row replica, subject to
+the relay's 48 MiB row-replica ceiling.
 
-Forgetting a user-owned canonical publishes an encrypted tombstone, then
-removes that device author's prior canonical events from the personal relay.
-The author signs a compact purge certificate for each removed event. Recipients
-verify its exact original envelope header and retained signed deletion event
-before accepting the sequence slot or removing synchronization metadata. This
-is automatic and adds no confirmation or recovery-key step to normal use.
-Locally revised, projected, or provider-backed state is retained. Relay and
-client backups created before the forget operation are not rewritten and must
-be expired separately when historical deletion is required.
-
-A purge certificate proves author authorization and prevents protocol replay;
-it does not prove destruction of relay backups, filesystem snapshots, storage
-remapping, or a dishonest relay's private copy. The live relay enables SQLite
-secure deletion, while operators remain responsible for WAL checkpointing,
-compaction, and backup retention appropriate to their deletion policy.
+Forgetting a user-owned canonical publishes a root-signed bodyless descendant
+containing the complete known ancestry. Recipients accept it only after proof
+verification, and it defeats stale active ancestors without relay-specific
+deletion infrastructure. Locally revised, projected, or provider-backed state
+is retained. Any authorized holder can repair the tombstone on a replacement
+relay, but it cannot erase historical plaintext or ciphertext already retained
+by a peer, relay operator, filesystem snapshot, or backup.
 
 ## Team workspaces
 
@@ -309,9 +300,8 @@ events, and last successful synchronization.
 
 Relay backups are optional recovery acceleration and preservation of the old
 workspace authority, not canonical archive backups. Surviving authorized peers
-can rebuild current rows, proofs, and blobs on a fresh relay. Until the memory
-semantic-proof cutover, a backup is still required to preserve the exact legacy
-memory event and purge ledger across total relay loss.
+can rebuild current rows, proofs, memory objects, tombstones, and blobs on a
+fresh relay.
 
 Back up a consistent server snapshot while it is running:
 
@@ -330,9 +320,9 @@ an already-bound auxiliary-event prefix; without gossip, a newest suffix after
 the latest signed boundary can still be withheld.
 
 A backup taken before a memory forget operation still contains the older
-encrypted events and predates their signed purge certificates. Treat relay-backup
-retention as part of the deletion policy; restoring such a backup can make that
-historical ciphertext available to newly recovered clients again.
+encrypted active replica. Treat relay-backup retention as part of the deletion
+policy; restoring such a backup without a surviving tombstone can make that
+historical object current again.
 
 If the relay itself is lost, a surviving device can establish fresh relay
 credentials without changing its signing identity, then explicitly re-found a

@@ -38,9 +38,8 @@ provider transcripts -> canonical convos DuckDB -> proof/replica encoder -> encr
   format.
 - Changegraph is a read-only typed view over DuckDB; there is no second graph
   database.
-- Logical-row origin proofs are durable peer-held evidence. Workspace controls
-  and the current memory adapter still use signed events; memory purge
-  certificates are transitional relay-held evidence.
+- Logical-row and personal-memory origin proofs are durable peer-held evidence.
+  Workspace controls remain signed events.
 - The server stores ciphertext, public device records, workspace ACLs, key
   envelopes, opaque event headers, cursors, invitation state, and quotas.
 - The server accelerates delivery and recovery but is not canonical archive
@@ -122,20 +121,11 @@ a possible later key-management profile, not a v1 dependency.
 ```
 
 The signature covers every field except `signature`; the event id covers the
-body before `id` and `signature` are added. Unknown kinds and payload versions
-are retained and forwarded even when the local projector cannot interpret
-them. Client dispatch is exact on `(kind, payload_v)`: unknown core semantics
-block publication, while only explicitly receiver-known auxiliary families may
-defer without blocking the core archive when their product is absent; an
-installed but outdated product blocks publication. Events are never edited.
-Corrections, identity links, retractions, key changes, and tombstones are new
-events. The sole deletion exception is an
-author-bound purge of superseded `memory.canonical` events from a personal
-workspace after its signed tombstone is durable. The author signs one
-`event.purge` certificate per removed event over version, workspace, original
-event ID, author, epoch, sequence, exact parents, fixed event kind/payload
-version, and the retained later deletion-event ID. Team events cannot use this
-operation.
+body before `id` and `signature` are added. Client dispatch is exact on
+`(kind, payload_v)`: unknown event semantics block readiness until upgraded.
+Events are never edited. Corrections, key changes, and control updates are new
+events. Semantic archive and personal-memory objects use the independent proof
+format below rather than this event chain.
 
 Required initial semantic kinds:
 
@@ -149,6 +139,15 @@ proofs. Workspace policy and membership remain signed events. Provenance facts
 carry semantic references, not copied content: edit identity is
 `file_edits.id`, changeset identity is the existing message/turn, and prompt
 text is resolved from `messages` after projection.
+
+Personal-memory canonicals carry user-root-signed semantic proofs. Each proof
+binds object kind and ID, encoding version, content hash, active/deleted state,
+author user and device, personal workspace, authorization epoch, direct
+predecessor, and the complete ancestor-revision set. The proof is independent
+of delivery encryption and can be retained or re-uploaded by any authorized
+holder without the author's private key. Only the author root can sign a new
+revision. A deleted revision has no semantic body and defeats all ancestors
+named in its proof.
 
 ## Envelopes and idempotency
 
@@ -173,19 +172,13 @@ order where no causal relationship exists. Per-workspace, per-device `seq` and
 previous-event parents detect replay and interior gaps in either arrival order;
 clocks never establish causality.
 
-For personal-memory privacy deletion, a device may purge only explicit event
-ids that it authored and only after publishing the corresponding memory
-tombstone. The relay verifies each author signature, exact stored envelope
-header, later same-author anchor, and personal scope before atomically storing
-certificates and deleting live ciphertext.
-Clients verify the historical device key and signed deletion anchor before
-changing sequence or receipt state. Missing or invalid proof blocks readiness.
-Purge is idempotent, and stored proofs prevent event-ID or author-sequence reuse.
-Recipients remove an
-unchanged remote-only memory and its revisions; a locally changed memory or one
-with another provider origin or active projection survives, with the deleted
-remote origin redacted to hash and link metadata. This preserves conflicts
-instead of treating deletion as last-writer-wins.
+For personal-memory deletion, the author publishes a bodyless signed semantic
+descendant. Recipients verify its root signature and ancestry, then remove an
+unchanged remote-only memory and its local revisions. A locally changed memory
+or one with another provider origin or active projection survives, with the
+remote origin marked missing. The relay retains opaque replicas and need not
+understand deletion. Existing peers and backups may retain older ciphertext;
+the tombstone governs convergent current state rather than proving erasure.
 
 Large auxiliary event bodies use encrypted lazy events. Personal attachments
 use independently repairable, content-addressed blob replicas capped at 32 MiB;
@@ -281,9 +274,8 @@ CLI.
 - Hooks enqueue only local identifiers and return without network or Git work.
 - Background workers scan, enrich, encrypt, upload, pull, verify, and project.
 - Retrieval never waits for the network.
-- Explicit sync inventories retained row proofs and blobs against the relay;
-  auxiliary controls and memory records still reconcile through the event
-  ledger.
+- Explicit sync inventories retained row proofs, memory semantic proofs, and
+  blobs against the relay; controls reconcile through the event ledger.
 - Server database and blob directory may be backed up together from a
   consistent snapshot for fast restoration, but are not canonical row
   authority.

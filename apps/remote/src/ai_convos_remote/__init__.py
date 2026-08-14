@@ -10,9 +10,9 @@ _pending=[]
 def register(app): _pending.append(app) if "remote" not in globals() else app.add_typer(remote,name="remote")
 from ai_convos.cli import PROJECT_ROOT, archive_changes as core_archive_changes, archive_state as core_archive_state, drain_hooks, durable_replace, init_schema, install_hooks, open_db, project_attachment_body, project_workspace_controls
 from .control import CONTROL_V, approved, electorate, proposal as device_proposal, record as control_record, sign as control_sign, state_hash, verify_proposal, verify_state, vote as device_vote
-from .projection import SIGNED, TABLES, apply_row_replicas, attest_rows, blob_replicas, bridge_purges, bridge_records, connect, control_chain, cutover_state, event_support, inspect_state, project, project_many, query as graph_query, read_state, relocate_attachments, reset_history, row_replicas, scan, sequence, stored_controls, verify_history
-from .protocol import (b64, certificate, digest, event, fingerprint, identity, open_blob, open_event, open_key, open_origin, open_replica, public, public_id, purge_certificate, recover,
-                       recovery_bundle, registration_proof, seal_event, seal_key, seal_origin, seal_replica, sign_control, signer, unb64, verify_certificate, verify_purge)
+from .projection import SIGNED, TABLES, apply_row_replicas, attest_rows, blob_replicas, bridge_replicas, bridge_stamp, connect, control_chain, cutover_state, event_support, inspect_state, project, project_many, query as graph_query, read_state, relocate_attachments, reset_history, row_replicas, scan, sequence, stored_controls, verify_history
+from .protocol import (b64, certificate, digest, event, fingerprint, identity, open_blob, open_event, open_key, open_origin, open_replica, public, public_id, recover,
+                       recovery_bundle, registration_proof, seal_event, seal_key, seal_origin, seal_replica, sign_control, signer, unb64, verify_certificate)
 from .service import edit_hooks, enable
 
 remote=typer.Typer(help="End-to-end encrypted personal and team synchronization")
@@ -243,19 +243,6 @@ def upload_blobs(cfg,state,root,workspaces):
         path=Path(row["path"]); env=json.loads(path.read_text())
         if path.is_symlink() or (env["workspace"],env["blob"],env["epoch"],env["uploader"])!=(row["workspace"],row["blob"],row["epoch"],row["uploader"]): raise ValueError("invalid blob outbox")
         ack=request(cfg,{"op":"blob_upload","envelope":env}); state.execute("INSERT OR REPLACE INTO blob_receipts VALUES (?,?,?,?)",(row["workspace"],row["blob"],row["epoch"],ack["cursor"])); state.execute("DELETE FROM blob_outbox WHERE workspace=? AND blob=? AND epoch=? AND uploader=?",(row["workspace"],row["blob"],row["epoch"],row["uploader"])); state.commit(); path.unlink(missing_ok=True)
-def drop_event(state,ws,event):
-    state.execute("DELETE FROM publication_heads WHERE workspace=? AND event=?",(ws,event)); state.execute("DELETE FROM receipts WHERE workspace=? AND event=?",(ws,event)); state.execute("DELETE FROM lazy_events WHERE workspace=? AND event=?",(ws,event)); state.execute("DELETE FROM deferred_events WHERE workspace=? AND event=?",(ws,event))
-def purge_events(cfg,state,ws,intents):
-    if cfg["workspaces"][ws]["kind"]!="personal": raise ValueError("event purge requires a personal workspace")
-    certificates=[]
-    for intent in intents:
-        target=state.execute("SELECT * FROM receipts WHERE workspace=? AND event=?",(ws,intent["event"])).fetchone(); anchor=state.execute("SELECT * FROM receipts WHERE workspace=? AND event=?",(ws,intent["superseded_by"])).fetchone(); head=anchor and state.execute("SELECT event FROM publication_heads WHERE workspace=? AND owner=? AND entity=?",(ws,cfg["user"],anchor["entity"])).fetchone()
-        if not target or not anchor or (target["author"],target["kind"],target["payload_v"],target["status"])!=(cfg["device"]["id"],"memory.canonical",1,"active") or (anchor["author"],anchor["kind"],anchor["payload_v"],anchor["status"])!=(target["author"],"memory.canonical",1,"deleted") or anchor["seq"]<=target["seq"] or target["entity"].rsplit(":part:",1)[0]!=anchor["entity"] or not head or head[0]!=anchor["event"]: raise ValueError("invalid purge intent")
-        previous=state.execute("SELECT event FROM event_sequences WHERE workspace=? AND author=? AND seq=?",(ws,target["author"],target["seq"]-1)).fetchone() if target["seq"]>1 else None
-        if target["seq"]>1 and not previous: raise ValueError("purge target parent is unavailable")
-        certificates.append(purge_certificate(cfg["device"],ws,target,[previous[0]] if previous else [],anchor))
-    for i in range(0,len(certificates),500):
-        batch=certificates[i:i+500]; request(cfg,{"op":"purge","workspace":ws,"certificates":batch}); [drop_event(state,ws,value["event"]) for value in batch]; state.commit()
 def pull_origins(cfg,state,root,ws):
     sid=ws["id"]; values=request(cfg,{"op":"origin_pull","workspace":sid})["origins"]
     if not values: return {r[0] for r in state.execute("SELECT origin FROM origin_bindings WHERE workspace=?",(sid,)).fetchall()}
@@ -269,24 +256,26 @@ def pull_origins(cfg,state,root,ws):
     except BaseException: core.execute("ROLLBACK"); state.rollback(); raise
     finally: core.close()
 def pull_row_replicas(cfg,state,root,ws,recover=None,origins=()):
-    sid=ws["id"]; after=int((state.execute("SELECT value FROM meta WHERE key=?",(f"replica_cursor:{sid}",)).fetchone() or [0])[0]); cursor,total=after,0; dependencies={r[0] for r in state.execute("SELECT origin FROM control_dependencies WHERE workspace=?",(sid,)).fetchall()}; controls=ws["controls"]+stored_controls(core_path(root),set(origins)|dependencies); known={(r[0],r[1]) for r in state.execute("SELECT replica,epoch FROM replica_receipts WHERE workspace=?",(sid,)).fetchall()}; checked=recover is None or not known; bodies=[]; received=[]; core=None
-    try:
-        while True:
-            result=request(cfg,{"op":"replica_pull","workspace":sid,"after":cursor,"limit":500}); floor,tail=result["floor"],result["tail"]
-            if not all(isinstance(v,int) and not isinstance(v,bool) and v>=0 for v in (floor,tail)) or floor>tail and tail: raise ValueError("relay replica cursor window is invalid")
-            if cursor>tail: cursor=after=0; state.execute("DELETE FROM meta WHERE key=?",(f"replica_cursor:{sid}",)); state.execute("INSERT OR REPLACE INTO meta VALUES (?,?)",(f"replica_repair:{sid}","1")); state.commit(); continue
-            if result["replicas"] and core is None: core=open_db(core_path(root)); init_schema(core)
-            if not checked and result["replicas"]:
-                fields=("workspace","authorization_workspace","row_kind","row_id","encoding_v","content_hash","revision","previous_revision","state","author_user_id","author_device_id","authorization_epoch","signature"); proofs=[{"v":1,"kind":"row.proof",**dict(zip(fields,r))} for r in core.execute("SELECT workspace_id,authorization_workspace_id,row_kind,source_row_id,encoding_v,content_hash,revision,previous_revision,state,author_user_id,author_device_id,authorization_epoch,signature FROM remote.row_proofs").fetchall()]; epochs={r[1] for r in known}; retained={(fingerprint(key(cfg,sid,epoch),digest(proof)),epoch) for proof in proofs for epoch in epochs}; known&=retained; checked=True
-            for item in result["replicas"]:
-                env=item["envelope"]
-                if not isinstance(item["cursor"],int) or isinstance(item["cursor"],bool) or not cursor<item["cursor"]<=tail or env["workspace"]!=sid or not access_from(cfg,sid)<=env["epoch"]<=cfg["controls"][sid]["epoch"]: raise ValueError("row replica envelope response mismatch")
-                cursor=item["cursor"]; received.append(item)
-                if (env["replica"],env["epoch"]) not in known: bodies.append(open_replica(env,key(cfg,sid,env["epoch"])))
-            if received: apply_row_replicas(core_path(root),bodies,sid,controls,recover,cfg["user"],core); [(state.execute("INSERT OR REPLACE INTO replica_receipts VALUES (?,?,?,?)",(sid,item["envelope"]["replica"],item["envelope"]["epoch"],item["cursor"]))) for item in received]; after=cursor; total+=len(received); state.execute("INSERT OR REPLACE INTO meta VALUES (?,?)",(f"replica_cursor:{sid}",str(after))); state.commit(); bodies=[]; received=[]
-            if cursor>=tail: return total
-            if not result["replicas"]: raise ValueError("relay replica tail cannot be reached")
-    finally: core and core.close()
+    sid=ws["id"]; stamp=bridge_stamp(root); saved=(state.execute("SELECT value FROM meta WHERE key=?",(f"replica_projection:{sid}",)).fetchone() or [None])[0]; reset=saved!=stamp; after=0 if reset else int((state.execute("SELECT value FROM meta WHERE key=?",(f"replica_cursor:{sid}",)).fetchone() or [0])[0]); cursor,total=after,0; dependencies={r[0] for r in state.execute("SELECT origin FROM control_dependencies WHERE workspace=?",(sid,)).fetchall()}; controls=ws["controls"]+stored_controls(core_path(root),set(origins)|dependencies); known=set() if reset else {(r[0],r[1]) for r in state.execute("SELECT replica,epoch FROM replica_receipts WHERE workspace=?",(sid,)).fetchall()}; checked=recover is None or not known
+    while True:
+        result=request(cfg,{"op":"replica_pull","workspace":sid,"after":cursor,"limit":500}); floor,tail=result["floor"],result["tail"]
+        if not all(isinstance(v,int) and not isinstance(v,bool) and v>=0 for v in (floor,tail)) or floor>tail and tail: raise ValueError("relay replica cursor window is invalid")
+        if cursor>tail: cursor=after=0; known=set(); state.execute("DELETE FROM meta WHERE key=?",(f"replica_cursor:{sid}",)); state.execute("INSERT OR REPLACE INTO meta VALUES (?,?)",(f"replica_repair:{sid}","1")); state.commit(); continue
+        if not checked and result["replicas"]:
+            fields=("workspace","authorization_workspace","row_kind","row_id","encoding_v","content_hash","revision","previous_revision","state","author_user_id","author_device_id","authorization_epoch","signature"); core=open_db(core_path(root),True); proofs=[{"v":1,"kind":"row.proof",**dict(zip(fields,r))} for r in core.execute("SELECT workspace_id,authorization_workspace_id,row_kind,source_row_id,encoding_v,content_hash,revision,previous_revision,state,author_user_id,author_device_id,authorization_epoch,signature FROM remote.row_proofs").fetchall()]; core.close(); epochs={r[1] for r in known}; known&={(fingerprint(key(cfg,sid,epoch),digest(proof)),epoch) for proof in proofs for epoch in epochs}; checked=True
+        opened=[]; received=[]
+        for item in result["replicas"]:
+            env=item["envelope"]
+            if not isinstance(item["cursor"],int) or isinstance(item["cursor"],bool) or not cursor<item["cursor"]<=tail or env["workspace"]!=sid or not access_from(cfg,sid)<=env["epoch"]<=cfg["controls"][sid]["epoch"]: raise ValueError("row replica envelope response mismatch")
+            cursor=item["cursor"]; received.append(item)
+            if (env["replica"],env["epoch"]) not in known: opened.append((item,open_replica(env,key(cfg,sid,env["epoch"]))))
+        accepted=apply_row_replicas(core_path(root),[body for item,body in opened],sid,controls,recover,cfg["user"],root=root); accepted_keys={(item["envelope"]["replica"],item["envelope"]["epoch"]) for (item,body),ok in zip(opened,accepted) if body["proof"]["kind"]=="row.proof" or ok}
+        for item in received:
+            env=item["envelope"]
+            if (env["replica"],env["epoch"]) in known|accepted_keys: state.execute("INSERT OR REPLACE INTO replica_receipts VALUES (?,?,?,?)",(sid,env["replica"],env["epoch"],item["cursor"]))
+        after=cursor; total+=len(received); state.execute("INSERT OR REPLACE INTO meta VALUES (?,?),(?,?)",(f"replica_cursor:{sid}",str(after),f"replica_projection:{sid}",stamp)); state.commit()
+        if cursor>=tail: return total
+        if not result["replicas"]: raise ValueError("relay replica tail cannot be reached")
 def pull_blobs(cfg,state,root,ws,recover=None):
     sid=ws["id"]; after=int((state.execute("SELECT value FROM meta WHERE key=?",(f"blob_cursor:{sid}",)).fetchone() or [0])[0]); total=0; known={(r[0],r[1]) for r in state.execute("SELECT blob,epoch FROM blob_receipts WHERE workspace=?",(sid,)).fetchall()}; checked=recover is None or not known
     while True:
@@ -321,13 +310,7 @@ def pull(cfg,state,root=None):
                 result=request(cfg,{"op":"pull","workspace":sid,"after":after,"limit":500}); floor,tail=result["floor"],result["tail"]
                 if not all(isinstance(v,int) and not isinstance(v,bool) and v>=0 for v in (floor,tail)) or floor>tail and tail or after>tail: raise ValueError("relay cursor window is invalid")
                 incoming=[]
-                for item in sorted(result["events"],key=lambda value:"purge" in value):
-                    if cert:=item.get("purge"):
-                        verify_purge(cert,signer(devices,cert["author"])); support=event_support({"kind":cert["event_kind"],"payload_v":cert["payload_v"]}); anchor=state.execute("SELECT * FROM receipts WHERE workspace=? AND event=?",(sid,cert["superseded_by"])).fetchone(); target=state.execute("SELECT * FROM receipts WHERE workspace=? AND event=?",(sid,cert["event"])).fetchone()
-                        if cert["workspace"]!=sid or ws["kind"]!="personal" or support=="required" or not anchor or (anchor["author"],anchor["kind"],anchor["payload_v"],anchor["status"])!=(cert["author"],"memory.canonical",1,"deleted") or anchor["seq"]<=cert["seq"] or target and ((target["author"],target["epoch"],target["seq"],target["kind"],target["payload_v"],target["status"])!=(cert["author"],cert["epoch"],cert["seq"],cert["event_kind"],cert["payload_v"],"active") or target["entity"].rsplit(":part:",1)[0]!=anchor["entity"]): raise ValueError("invalid purge certificate")
-                        sequence(state,sid,{"id":cert["event"],"author":cert["author"],"seq":cert["seq"],"parents":cert["parents"]}); drop_event(state,sid,cert["event"])
-                        if cert["author"]==cfg["device"]["id"] and cert["seq"]>=int((state.execute("SELECT value FROM meta WHERE key=?",(f"seq:{sid}",)).fetchone() or ["0"])[0]): state.execute("INSERT OR REPLACE INTO meta VALUES (?,?),(?,?)",(f"seq:{sid}",str(cert["seq"]),f"prev:{sid}",cert["event"]))
-                        after=max(after,item["cursor"]); continue
+                for item in result["events"]:
                     env=request(cfg,{"op":"fetch","workspace":sid,"event":item["event"]})["envelope"] if item.get("lazy") else item["envelope"]
                     if (env["workspace"],env["event"])!=(sid,item.get("event",env["event"])) or not access_from(cfg,sid)<=env["epoch"]<=cfg["controls"][sid]["epoch"]: raise ValueError("event envelope response mismatch")
                     value=open_event(env,key(cfg,sid,env["epoch"]),signer(devices,env["author"])); support=event_support(value); sequence(state,sid,value); receipt(state,sid,value,item["cursor"],env["epoch"])
@@ -371,11 +354,13 @@ def sync_once(root=None,force=False):
                     pol=state.execute("SELECT kind,value FROM policies WHERE workspace=?",(ws,)).fetchall(); repos=[p[1] for p in pol if p[0]=="repository"]; roots=[cfg.get("bindings",{}).get(f"{ws}:{p[1]}") for p in pol if p[0]=="path" and cfg.get("bindings",{}).get(f"{ws}:{p[1]}")]; changes=None if prior is None or state.execute("SELECT 1 FROM meta WHERE key=?",(f"replica_repair:{ws}",)).fetchone() else set(core_archive_changes(core,int(prior[0]))[1]); scope=set(); records=scan(core,state,meta["kind"],repos,roots,changes,ws,scope); records=protect_all(records,root,ws) if meta["kind"]=="team" else records; batches.append((ws,records,scope,prior is None))
                 core.close()
                 for ws,records,scope,initial in batches:
-                    bindings={r[0]:r[1] for r in state.execute("SELECT origin,epoch FROM origin_bindings WHERE workspace=?",(ws,)).fetchall()}; origins=set(bindings); repair=initial or bool(state.execute("SELECT 1 FROM meta WHERE key=?",(f"replica_repair:{ws}",)).fetchone()); attest_rows(path,cfg,ws,records,origins); keys={epoch:key(cfg,ws,epoch) for epoch in range(access_from(cfg,ws),cfg["workspaces"][ws]["epoch"]+1) if f"{ws}:{epoch}" in cfg["keys"]}; known={r[0] for r in state.execute("SELECT replica FROM replica_receipts WHERE workspace=?",(ws,)).fetchall()}; [reconcile_replicas(cfg,state,root,ws,row_replicas(path,cfg,ws,records[i:i+5000],keys,known,origins,bindings,lambda ids:replica_inventory(cfg,state,ws,ids),repair and i==0)) for i in range(0,max(len(records),1),5000)]; known_blobs={r[0] for r in state.execute("SELECT blob FROM blob_receipts WHERE workspace=? UNION SELECT blob FROM blob_outbox WHERE workspace=?",(ws,ws)).fetchall()}; reconcile_blobs(cfg,state,root,ws,blob_replicas(path,cfg,ws,records,keys,known_blobs,origins,bindings,repair)); heads={r[0]:r[1] for r in state.execute("SELECT entity,revision FROM publication_heads WHERE workspace=? AND owner=?",(ws,cfg["user"])).fetchall()}; [publish(cfg,state,ws,r,root,True,heads) for r in records if r["kind"] not in SIGNED]; state.execute("DELETE FROM meta WHERE key=?",(f"replica_repair:{ws}",)); state.execute("DELETE FROM team_scopes WHERE workspace=?",(ws,)); state.executemany("INSERT INTO team_scopes VALUES (?,?)",[(ws,c) for c in scope])
+                    bindings={r[0]:r[1] for r in state.execute("SELECT origin,epoch FROM origin_bindings WHERE workspace=?",(ws,)).fetchall()}; origins=set(bindings); repair=initial or bool(state.execute("SELECT 1 FROM meta WHERE key=?",(f"replica_repair:{ws}",)).fetchone()); attest_rows(path,cfg,ws,records,origins); keys={epoch:key(cfg,ws,epoch) for epoch in range(access_from(cfg,ws),cfg["workspaces"][ws]["epoch"]+1) if f"{ws}:{epoch}" in cfg["keys"]}; known={r[0] for r in state.execute("SELECT replica FROM replica_receipts WHERE workspace=?",(ws,)).fetchall()}; [reconcile_replicas(cfg,state,root,ws,row_replicas(path,cfg,ws,records[i:i+5000],keys,known,origins,bindings,lambda ids:replica_inventory(cfg,state,ws,ids),repair and i==0)) for i in range(0,max(len(records),1),5000)]; known_blobs={r[0] for r in state.execute("SELECT blob FROM blob_receipts WHERE workspace=? UNION SELECT blob FROM blob_outbox WHERE workspace=?",(ws,ws)).fetchall()}; reconcile_blobs(cfg,state,root,ws,blob_replicas(path,cfg,ws,records,keys,known_blobs,origins,bindings,repair)); heads={r[0]:r[1] for r in state.execute("SELECT entity,revision FROM publication_heads WHERE workspace=? AND owner=?",(ws,cfg["user"])).fetchall()}; [publish(cfg,state,ws,r,root,True,heads) for r in records if r["kind"] not in SIGNED]; state.execute("DELETE FROM team_scopes WHERE workspace=?",(ws,)); state.executemany("INSERT INTO team_scopes VALUES (?,?)",[(ws,c) for c in scope])
                 [state.execute("INSERT OR REPLACE INTO meta VALUES (?,?)",(f"core_generation:{ws}",str(generation))) for ws,meta,prior in scans]
-            [publish(cfg,state,ws,r,root,True,heads) for ws,meta in cfg["workspaces"].items() if ws in ready and ws in active and meta["kind"]=="personal" and f"{ws}:{meta['epoch']}" in cfg["keys"] for heads in [{r[0]:r[1] for r in state.execute("SELECT entity,revision FROM publication_heads WHERE workspace=? AND owner=?",(ws,cfg["user"])).fetchall()}] for r in bridge_records(root,state,ws,meta["kind"])]; state.commit(); upload(cfg,state,root,ready)
             for ws,meta in cfg["workspaces"].items():
-                if ws in ready and ws in active and meta["kind"]=="personal": purge_events(cfg,state,ws,bridge_purges(root,state,ws,meta["kind"]))
+                if ws in ready and ws in active and meta["kind"]=="personal" and f"{ws}:{meta['epoch']}" in cfg["keys"]:
+                    known={r[0] for r in state.execute("SELECT replica FROM replica_receipts WHERE workspace=?",(ws,)).fetchall()}; repair=bool(state.execute("SELECT 1 FROM meta WHERE key=?",(f"replica_repair:{ws}",)).fetchone()); reconcile_replicas(cfg,state,root,ws,bridge_replicas(root,cfg,ws,meta["kind"],key(cfg,ws,meta["epoch"]),known,lambda ids:replica_inventory(cfg,state,ws,ids) if repair else set(known)))
+            [state.execute("DELETE FROM meta WHERE key=?",(f"replica_repair:{ws}",)) for ws in ready&active]
+            state.commit(); upload(cfg,state,root,ready)
             pull(cfg,state,root); remember_archive(cfg,state,root); state.execute("INSERT OR REPLACE INTO meta VALUES ('last_sync',?)",(str(time.time()),)); state.commit()
         finally: state.close()
         return cutover

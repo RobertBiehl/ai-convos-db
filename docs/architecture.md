@@ -31,26 +31,21 @@ captured activity without a browser or generation model.
 The memory product separates device-local checkout paths from repository scope:
 normalized origin evidence identifies clones and worktrees, root commits provide
 a fallback lineage anchor, and differing fork origins remain isolated.
-When both optional clients are installed, an entry-point adapter maps canonical
-memory revisions onto signed encrypted personal-workspace events. Incoming
-events remain normal revisioned sources in the memory ledger, so deterministic
-one-sided advances converge while concurrent semantic changes use the existing
-plan/resolve/apply path. Team workspaces never receive memory events.
-The adapter partitions large UTF-8 canonical content into independently signed
-encrypted records below the relay's lazy threshold and publishes no partial
-local canonical until hash-verified reassembly completes.
+When both optional clients are installed, an entry-point adapter maps current
+canonical memory revisions onto user-root-signed semantic objects carried by
+ordinary encrypted personal-workspace row replicas. Incoming objects remain
+normal revisioned sources in the memory ledger, so deterministic one-sided
+advances converge while concurrent semantic changes use the existing
+plan/resolve/apply path. Team workspaces never receive memory objects.
 Exact archive evidence belongs to the device-local memory ledger and one
 canonical revision hash. It stores only archive identity and content hashes,
 renders direct local read pivots, and is omitted from remote canonical events.
-After a user-owned forget tombstone is durably uploaded, the adapter asks the
-relay to remove only the same device author's prior personal canonical event
-IDs. The relay keeps an opaque replay-denial tombstone; recipients erase their
-decrypted event copies and purge a canonical only when it remains remote-only
-and unchanged.
-This event/purge adapter is transitional. Unlike archive row proofs, its
-deletion evidence cannot yet be rebuilt from surviving semantic replicas after
-simultaneous relay and remote-state loss; the normative target is documented in
-[Product invariants](invariants.md).
+After a user-owned forget, the adapter retains a signed bodyless descendant
+whose complete ancestry defeats every known active revision. Any holder may
+repair that proof on a replacement relay without the author's private key;
+recipients purge a canonical only when it remains remote-only and unchanged.
+Old ciphertext already retained by a peer, relay backup, or operator is not
+cryptographically erased by this semantic tombstone.
 
 ```
 ┌─────────────────┐     ┌─────────────────┐     ┌─────────────────┐

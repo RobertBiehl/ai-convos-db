@@ -15,6 +15,7 @@ ROW_FIELDS_V1={"conversations":("source","title","created_at","updated_at","mode
 PROVENANCE_FIELDS_V1={"repository.observed":("lineage","roots","remotes"),"file.observed":("repository","path","kind"),"file.version":("file","content_hash","observed_at"),"edit.observed":("turn","file","repository","old_content_hash","new_content_hash","evidence"),"git.checkpoint":("repository","head","state_hash","paths","observed_at","capture_source"),"checkpoint.link":("checkpoint","edit","evidence")}; SEMANTIC_FIELDS_V1=ROW_FIELDS_V1|PROVENANCE_FIELDS_V1
 ROW_JSON_V1={"metadata","input","output"}; ROW_TIME_V1={"created_at","updated_at"}
 ROW_PROOF_FIELDS={"v","kind","workspace","authorization_workspace","row_kind","row_id","encoding_v","content_hash","revision","previous_revision","state","author_user_id","author_device_id","authorization_epoch","signature"}
+SEMANTIC_PROOF_FIELDS={"v","kind","workspace","object_kind","object_id","encoding_v","content_hash","revision","previous_revision","ancestors","state","author_user_id","author_device_id","authorization_epoch","root_public","signature"}
 def canon(v): return json.dumps(v, sort_keys=True, separators=(",", ":"), ensure_ascii=True, allow_nan=False).encode()
 def b64(v): return base64.urlsafe_b64encode(v).decode().rstrip("=")
 def unb64(v): return base64.urlsafe_b64decode(v + "=" * (-len(v) % 4))
@@ -67,6 +68,17 @@ def verify_row_proof(value,row,cert,root_public):
         _pub(Ed25519PublicKey,device["sign_public"]).verify(unb64(value["signature"]),canon(signed)); return value
     except (InvalidSignature,KeyError,TypeError,ValueError) as e: raise ValueError("invalid row proof") from e
 
+def semantic_proof(root,user,device,workspace,epoch,row,previous=None):
+    parents=[] if previous is None else previous if isinstance(previous,list) else [previous]; ancestors=[] if not parents else [parents[0]["revision"],*sorted({a for p in parents for a in [p["revision"],*p["ancestors"]]}-{parents[0]["revision"]})]; claim={"object_kind":row["kind"],"object_id":row["id"],"encoding_v":row["v"],"content_hash":digest(row),"previous_revision":ancestors[0] if ancestors else None,"ancestors":ancestors,"state":row["state"]}; body={"v":1,"kind":"semantic.proof","workspace":workspace,**claim,"revision":digest({"v":1,**claim}),"author_user_id":user,"author_device_id":device,"authorization_epoch":epoch,"root_public":root["sign_public"]}; body["signature"]=b64(_priv(Ed25519PrivateKey,root["sign_private"]).sign(canon(body))); return body
+
+def verify_semantic_proof(value,row,user):
+    try:
+        claim={k:value[k] for k in ("object_kind","object_id","encoding_v","content_hash","previous_revision","ancestors","state")}; previous,ancestors=value["previous_revision"],value["ancestors"]
+        if set(row)!={"v","kind","id","state","data"} or row["v"]!=1 or not isinstance(row["kind"],str) or not isinstance(row["id"],str) or not row["id"] or row["state"] not in ("active","deleted") or row["state"]=="active" and not isinstance(row["data"],dict) or row["state"]=="deleted" and row["data"] is not None: raise ValueError
+        if set(value)!=SEMANTIC_PROOF_FIELDS or value["v"]!=1 or value["kind"]!="semantic.proof" or value["author_user_id"]!=user or public_id(value["root_public"])!=user or not isinstance(value["author_device_id"],str) or len(value["author_device_id"])!=32 or (value["object_kind"],value["object_id"],value["encoding_v"],value["content_hash"],value["state"])!=(row["kind"],row["id"],row["v"],digest(row),row["state"]) or value["revision"]!=digest({"v":1,**claim}) or not isinstance(ancestors,list) or len(ancestors)!=len(set(ancestors)) or any(not isinstance(a,str) or len(a)!=64 or any(c not in "0123456789abcdef" for c in a) for a in ancestors) or previous!=(ancestors[0] if ancestors else None) or value["revision"] in ancestors or not isinstance(value["authorization_epoch"],int) or isinstance(value["authorization_epoch"],bool) or value["authorization_epoch"]<1: raise ValueError
+        _pub(Ed25519PublicKey,value["root_public"]).verify(unb64(value["signature"]),canon({k:v for k,v in value.items() if k!="signature"})); return value
+    except (InvalidSignature,KeyError,TypeError,ValueError) as e: raise ValueError("invalid semantic proof") from e
+
 def event(device, seq, kind, entity, payload, parents=(), observed_at=None, payload_v=1):
     body = dict(v=V, kind=kind, entity=entity, revision=digest(payload), author=device["id"], seq=seq, parents=list(parents), observed_at=observed_at or now(), payload_v=payload_v, payload=payload)
     body["id"] = digest(body); body["signature"] = b64(_priv(Ed25519PrivateKey, device["sign_private"]).sign(canon(body)))
@@ -77,14 +89,6 @@ def verify_event(value, sign_public):
     sig, signed = unb64(value["signature"]), {k:v for k,v in value.items() if k != "signature"}; _pub(Ed25519PublicKey, sign_public).verify(sig, canon(signed))
     body = {k:v for k,v in signed.items() if k != "id"}
     if digest(body) != value["id"] or digest(value["payload"]) != value["revision"]: raise ValueError("Invalid event digest")
-    return value
-PURGE_FIELDS={"v","kind","workspace","event","author","epoch","seq","parents","event_kind","payload_v","superseded_by","signature"}
-def purge_certificate(device,workspace,target,parents,anchor):
-    body=dict(v=V,kind="event.purge",workspace=workspace,event=target["event"],author=target["author"],epoch=target["epoch"],seq=target["seq"],parents=list(parents),event_kind=target["kind"],payload_v=target["payload_v"],superseded_by=anchor["event"]); body["signature"]=b64(_priv(Ed25519PrivateKey,device["sign_private"]).sign(canon(body))); return body
-def verify_purge(value,sign_public):
-    if set(value)!=PURGE_FIELDS or value["v"]!=V or value["kind"]!="event.purge" or value["event_kind"]!="memory.canonical" or value["payload_v"]!=1 or not isinstance(value["workspace"],str) or not isinstance(value["author"],str) or len(value["author"])!=32 or any(not isinstance(value[k],str) or len(value[k])!=64 for k in ("event","superseded_by")) or any(not isinstance(value[k],int) or isinstance(value[k],bool) or value[k]<1 for k in ("epoch","seq")) or not isinstance(value["parents"],list) or len(value["parents"])!=(value["seq"]>1) or any(not isinstance(p,str) or len(p)!=64 for p in value["parents"]): raise ValueError("invalid purge certificate")
-    try: _pub(Ed25519PublicKey,sign_public).verify(unb64(value["signature"]),canon({k:v for k,v in value.items() if k!="signature"}))
-    except (InvalidSignature,KeyError,TypeError,ValueError) as e: raise ValueError("invalid purge certificate") from e
     return value
 def signer(devices,author): value=devices[author]["sign_public"]; return value if public_id(value)==author else (_ for _ in ()).throw(ValueError("device signing key mismatch"))
 def sign_control(device,body): return {**body,"control_signature":b64(_priv(Ed25519PrivateKey,device["sign_private"]).sign(canon(body)))}
@@ -101,7 +105,7 @@ def open_event(envelope, key, sign_public):
     return value
 
 def seal_replica(row,proof,workspace,epoch,key,uploader,content_hash=None):
-    if proof["revision"]!=digest({"v":1,**{k:proof[k] for k in ("row_kind","row_id","encoding_v","content_hash","previous_revision","state")}}) or proof["content_hash"]!=(content_hash if content_hash is not None else digest(row)): raise ValueError("row replica proof mismatch")
+    if proof["content_hash"]!=(content_hash if content_hash is not None else digest(row)): raise ValueError("row replica proof mismatch")
     nonce=os.urandom(12); header={"v":1,"kind":"row.replica","workspace":workspace,"replica":fingerprint(key,digest(proof)),"epoch":epoch,"uploader":uploader,"nonce":b64(nonce)}; return {**header,"ciphertext":b64(AESGCM(key).encrypt(nonce,canon({"row":row,"proof":proof}),canon(header)))}
 
 def open_replica(value,key):

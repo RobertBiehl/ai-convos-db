@@ -168,12 +168,12 @@ automatically through its personal workspace; do not ask users to run a second
 memory-specific remote command. Sequential revisions settle mechanically.
 Treat concurrent remote and local revisions like any other pending scoped
 three-way change, and never resolve them by timestamp or last-write-wins.
-Remote tombstones purge unchanged remote-only canonicals, decrypted event
-payloads, and the author's prior relay events. They only deactivate the remote
-source when a local revision, another origin, or a managed projection must be
-preserved. Purged event IDs cannot be re-uploaded. Backups remain historical
-copies and require an explicit retention policy; do not claim a forget rewrote
-pre-existing memory or relay snapshots.
+Root-signed bodyless tombstones purge unchanged remote-only canonicals. They
+only deactivate the remote source when a local revision, another origin, or a
+managed projection must be preserved. Any authorized holder may repair an
+intact tombstone, but it cannot erase older plaintext or ciphertext already
+retained by a peer, relay, snapshot, or backup. Historical retention therefore
+requires an explicit policy.
 
 Path-valued scopes resolve through private Git repository evidence, so matching
 clones and worktrees may return the first checkout's path as their canonical

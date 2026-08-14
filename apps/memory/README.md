@@ -37,19 +37,19 @@ CLI.
 
 If `ai-convos-remote` is installed and configured too, its ordinary personal
 workspace sync discovers this product automatically and carries canonical
-memory revisions between devices inside the existing signed encrypted
-envelopes. No memory-specific remote setup or sync command is added. Absolute
+memory revisions between devices as root-signed semantic objects inside the
+existing encrypted row replicas. No memory-specific remote setup or sync
+command is added. Absolute
 checkout paths stay local, sequential revisions settle automatically, and
 concurrent meaning changes remain pending for the normal three-way agent
 resolution instead of using last-write-wins. Remote deletion deactivates the
 remote origin when local or provider state must be preserved, but automatically
-purges unchanged remote-only canonicals, decrypted event payloads, and the
-author's prior relay ciphertext events. Purged event IDs cannot be uploaded
-again. The relay still observes envelope metadata such as device, timing,
-sequence, and ciphertext size.
-Large canonicals are automatically carried as bounded encrypted parts and
-become visible only after verified reassembly, so they never fall into the
-remote's explicit lazy-fetch path.
+purges unchanged remote-only canonicals. Its bodyless proof carries complete
+revision ancestry, so any authorized holder can repair it without the author's
+key while only the author can create a successor. Older ciphertext already
+retained by peers or backups is not erased. The relay still observes envelope
+metadata such as uploader, timing, epoch, and ciphertext size. Each canonical
+is one replica subject to the relay's 48 MiB row-replica ceiling.
 
 Routine use is deliberately small:
 

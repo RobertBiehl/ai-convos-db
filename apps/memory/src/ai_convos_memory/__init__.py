@@ -1,5 +1,5 @@
 """Read-only provider adapters plus a deterministic plan/resolve/apply memory ledger."""
-import base64, hashlib, json, os, queue, re, shlex, shutil, site, sqlite3, subprocess, sys, sysconfig, threading, time
+import hashlib, json, os, queue, re, shlex, shutil, site, sqlite3, subprocess, sys, sysconfig, threading, time
 from datetime import datetime, timezone
 from functools import lru_cache
 from pathlib import Path
@@ -17,10 +17,10 @@ CREATE TABLE IF NOT EXISTS canonical_revisions(canonical TEXT NOT NULL REFERENCE
 CREATE TABLE IF NOT EXISTS links(source TEXT PRIMARY KEY REFERENCES sources(id),canonical TEXT NOT NULL REFERENCES canonicals(id),applied_hash TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS projections(provider TEXT NOT NULL,target TEXT NOT NULL,hash TEXT NOT NULL,updated_at TEXT NOT NULL,PRIMARY KEY(provider,target));
 CREATE TABLE IF NOT EXISTS repository_scopes(repository TEXT NOT NULL,lineage TEXT,scope TEXT NOT NULL,checkout TEXT NOT NULL UNIQUE,observed_at TEXT NOT NULL,PRIMARY KEY(repository,checkout));
-CREATE TABLE IF NOT EXISTS remote_heads(workspace TEXT NOT NULL,author TEXT NOT NULL,entity TEXT NOT NULL,seq INTEGER NOT NULL,event TEXT NOT NULL,PRIMARY KEY(workspace,author,entity));
-CREATE TABLE IF NOT EXISTS remote_parts(workspace TEXT NOT NULL,author TEXT NOT NULL,entity TEXT NOT NULL,hash TEXT NOT NULL,idx INTEGER NOT NULL,total INTEGER NOT NULL,content BLOB NOT NULL,observed_at TEXT NOT NULL,seq INTEGER NOT NULL,event TEXT NOT NULL,PRIMARY KEY(workspace,author,entity,hash,idx));
+CREATE TABLE IF NOT EXISTS remote_semantics(workspace TEXT NOT NULL,author TEXT NOT NULL,entity TEXT NOT NULL,revision TEXT NOT NULL,state TEXT NOT NULL,body TEXT NOT NULL,proof TEXT NOT NULL,owned INTEGER NOT NULL,PRIMARY KEY(workspace,author,entity,revision));
+CREATE TABLE IF NOT EXISTS remote_meta(key TEXT PRIMARY KEY,value TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS evidence(canonical TEXT NOT NULL REFERENCES canonicals(id),hash TEXT NOT NULL,message TEXT NOT NULL,conversation TEXT NOT NULL,source TEXT NOT NULL,title TEXT,role TEXT NOT NULL,created_at TEXT,content_hash TEXT NOT NULL,PRIMARY KEY(canonical,hash,message));
-PRAGMA user_version=5;"""
+PRAGMA user_version=6;"""
 
 def _hash(value): return hashlib.sha256(value.encode()).hexdigest()
 def atomic_json(path, data): path.parent.mkdir(parents=True, exist_ok=True); mode = path.stat().st_mode&0o777 if path.exists() else 0o600; tmp = path.with_name(f".{path.name}.{os.getpid()}"); tmp.touch(mode=mode, exist_ok=False); os.chmod(tmp, mode); tmp.write_text(json.dumps(data, indent=2)+"\n"); os.replace(tmp, path)
@@ -75,8 +75,10 @@ def connect(root=None):
     path = _db_path(root); path.parent.mkdir(parents=True, exist_ok=True)
     if path.is_symlink() or path.exists() and not path.is_file(): raise ValueError("Memory database path must be a regular non-symlink file")
     path.touch(mode=0o600, exist_ok=True); os.chmod(path, 0o600); db = sqlite3.connect(path); db.row_factory = sqlite3.Row
-    if (version := db.execute("PRAGMA user_version").fetchone()[0]) not in (0, 1, 2, 3, 4, 5): db.close(); raise ValueError("Unsupported memory ledger schema version; expected 0 through 5")
+    if (version := db.execute("PRAGMA user_version").fetchone()[0]) not in (0, 1, 2, 3, 4, 5, 6): db.close(); raise ValueError("Unsupported memory ledger schema version; expected 0 through 6")
     db.executescript(SCHEMA)
+    if version<6: db.executescript("DROP TABLE IF EXISTS remote_heads;DROP TABLE IF EXISTS remote_parts;")
+    db.execute("INSERT OR IGNORE INTO remote_meta VALUES ('ledger_id',?)",(os.urandom(16).hex(),)); db.commit()
     if version < 2:
         [db.execute("INSERT OR IGNORE INTO repository_scopes VALUES (?,?,?,?,?)", (repo["repository"],repo["lineage"],scope,repo["checkout"],datetime.now(timezone.utc).isoformat())) for scope, in db.execute("SELECT scope FROM sources UNION SELECT scope FROM canonicals") if (repo := _repository(scope))]
         db.commit()
@@ -185,7 +187,7 @@ def remember_data(content, scope=None, canonical=None, evidence=()):
     proofs, db, now = _archive_evidence(evidence,scope) if evidence else [], connect(), datetime.now(timezone.utc).isoformat()
     try:
         db.execute("BEGIN IMMEDIATE"); scope = _bind_scope(db,scope); replacing = canonical is not None; cid = _select_canonical(db,scope,canonical)["id"] if replacing else "mem_" + _hash(scope + "\0" + content)[:16]; row = db.execute("SELECT * FROM canonicals WHERE id=?", (cid,)).fetchone(); origins = db.execute("SELECT s.* FROM links l JOIN sources s ON s.id=l.source WHERE l.canonical=? ORDER BY s.id", (cid,)).fetchall()
-        if replacing and (len(origins) != 1 or origins[0]["provider"] != "user"): raise ValueError("only memories created with remember and without provider origins can be revised directly")
+        if replacing and (len(origins) != 1 or origins[0]["provider"] not in ("user","remote")): raise ValueError("only user-owned memories without Codex or Claude origins can be revised directly")
         if row and (row["scope"] != scope or not replacing and row["content"] != content): raise ValueError("canonical id collision")
         locator, digest = f"user/{cid}", _hash(content); sid = origins[0]["id"] if replacing else _hash("\0".join(("user",scope,locator)))[:20]; prior = db.execute("SELECT content FROM sources WHERE id=?", (sid,)).fetchone(); status = "unchanged" if prior and prior["content"] == content else "revised" if replacing else "linked" if row else "created"
         db.execute("INSERT INTO sources VALUES (?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET hash=excluded.hash,content=excluded.content,active=1,observed_at=excluded.observed_at", (sid,"user",scope,locator,str(_db_path()),digest,content,1,now)); db.execute("INSERT OR IGNORE INTO revisions VALUES (?,?,?,?)", (sid,digest,content,now))
@@ -196,11 +198,11 @@ def remember_data(content, scope=None, canonical=None, evidence=()):
 def forget_data(canonical, scope=None, dry_run=False):
     scope, db = _scope(scope), connect()
     try:
-        db.execute("BEGIN IMMEDIATE"); row = _select_canonical(db,scope,canonical); canonical = row["id"]; origins = db.execute("SELECT s.id,s.provider FROM links l JOIN sources s ON s.id=l.source WHERE l.canonical=?", (canonical,)).fetchall()
-        if not origins or any(r["provider"] != "user" for r in origins): raise ValueError("only memories created with remember and without provider origins can be forgotten")
+        db.execute("BEGIN IMMEDIATE"); row = _select_canonical(db,scope,canonical); canonical = row["id"]; origins = db.execute("SELECT s.id,s.provider,s.locator,s.hash,s.active,l.applied_hash FROM links l JOIN sources s ON s.id=l.source WHERE l.canonical=?", (canonical,)).fetchall()
+        if not origins or any(r["provider"] not in ("user","remote") or r["provider"]=="user" and (not r["active"] or r["hash"]!=r["applied_hash"]) for r in origins): raise ValueError("only settled user-owned memories without Codex or Claude origins can be forgotten")
         if any((p := Path(r[0])).exists() and (p.is_symlink() or f"canonical:{canonical} " in p.read_text()) for r in db.execute("SELECT target FROM projections")): raise ValueError("canonical is present in a Claude projection; remove or refresh the projection first")
         revisions = db.execute("SELECT COUNT(*) FROM canonical_revisions WHERE canonical=?", (canonical,)).fetchone()[0] + sum(db.execute("SELECT COUNT(*) FROM revisions WHERE source=?", (r["id"],)).fetchone()[0] for r in origins); evidence = db.execute("SELECT COUNT(*) FROM evidence WHERE canonical=?",(canonical,)).fetchone()[0]
-        [db.execute("DELETE FROM links WHERE source=?", (r["id"],)) for r in origins]; [db.execute("DELETE FROM revisions WHERE source=?", (r["id"],)) for r in origins]; [db.execute("DELETE FROM sources WHERE id=?", (r["id"],)) for r in origins]; db.execute("DELETE FROM evidence WHERE canonical=?", (canonical,)); db.execute("DELETE FROM canonical_revisions WHERE canonical=?", (canonical,)); db.execute("DELETE FROM canonicals WHERE id=?", (canonical,)); db.rollback() if dry_run else db.commit()
+        [db.execute("UPDATE remote_semantics SET owned=1 WHERE entity=?",(r["locator"].split("/",2)[-1],)) for r in origins if r["provider"]=="remote"]; [db.execute("DELETE FROM links WHERE source=?", (r["id"],)) for r in origins]; [db.execute("DELETE FROM revisions WHERE source=?", (r["id"],)) for r in origins]; [db.execute("DELETE FROM sources WHERE id=?", (r["id"],)) for r in origins]; db.execute("DELETE FROM evidence WHERE canonical=?", (canonical,)); db.execute("DELETE FROM canonical_revisions WHERE canonical=?", (canonical,)); db.execute("DELETE FROM canonicals WHERE id=?", (canonical,)); db.rollback() if dry_run else db.commit()
     except BaseException: db.rollback(); db.close(); raise
     db.close(); return dict(id=canonical,scope=scope,revisions=revisions,evidence=evidence,status="would_forget" if dry_run else "forgotten")
 def apply_data(document, dry_run=False):
@@ -283,8 +285,8 @@ def _snapshot(path):
     db, expected = sqlite3.connect(path.resolve().as_uri()+"?mode=ro", uri=True), sqlite3.connect(":memory:"); db.execute("BEGIN"); expected.executescript(SCHEMA); tables = {r[0]:r[1] for r in expected.execute("SELECT name,sql FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")}; expected.close()
     try:
         version=db.execute("PRAGMA user_version").fetchone()[0]; base=("sources","revisions","canonicals","canonical_revisions","links","projections")
-        if version not in (1,2,3,4,5) or db.execute("PRAGMA integrity_check").fetchone()[0] != "ok" or db.execute("SELECT 1 FROM sqlite_master WHERE type='trigger' LIMIT 1").fetchone() or any(db.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name=?",(name,)).fetchone()!=(tables[name],) for name in base): raise ValueError("Invalid or incompatible memory snapshot")
-        if version<5: migrated=sqlite3.connect(":memory:"); db.backup(migrated); db.close(); db=migrated; db.executescript(SCHEMA)
+        if version not in (1,2,3,4,5,6) or db.execute("PRAGMA integrity_check").fetchone()[0] != "ok" or db.execute("SELECT 1 FROM sqlite_master WHERE type='trigger' LIMIT 1").fetchone() or any(db.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name=?",(name,)).fetchone()!=(tables[name],) for name in base): raise ValueError("Invalid or incompatible memory snapshot")
+        if version<6: migrated=sqlite3.connect(":memory:"); db.backup(migrated); db.close(); db=migrated; db.executescript(SCHEMA+"DROP TABLE IF EXISTS remote_heads;DROP TABLE IF EXISTS remote_parts;"); db.execute("INSERT OR IGNORE INTO remote_meta VALUES ('ledger_id',?)",(os.urandom(16).hex(),)); db.commit()
         if any(db.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name=?", (name,)).fetchone() != (sql,) for name,sql in tables.items()): raise ValueError("Invalid or incompatible memory snapshot")
         if db.execute("SELECT 1 FROM links l JOIN sources s ON s.id=l.source JOIN canonicals c ON c.id=l.canonical WHERE s.scope<>c.scope LIMIT 1").fetchone(): raise ValueError("Cross-scope memory link in snapshot")
         return db
@@ -312,22 +314,20 @@ def adopt_scope_data(scope, checkout=None, yes=False):
     if not canonicals and not sources: db.close(); raise ValueError(f"Memory scope does not exist: {scope}")
     if yes: db.execute("INSERT OR REPLACE INTO repository_scopes VALUES (?,?,?,?,?)", (repo["repository"],repo["lineage"],scope,repo["checkout"],datetime.now(timezone.utc).isoformat())); db.commit()
     db.close(); return dict(status="adopted" if yes else "would_adopt",scope=scope,checkout=repo["checkout"],repository=repo["repository"],canonicals=canonicals,sources=sources)
-def remote_records(root,state,workspace,kind):
-    if kind != "personal" or not _db_path(root).is_file(): return []
-    db = connect(root); rows = [dict(r) for r in db.execute("""SELECT c.*,
-        EXISTS(SELECT 1 FROM links l JOIN sources s ON s.id=l.source WHERE l.canonical=c.id AND s.provider<>'remote') local_origin,
-        EXISTS(SELECT 1 FROM links l JOIN sources s ON s.id=l.source WHERE l.canonical=c.id AND s.provider='remote' AND s.hash=c.hash) remote_exact
-        FROM canonicals c ORDER BY c.id""")]; repositories = {r["scope"]:dict(x) for r in rows if (x := db.execute("SELECT repository,lineage FROM repository_scopes WHERE scope=? ORDER BY checkout LIKE 'remote:%',checkout LIMIT 1",(r["scope"],)).fetchone())}; db.close(); published = {}
-    for entity,status,seq in state.execute("SELECT r.entity,r.status,r.seq FROM publication_heads h JOIN receipts r ON r.workspace=h.workspace AND r.event=h.event WHERE h.workspace=? AND r.kind='memory.canonical' ORDER BY r.seq",(workspace,)): published[entity.rsplit(":part:",1)[0]] = status
-    records, seen = [], set()
-    for row in rows:
-        repo = repositories.get(row["scope"]); scope = repo["repository"] if repo else "global" if row["scope"] == "global" else "scope_"+_hash(row["scope"])[:20]; entity = f"memory:{scope}:{row['id']}"; seen.add(entity)
-        if row["local_origin"] or not row["remote_exact"] or entity in published:
-            data=row["content"].encode(); chunks=[data[i:i+24576] for i in range(0,len(data),24576)] or [b""]; common=dict(v=3,canonical=row["id"],scope=scope,repository=repo["repository"] if repo else None,lineage=repo["lineage"] if repo else None,status="active",hash=row["hash"],total=len(chunks))
-            records += [dict(kind="memory.canonical",entity=f"{entity}:part:{i}",payload={**common,"part":i,"content":base64.b64encode(chunk).decode()}) for i,chunk in enumerate(chunks)]
-    records += [dict(kind="memory.canonical",entity=entity,payload={"v":3,"canonical":entity.split(":",2)[2],"scope":entity.split(":",2)[1],"status":"deleted"}) for entity,status in published.items() if entity not in seen and status=="active"]
-    return records
-def _remote_apply(db,root,workspace,author,entity,p,content,observed_at):
+def remote_records(root,user,workspace,kind):
+    if kind!="personal": return []
+    db=connect(root); stored=[dict(row=json.loads(r["body"]),proof=json.loads(r["proof"]),previous=None,owned=bool(r["owned"])) for r in db.execute("SELECT * FROM remote_semantics ORDER BY workspace,author,entity,revision")]; rows=[dict(r) for r in db.execute("""SELECT c.*,EXISTS(SELECT 1 FROM links l JOIN sources s ON s.id=l.source WHERE l.canonical=c.id AND s.provider<>'remote') local_origin,EXISTS(SELECT 1 FROM links l JOIN sources s ON s.id=l.source WHERE l.canonical=c.id AND s.provider='remote' AND s.hash=c.hash) remote_exact,EXISTS(SELECT 1 FROM links l JOIN sources s ON s.id=l.source WHERE l.canonical=c.id AND (NOT s.active OR s.hash<>l.applied_hash)) pending FROM canonicals c ORDER BY c.id""")]; repositories={r["scope"]:dict(x) for r in rows if (x:=db.execute("SELECT repository,lineage FROM repository_scopes WHERE scope=? ORDER BY checkout LIKE 'remote:%',checkout LIMIT 1",(r["scope"],)).fetchone())}; records,seen=stored.copy(),set()
+    for value in rows:
+        repo=repositories.get(value["scope"]); scope=repo["repository"] if repo else "global" if value["scope"]=="global" else "scope_"+_hash(value["scope"])[:20]; entity=f"memory:{scope}:{value['id']}"; matching=[r for r in stored if r["proof"]["author_user_id"]==user and r["row"]["id"]==entity]; imported=any(r["row"]["state"]=="active" and r["row"]["data"]["hash"]==value["hash"] and not r["owned"] for r in stored); local=value["local_origin"] or not value["remote_exact"] or not imported
+        if not local: continue
+        seen.add(entity); row={"v":1,"kind":"memory.canonical","id":entity,"state":"active","data":{"canonical":value["id"],"scope":scope,"repository":repo["repository"] if repo else None,"lineage":repo["lineage"] if repo else None,"hash":value["hash"],"content":value["content"],"updated_at":value["updated_at"]}}
+        if len(matching)>1 and value["pending"]: continue
+        if not matching or matching[0]["row"]!=row: records.append(dict(row=row,proof=None,previous=[r["proof"] for r in matching] if len(matching)>1 else matching[0]["proof"] if matching else None,owned=True))
+    gone={}
+    for r in stored: gone.setdefault((r["proof"]["workspace"],r["proof"]["author_user_id"],r["row"]["id"]),[]).append(r)
+    records += [dict(row={"v":1,"kind":"memory.canonical","id":entity,"state":"deleted","data":None},proof=None,previous=[r["proof"] for r in values] if len(values)>1 else values[0]["proof"],owned=True) for (workspace,author,entity),values in gone.items() if any(r["owned"] for r in values) and any(r["row"]["state"]=="active" for r in values) and entity not in seen]
+    db.close(); return records
+def _remote_apply(db,root,workspace,author,entity,p,content,observed_at,conflict=False):
     locator=f"{workspace}/{author}/{entity}"; found=db.execute("SELECT id,scope FROM sources WHERE provider='remote' AND locator=?",(locator,)).fetchone()
     if content is None:
         if not found: return
@@ -339,59 +339,34 @@ def _remote_apply(db,root,workspace,author,entity,p,content,observed_at):
         if p["repository"] and not scopes: db.execute("INSERT OR IGNORE INTO repository_scopes VALUES (?,?,?,?,?)",(p["repository"],p["lineage"],target,"remote:"+p["repository"],observed_at))
         sid=found["id"] if found else _hash("\0".join(("remote",target,locator)))[:20]; target=found["scope"] if found else target
     if content is not None:
-        digest=p["hash"]; link=db.execute("SELECT l.canonical,l.applied_hash,c.hash FROM links l JOIN canonicals c ON c.id=l.canonical WHERE l.source=?",(sid,)).fetchone(); db.execute("""INSERT INTO sources VALUES (?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET hash=excluded.hash,content=excluded.content,active=1,observed_at=excluded.observed_at""",(sid,"remote",target,locator,str(Path(root)/"remote/state.db"),digest,content,1,observed_at)); db.execute("INSERT OR IGNORE INTO revisions VALUES (?,?,?,?)",(sid,digest,content,observed_at))
+        digest=p["hash"]; link=db.execute("SELECT l.canonical,l.applied_hash,c.hash FROM links l JOIN canonicals c ON c.id=l.canonical WHERE l.source=?",(sid,)).fetchone(); db.execute("""INSERT INTO sources VALUES (?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET hash=excluded.hash,content=excluded.content,active=1,observed_at=excluded.observed_at""",(sid,"remote",target,locator,str(_db_path(root)),digest,content,1,observed_at)); db.execute("INSERT OR IGNORE INTO revisions VALUES (?,?,?,?)",(sid,digest,content,observed_at))
+        if conflict: return
         blocked=link and db.execute("SELECT 1 FROM links l JOIN sources s ON s.id=l.source WHERE l.canonical=? AND s.id<>? AND (NOT s.active OR s.hash<>l.applied_hash) LIMIT 1",(link["canonical"],sid)).fetchone()
         if link and link["hash"]==link["applied_hash"] and not blocked: _canonical(db,link["canonical"],target,content,observed_at); db.execute("UPDATE links SET applied_hash=? WHERE source=?",(digest,sid))
         elif not link and (exact:=db.execute("SELECT id FROM canonicals WHERE scope=? AND hash=? ORDER BY id LIMIT 1",(target,digest)).fetchone()): db.execute("INSERT INTO links VALUES (?,?,?)",(sid,exact["id"],digest))
         elif not link and not db.execute("SELECT 1 FROM canonicals WHERE scope=? LIMIT 1",(target,)).fetchone(): cid="mem_"+_hash(target+"\0"+content)[:16]; _canonical(db,cid,target,content,observed_at); db.execute("INSERT INTO links VALUES (?,?,?)",(sid,cid,digest))
     elif found:
+        if conflict: db.execute("DELETE FROM revisions WHERE source=?",(sid,)); db.execute("UPDATE sources SET content='',active=0,observed_at=? WHERE id=?",(observed_at,sid)); return
         link=db.execute("SELECT l.canonical,l.applied_hash,c.hash FROM links l JOIN canonicals c ON c.id=l.canonical WHERE l.source=?",(sid,)).fetchone(); protected=link and (db.execute("SELECT 1 FROM links WHERE canonical=? AND source<>? LIMIT 1",(link["canonical"],sid)).fetchone() or any((path:=Path(r[0])).exists() and (path.is_symlink() or f"canonical:{link['canonical']} " in path.read_text()) for r in db.execute("SELECT target FROM projections")))
         if link and link["hash"]==link["applied_hash"] and not protected: db.execute("DELETE FROM links WHERE source=?",(sid,)); db.execute("DELETE FROM revisions WHERE source=?",(sid,)); db.execute("DELETE FROM sources WHERE id=?",(sid,)); db.execute("DELETE FROM canonical_revisions WHERE canonical=?",(link["canonical"],)); db.execute("DELETE FROM canonicals WHERE id=?",(link["canonical"],))
         elif link: db.execute("DELETE FROM revisions WHERE source=?",(sid,)); db.execute("UPDATE sources SET content='',active=0,observed_at=? WHERE id=?",(observed_at,sid))
         else: db.execute("DELETE FROM revisions WHERE source=?",(sid,)); db.execute("DELETE FROM sources WHERE id=?",(sid,))
-def remote_project(root,state,value,workspace,local_device):
-    if value["kind"] != "memory.canonical": return None
-    if value["author"] == local_device: return False
-    p=value["payload"]; active=p.get("status")=="active"; required={"v","canonical","scope","status"}|({"repository","lineage","hash","content","part","total"} if active else set()); entity=f"memory:{p.get('scope')}:{p.get('canonical')}"
-    if set(p)!=required or p.get("v")!=3 or isinstance(p.get("v"),bool) or not all(isinstance(p.get(k),str) and p[k] for k in ("canonical","scope","status")) or active and (not isinstance(p["hash"],str) or not re.fullmatch(r"[0-9a-f]{64}",p["hash"]) or p["repository"] is not None and not isinstance(p["repository"],str) or p["lineage"] is not None and not isinstance(p["lineage"],str) or p["repository"] is None and p["lineage"] is not None) or p["status"] not in ("active","deleted") or not isinstance(value.get("observed_at"),str) or not isinstance(value.get("seq"),int) or isinstance(value["seq"],bool) or value["seq"]<1: raise ValueError("Malformed remote memory event")
-    if active:
-        if not isinstance(p["part"],int) or isinstance(p["part"],bool) or not isinstance(p["total"],int) or isinstance(p["total"],bool) or not 0<=p["part"]<p["total"]<=4096 or not isinstance(p["content"],str) or len(p["content"])>32768 or value["entity"]!=f"{entity}:part:{p['part']}": raise ValueError("Malformed remote memory event")
-        try: part=base64.b64decode(p["content"],validate=True)
-        except (ValueError,TypeError) as e: raise ValueError("Malformed remote memory event") from e
-        if len(part)>24576: raise ValueError("Malformed remote memory event")
-        content=None
-    else:
-        content=None
-        if value["entity"]!=entity: raise ValueError("Malformed remote memory event")
-    db=connect(root); head=db.execute("SELECT seq,event FROM remote_heads WHERE workspace=? AND author=? AND entity=?",(workspace,value["author"],value["entity"])).fetchone()
-    if head and (head["seq"] > value["seq"] or head["seq"] == value["seq"] and head["event"] == value["id"]):
-        db.close(); return False
-    if head and head["seq"] == value["seq"]: db.close(); raise ValueError("Remote memory sequence replay")
+def remote_accept(root,row,proof,project=True):
+    data=row["data"]; parts=row["id"].split(":",2); fields={"canonical","scope","repository","lineage","hash","content","updated_at"}
+    if row["kind"]!="memory.canonical" or len(parts)!=3 or parts[0]!="memory" or not all(parts[1:]) or row["state"]=="active" and (set(data)!=fields or row["id"]!=f"memory:{data['scope']}:{data['canonical']}" or not all(isinstance(data[k],str) and data[k] for k in ("canonical","scope","hash","updated_at")) or not isinstance(data["content"],str) or _hash(data["content"])!=data["hash"] or data["repository"] is not None and not isinstance(data["repository"],str) or data["lineage"] is not None and not isinstance(data["lineage"],str) or data["repository"] is None and data["lineage"] is not None) or row["state"]=="deleted" and data is not None: raise ValueError("Malformed remote memory object")
+    db=connect(root); author,entity=proof["author_user_id"],row["id"]
     try:
-        db.execute("BEGIN IMMEDIATE")
-        if active:
-            old=db.execute("SELECT total,content FROM remote_parts WHERE workspace=? AND author=? AND entity=? AND hash=? AND idx=?",(workspace,value["author"],entity,p["hash"],p["part"])).fetchone()
-            if old and (old["total"]!=p["total"] or old["content"]!=part): raise ValueError("Remote memory chunk conflict")
-            db.execute("INSERT OR IGNORE INTO remote_parts VALUES (?,?,?,?,?,?,?,?,?,?)",(workspace,value["author"],entity,p["hash"],p["part"],p["total"],part,value["observed_at"],value["seq"],value["id"])); db.execute("INSERT OR REPLACE INTO remote_heads VALUES (?,?,?,?,?)",(workspace,value["author"],value["entity"],value["seq"],value["id"])); parts=db.execute("SELECT idx,total,content,observed_at,seq,event FROM remote_parts WHERE workspace=? AND author=? AND entity=? AND hash=? ORDER BY idx",(workspace,value["author"],entity,p["hash"])).fetchall()
-            if len(parts)==p["total"] and [r["idx"] for r in parts]==list(range(p["total"])) and all(r["total"]==p["total"] for r in parts):
-                try: content=b"".join(r["content"] for r in parts).decode()
-                except UnicodeDecodeError as e: raise ValueError("Malformed remote memory content") from e
-                if _hash(content)!=p["hash"]: raise ValueError("Remote memory hash mismatch")
-                latest=max(parts,key=lambda r:r["seq"]); logical=db.execute("SELECT seq FROM remote_heads WHERE workspace=? AND author=? AND entity=?",(workspace,value["author"],entity)).fetchone()
-                if not logical or logical["seq"]<latest["seq"]: _remote_apply(db,root,workspace,value["author"],entity,p,content,latest["observed_at"]); db.execute("INSERT OR REPLACE INTO remote_heads VALUES (?,?,?,?,?)",(workspace,value["author"],entity,latest["seq"],latest["event"]))
-                db.execute("DELETE FROM remote_parts WHERE workspace=? AND author=? AND entity=?",(workspace,value["author"],entity))
-        else:
-            _remote_apply(db,root,workspace,value["author"],entity,p,content if active else None,value["observed_at"]); db.execute("DELETE FROM remote_parts WHERE workspace=? AND author=? AND entity=?",(workspace,value["author"],entity)); db.execute("INSERT OR REPLACE INTO remote_heads VALUES (?,?,?,?,?)",(workspace,value["author"],entity,value["seq"],value["id"]))
+        db.execute("BEGIN IMMEDIATE"); old=db.execute("SELECT owned FROM remote_semantics WHERE workspace=? AND author=? AND entity=? AND revision=?",(proof["workspace"],author,entity,proof["revision"])).fetchone(); owned=bool(old and old["owned"]); db.execute("INSERT OR REPLACE INTO remote_semantics VALUES (?,?,?,?,?,?,?,?)",(proof["workspace"],author,entity,proof["revision"],row["state"],json.dumps(row,sort_keys=True,separators=(",",":")),json.dumps(proof,sort_keys=True,separators=(",",":")),int(owned or not project))); values=[dict(row=json.loads(r["body"]),proof=json.loads(r["proof"])) for r in db.execute("SELECT body,proof FROM remote_semantics WHERE workspace=? AND author=? AND entity=?",(proof["workspace"],author,entity))]; ancestors={a for value in values for a in value["proof"]["ancestors"]}; leaves=[value for value in values if value["proof"]["revision"] not in ancestors]; db.execute("DELETE FROM remote_semantics WHERE workspace=? AND author=? AND entity=? AND revision NOT IN (%s)"%",".join("?"*len(leaves)),(proof["workspace"],author,entity,*(v["proof"]["revision"] for v in leaves)))
+        if project and not owned:
+            current=(db.execute("SELECT c.hash FROM sources s JOIN links l ON l.source=s.id JOIN canonicals c ON c.id=l.canonical WHERE s.provider='remote' AND s.locator=?",(f"{proof['workspace']}/{author}/{entity}",)).fetchone() or [None])[0]; deleted=next((v for v in leaves if v["row"]["state"]=="deleted"),None); chosen=leaves if len(leaves)==1 else [deleted or next((v for v in leaves if v["row"]["data"]["hash"]!=current),leaves[0])]
+            for value in chosen:
+                body,p=value["row"],value["proof"]; payload=body["data"]; _remote_apply(db,root,proof["workspace"],p["author_user_id"],entity,payload,payload["content"],payload["updated_at"],len(leaves)>1) if body["state"]=="active" else _remote_apply(db,root,proof["workspace"],p["author_user_id"],entity,{},None,datetime.now(timezone.utc).isoformat(),len(leaves)>1)
         db.commit()
     except BaseException: db.rollback(); db.close(); raise
-    db.close(); return True
-def remote_purges(root,state,workspace,kind):
-    if kind!="personal": return []
-    groups={}
-    for event,cursor,entity,status,author,current in state.execute("SELECT r.event,r.cursor,r.entity,r.status,r.author,h.event IS NOT NULL FROM receipts r LEFT JOIN publication_heads h ON h.workspace=r.workspace AND h.event=r.event WHERE r.workspace=? AND r.kind='memory.canonical' ORDER BY r.seq",(workspace,)):
-        group=groups.setdefault(entity.rsplit(":part:",1)[0],dict(active=[])); current and group.update(latest=(status,cursor,author,event)); status=="active" and group["active"].append((event,author))
-    return [dict(event=event,superseded_by=group["latest"][3]) for group in groups.values() if group.get("latest",(None,))[0]=="deleted" for event,author in group["active"] if author==group["latest"][2]]
-def remote_bridge(): return dict(v=1,events={("memory.canonical",1)},records=remote_records,project=remote_project,purges=remote_purges)
+    db.close(); return len(leaves)==1
+def remote_token(root):
+    db=connect(root); value=db.execute("SELECT value FROM remote_meta WHERE key='ledger_id'").fetchone()[0]; db.close(); return value
+def remote_bridge(): return dict(v=2,objects={"memory.canonical"},records=remote_records,accept=remote_accept,token=remote_token)
 def _skill_source():
     rel = Path("skills")/"agent-convos"/"SKILL.md"; root = Path(os.environ.get("CONVOS_PROJECT_ROOT", Path.home()/".convos")).expanduser()
     roots = (root, Path(__file__).resolve().parents[4], Path(sysconfig.get_paths().get("data", ""))/"share"/"ai-convos-db", Path(site.getuserbase())/"share"/"ai-convos-db")
