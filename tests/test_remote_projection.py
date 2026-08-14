@@ -6,7 +6,7 @@ import pytest
 from ai_convos.cli import init_schema
 import ai_convos_remote.projection as projection_module
 from ai_convos_remote import publish
-from ai_convos_remote.projection import bridges, connect, cutover_state, foreign_id, inspect_state, project, project_many, scan, sequence
+from ai_convos_remote.projection import bridges, connect, cutover_state, event_support, foreign_id, inspect_state, project, project_many, scan, sequence
 from ai_convos_remote.protocol import b64, digest, event, identity
 
 
@@ -33,7 +33,7 @@ def test_old_state_inspection_is_read_only_and_cutover_preserves_exact_backup(tm
     with pytest.raises(ValueError,match="rebuild required"): connect(path)
     assert (path.read_bytes(),path.stat().st_mtime_ns,{p.name for p in tmp_path.iterdir()})==before
     report=cutover_state(path); backup=Path(report["backup"]); old=__import__("sqlite3").connect(backup/"state.db"); assert old.execute("SELECT value FROM legacy_payload").fetchone()[0]=="only in old state"; old.close()
-    state=connect(path); assert state.execute("SELECT value FROM meta WHERE key='state_schema'").fetchone()[0]=="5" and json.loads(state.execute("SELECT value FROM meta WHERE key='state_cutover'").fetchone()[0])["backup"]==str(backup); state.close(); assert inspect_state(path)["status"]=="current" and os.stat(backup).st_mode&0o777==0o700 and os.stat(backup/"state.db").st_mode&0o777==0o600
+    state=connect(path); assert state.execute("SELECT value FROM meta WHERE key='state_schema'").fetchone()[0]=="6" and json.loads(state.execute("SELECT value FROM meta WHERE key='state_cutover'").fetchone()[0])["backup"]==str(backup); state.close(); assert inspect_state(path)["status"]=="current" and os.stat(backup).st_mode&0o777==0o700 and os.stat(backup/"state.db").st_mode&0o777==0o600
 
 
 def test_cutover_recovers_corrupt_regular_state_but_refuses_symlink(tmp_path):
@@ -74,6 +74,10 @@ def test_optional_projection_bridge_contract_fails_closed(monkeypatch):
     bridges.cache_clear(); monkeypatch.setattr(projection_module,"entry_points",lambda **_:[Entry()])
     with pytest.raises(ValueError,match="Unsupported remote bridge"): bridges()
     bridges.cache_clear()
+
+
+def test_event_support_is_exact_and_unknowns_fail_closed(monkeypatch):
+    monkeypatch.setattr(projection_module,"bridges",lambda:[]); classify=lambda kind,version:event_support({"kind":kind,"payload_v":version}); assert classify("conversation.record",1)=="supported" and classify("conversation.record",2)==classify("future.opaque",1)=="required" and classify("memory.canonical",2)=="optional"; monkeypatch.setattr(projection_module,"bridges",lambda:[{"events":{("memory.canonical",1)}}]); assert classify("memory.canonical",2)=="required"
 
 
 def test_out_of_order_revisions_converge_and_replay_deduplicates(tmp_path):

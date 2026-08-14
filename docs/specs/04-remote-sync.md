@@ -121,8 +121,12 @@ a possible later key-management profile, not a v1 dependency.
 The signature covers every field except `signature`; the event id covers the
 body before `id` and `signature` are added. Unknown kinds and payload versions
 are retained and forwarded even when the local projector cannot interpret
-them. Events are never edited. Corrections, identity links, retractions, key
-changes, and tombstones are new events. The sole deletion exception is an
+them. Client dispatch is exact on `(kind, payload_v)`: unknown core semantics
+block publication, while only explicitly receiver-known auxiliary families may
+defer without blocking the core archive when their product is absent; an
+installed but outdated product blocks publication. Events are never edited.
+Corrections, identity links, retractions, key changes, and tombstones are new
+events. The sole deletion exception is an
 author-bound purge of superseded `memory.canonical` events from a personal
 workspace after its signed tombstone is durable. The relay keeps only opaque
 event-id replay-denial tombstones; team events cannot use this operation.
