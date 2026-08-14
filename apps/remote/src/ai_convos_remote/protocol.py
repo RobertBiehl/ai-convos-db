@@ -92,13 +92,13 @@ def open_event(envelope, key, sign_public):
 
 def seal_replica(row,proof,workspace,epoch,key,uploader):
     if proof["revision"]!=digest({"v":1,**{k:proof[k] for k in ("row_kind","row_id","encoding_v","content_hash","previous_revision","state")}}) or proof["content_hash"]!=digest(row): raise ValueError("row replica proof mismatch")
-    nonce=os.urandom(12); header={"v":1,"kind":"row.replica","workspace":workspace,"revision":proof["revision"],"epoch":epoch,"uploader":uploader,"nonce":b64(nonce)}; return {**header,"ciphertext":b64(AESGCM(key).encrypt(nonce,canon({"row":row,"proof":proof}),canon(header)))}
+    nonce=os.urandom(12); header={"v":1,"kind":"row.replica","workspace":workspace,"replica":fingerprint(key,digest(proof)),"epoch":epoch,"uploader":uploader,"nonce":b64(nonce)}; return {**header,"ciphertext":b64(AESGCM(key).encrypt(nonce,canon({"row":row,"proof":proof}),canon(header)))}
 
 def open_replica(value,key):
     try:
-        if set(value)!={"v","kind","workspace","revision","epoch","uploader","nonce","ciphertext"} or value["v"]!=1 or value["kind"]!="row.replica": raise ValueError
-        header={k:value[k] for k in ("v","kind","workspace","revision","epoch","uploader","nonce")}; body=json.loads(AESGCM(key).decrypt(unb64(value["nonce"]),unb64(value["ciphertext"]),canon(header)))
-        if set(body)!={"row","proof"} or body["proof"]["revision"]!=value["revision"] or body["proof"]["content_hash"]!=digest(body["row"]): raise ValueError
+        if set(value)!={"v","kind","workspace","replica","epoch","uploader","nonce","ciphertext"} or value["v"]!=1 or value["kind"]!="row.replica": raise ValueError
+        header={k:value[k] for k in ("v","kind","workspace","replica","epoch","uploader","nonce")}; body=json.loads(AESGCM(key).decrypt(unb64(value["nonce"]),unb64(value["ciphertext"]),canon(header)))
+        if set(body)!={"row","proof"} or value["replica"]!=fingerprint(key,digest(body["proof"])) or body["proof"]["content_hash"]!=digest(body["row"]): raise ValueError
         return body
     except (InvalidTag,KeyError,TypeError,ValueError) as e: raise ValueError("invalid row replica") from e
 

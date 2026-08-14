@@ -56,8 +56,8 @@ def test_row_proof_rejects_wrong_body_signer_and_self_predecessor():
 
 def test_delivery_replica_separates_origin_author_from_uploader():
     root,author,uploader=identity("root"),fixed_identity(),identity("peer"); user=public_id(root["sign_public"]); cert=certificate(root,user,author); row=logical_row("messages",identity="m",state="deleted"); proof=row_proof(author,user,"origin",2,row,"a"*64); key=bytes(range(32)); env=seal_replica(row,proof,"replacement",1,key,uploader["id"]); opened=open_replica(env,key)
-    assert env["uploader"]==uploader["id"]!=proof["author_device_id"] and verify_row_proof(opened["proof"],opened["row"],cert,root["sign_public"])
-    with pytest.raises(ValueError,match="replica"): open_replica({**env,"revision":"0"*64},key)
+    assert env["uploader"]==uploader["id"]!=proof["author_device_id"] and env["replica"]!=proof["revision"] and verify_row_proof(opened["proof"],opened["row"],cert,root["sign_public"])
+    with pytest.raises(ValueError,match="replica"): open_replica({**env,"replica":"0"*64},key)
 
 
 def test_event_encryption_tamper_signature_and_header_binding():

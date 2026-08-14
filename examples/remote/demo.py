@@ -20,7 +20,7 @@ def seed(root,cid,title,prompt,cwd=None,edit=None):
     db.execute("INSERT INTO conversations (id,source,title,created_at,updated_at,cwd,metadata) VALUES (?,?,?,'2026-01-01','2026-01-01',?,'{}')",(cid,"demo",title,str(cwd) if cwd else None)); db.execute("INSERT INTO messages (id,conversation_id,role,content,created_at,metadata) VALUES (?,?, 'user',?,'2026-01-01 00:00:00','{}'),(?,?, 'assistant','done','2026-01-01 00:00:01','{}')",(f"u-{cid}",cid,prompt,f"a-{cid}",cid))
     if edit: db.execute("INSERT INTO file_edits (id,message_id,file_path,edit_type,content,created_at,old_content) VALUES (?,?,?,'write',?,'2026-01-01 00:00:01',?)",(f"e-{cid}",f"a-{cid}",str(edit[0]),edit[1],edit[2]))
     db.close()
-def wait_message(root,content,workers,timeout=10):
+def wait_message(root,content,workers,timeout=10,graph=False):
     start=time.monotonic(); path=Path(root)/"data/convos.db"
     while time.monotonic()-start<timeout:
         for base,worker in workers:
@@ -28,7 +28,7 @@ def wait_message(root,content,workers,timeout=10):
             if (error:=Path(base)/"remote/last_error").exists() and "Could not set lock on file" not in (failure:=error.read_text()): raise RuntimeError(failure)
         if path.exists():
             try:
-                db=duckdb.connect(str(path),read_only=True); found=db.execute("SELECT COUNT(*) FROM messages WHERE content=?",(content,)).fetchone()[0]; db.close()
+                db=duckdb.connect(str(path),read_only=True); found=db.execute("SELECT COUNT(*) FROM messages WHERE content=?",(content,)).fetchone()[0] and (not graph or db.execute("SELECT COUNT(*) FROM provenance.file_edit_files").fetchone()[0]); db.close()
                 if found: return time.monotonic()-start
             except duckdb.Error: pass
         time.sleep(.1)
@@ -75,7 +75,7 @@ def team(keep=False):
         alice_root,bob_root=base/"alice-device",base/"bob-device"; alice,_=setup_client(url,"demo-alice","laptop",root=alice_root); setup_client(url,"demo-bob","desktop",root=bob_root); workspace=create(alice,"Backend","team",alice_root); add_member(alice,workspace,"demo-bob",root=alice_root)
         alice_repo=base/"alice-checkouts/backend"; alice_repo.mkdir(parents=True); git(alice_repo,"init","-q"); git(alice_repo,"config","user.email","demo@example.com"); git(alice_repo,"config","user.name","Demo"); (alice_repo/"app.py").write_text("before\n"); git(alice_repo,"add","."); git(alice_repo,"commit","-qm","initial"); bob_repo=base/"unrelated/location/backend"; bob_repo.parent.mkdir(parents=True); subprocess.run(("git","clone","-q",str(alice_repo),str(bob_repo)),check=True); run(alice_root,"remote","link",str(alice_repo),"Backend")
         prompt="Update the backend response."; (alice_repo/"app.py").write_text("after\n"); seed(alice_root,"team-demo","Team demo",prompt,alice_repo,(alice_repo/"app.py","after\n","before\n"))
-        with watchers(alice_root,bob_root) as running: elapsed=wait_message(bob_root,prompt,running)
+        with watchers(alice_root,bob_root) as running: elapsed=wait_message(bob_root,prompt,running,graph=True)
         changes=json.loads(run(bob_root,"remote","graph","conversation_changes")); files=json.loads(run(bob_root,"remote","graph","changeset_files","--arg",changes[0]["changeset_id"])); activity=json.loads(run(bob_root,"remote","graph","repository_activity","--arg",files[0]["repository"])); db=duckdb.connect(str(bob_root/"data/convos.db"),read_only=True); shared_path=db.execute("SELECT file_path FROM file_edits").fetchone()[0]; db.close()
         assert shared_path=="app.py" and activity; assert_opaque(server,prompt,alice_repo,bob_repo); result={"scenario":"team","automatic":True,"seconds":round(elapsed,2),"different_checkout_paths":True,"shared_path":shared_path,"repositories":changes[0]["repositories"],"files":len(files),"repository_activity":len(activity),"relay_plaintext":False}; print(json.dumps(result)); return result
 

@@ -199,22 +199,29 @@ def upload(cfg,state,root=None,workspaces=None):
         state.commit(); [path.unlink(missing_ok=True) for row,env,path,ack in acknowledged+[(row,env,path,ack) for (row,env,path),ack in zip(prepared,result)]]
     upload_replicas(cfg,state,root,active)
 def queue_replica(state,root,env):
-    key_=(env["workspace"],env["revision"],env["epoch"],env["uploader"])
-    if state.execute("SELECT 1 FROM replica_outbox WHERE workspace=? AND revision=? AND epoch=? AND uploader=? UNION ALL SELECT 1 FROM replica_receipts WHERE workspace=? AND revision=? AND epoch=? AND uploader=? LIMIT 1",key_+key_).fetchone(): return False
+    key_=(env["workspace"],env["replica"],env["epoch"],env["uploader"])
+    if state.execute("SELECT 1 FROM replica_outbox WHERE workspace=? AND replica=? AND epoch=? AND uploader=? UNION ALL SELECT 1 FROM replica_receipts WHERE workspace=? AND replica=? AND epoch=? LIMIT 1",key_+key_[:3]).fetchone(): return False
     path,size=encrypted_file(root,"replica-"+digest(key_),env); state.execute("INSERT INTO replica_outbox VALUES (?,?,?,?,?,?)",(*key_,str(path),size)); return True
+def reconcile_replicas(cfg,state,root,ws,envelopes):
+    for page in (envelopes[i:i+500] for i in range(0,len(envelopes),500)):
+        ids=[e["replica"] for e in page]; present=request(cfg,{"op":"replica_reconcile","workspace":ws,"replicas":ids})["present"]
+        if not isinstance(present,dict) or not set(present)<=set(ids) or any(not isinstance(v,int) or isinstance(v,bool) or v<1 for v in present.values()): raise ValueError("relay replica inventory mismatch")
+        for env in page:
+            if env["replica"] in present: state.execute("INSERT OR REPLACE INTO replica_receipts VALUES (?,?,?,?)",(ws,env["replica"],env["epoch"],present[env["replica"]]))
+            else: queue_replica(state,root,env)
 def upload_replicas(cfg,state,root,workspaces):
-    rows=[r for r in state.execute("SELECT * FROM replica_outbox ORDER BY workspace,revision").fetchall() if r["workspace"] in workspaces]
+    rows=[r for r in state.execute("SELECT * FROM replica_outbox ORDER BY workspace,replica").fetchall() if r["workspace"] in workspaces]
     for batch in _upload_batches(rows):
         prepared=[]
         for row in batch:
             path=Path(row["path"]); env=json.loads(path.read_text()); current=cfg["workspaces"][row["workspace"]]["epoch"]
-            if (env["workspace"],env["revision"],env["epoch"],env["uploader"])!=(row["workspace"],row["revision"],row["epoch"],row["uploader"]) or path.is_symlink(): raise ValueError("invalid replica outbox")
+            if (env["workspace"],env["replica"],env["epoch"],env["uploader"])!=(row["workspace"],row["replica"],row["epoch"],row["uploader"]) or path.is_symlink(): raise ValueError("invalid replica outbox")
             if env["epoch"]!=current:
-                old_path=path; body=open_replica(env,key(cfg,row["workspace"],env["epoch"])); env=seal_replica(body["row"],body["proof"],row["workspace"],current,key(cfg,row["workspace"],current),cfg["device"]["id"]); path,size=encrypted_file(root,"replica-"+digest((row["workspace"],row["revision"],current,row["uploader"])),env); state.execute("DELETE FROM replica_outbox WHERE workspace=? AND revision=? AND epoch=? AND uploader=?",(row["workspace"],row["revision"],row["epoch"],row["uploader"])); state.execute("INSERT OR REPLACE INTO replica_outbox VALUES (?,?,?,?,?,?)",(row["workspace"],row["revision"],current,row["uploader"],str(path),size)); old_path.unlink(missing_ok=True)
+                old_path=path; body=open_replica(env,key(cfg,row["workspace"],env["epoch"])); env=seal_replica(body["row"],body["proof"],row["workspace"],current,key(cfg,row["workspace"],current),cfg["device"]["id"]); path,size=encrypted_file(root,"replica-"+digest((row["workspace"],env["replica"],current,row["uploader"])),env); state.execute("DELETE FROM replica_outbox WHERE workspace=? AND replica=? AND epoch=? AND uploader=?",(row["workspace"],row["replica"],row["epoch"],row["uploader"])); state.execute("INSERT OR REPLACE INTO replica_outbox VALUES (?,?,?,?,?,?)",(row["workspace"],env["replica"],current,row["uploader"],str(path),size)); old_path.unlink(missing_ok=True)
             prepared.append((row,env,path))
         result=request(cfg,{"op":"replica_upload_many","envelopes":[p[1] for p in prepared]})["replicas"]
         if len(result)!=len(prepared): raise ValueError("relay replica acknowledgement mismatch")
-        for (row,env,path),ack in zip(prepared,result): state.execute("INSERT OR REPLACE INTO replica_receipts VALUES (?,?,?,?,?)",(env["workspace"],env["revision"],env["epoch"],env["uploader"],ack["cursor"])); state.execute("DELETE FROM replica_outbox WHERE workspace=? AND revision=? AND epoch=? AND uploader=?",(env["workspace"],env["revision"],env["epoch"],env["uploader"])); path.unlink(missing_ok=True)
+        for (row,env,path),ack in zip(prepared,result): state.execute("INSERT OR REPLACE INTO replica_receipts VALUES (?,?,?,?)",(env["workspace"],env["replica"],env["epoch"],ack["cursor"])); state.execute("DELETE FROM replica_outbox WHERE workspace=? AND replica=? AND epoch=? AND uploader=?",(env["workspace"],env["replica"],env["epoch"],env["uploader"])); path.unlink(missing_ok=True)
         state.commit()
 def drop_event(state,ws,event):
     state.execute("DELETE FROM publication_heads WHERE workspace=? AND event=?",(ws,event)); state.execute("DELETE FROM receipts WHERE workspace=? AND event=?",(ws,event)); state.execute("DELETE FROM lazy_events WHERE workspace=? AND event=?",(ws,event)); state.execute("DELETE FROM deferred_events WHERE workspace=? AND event=?",(ws,event))
@@ -242,7 +249,7 @@ def pull_row_replicas(cfg,state,root,ws,recover=None):
             bodies.append(open_replica(env,key(cfg,sid,env["epoch"])))
         apply_row_replicas(core_path(root),bodies,sid,ws["controls"],recover,cfg["user"])
         for item in result["replicas"]:
-            env=item["envelope"]; state.execute("INSERT OR REPLACE INTO replica_receipts VALUES (?,?,?,?,?)",(sid,env["revision"],env["epoch"],env["uploader"],item["cursor"])); after=max(after,item["cursor"]); total+=1
+            env=item["envelope"]; state.execute("INSERT OR REPLACE INTO replica_receipts VALUES (?,?,?,?)",(sid,env["replica"],env["epoch"],item["cursor"])); after=max(after,item["cursor"]); total+=1
         state.execute("INSERT OR REPLACE INTO meta VALUES (?,?)",(f"replica_cursor:{sid}",str(after))); state.commit()
         if after>=tail: return total
         if not result["replicas"]: raise ValueError("relay replica tail cannot be reached")
@@ -313,7 +320,7 @@ def sync_once(root=None,force=False):
                     pol=state.execute("SELECT kind,value FROM policies WHERE workspace=?",(ws,)).fetchall(); repos=[p[1] for p in pol if p[0]=="repository"]; roots=[cfg.get("bindings",{}).get(f"{ws}:{p[1]}") for p in pol if p[0]=="path" and cfg.get("bindings",{}).get(f"{ws}:{p[1]}")]; records=[safe for r in scan(core,state,meta["kind"],repos,roots) if (safe:=protect_record(r,root,ws) if meta["kind"]=="team" else r) is not None]; batches.append((ws,records))
                 core.close()
                 for ws,records in batches:
-                    attest_rows(path,cfg,ws,records); epoch=cfg["workspaces"][ws]["epoch"]; known={r[0] for r in state.execute("SELECT revision FROM replica_receipts WHERE workspace=? AND epoch=? UNION SELECT revision FROM replica_outbox WHERE workspace=? AND epoch=?",(ws,epoch,ws,epoch)).fetchall()}; [queue_replica(state,root,env) for env in row_replicas(path,cfg,ws,records,key(cfg,ws,epoch),known)]; heads={r[0]:r[1] for r in state.execute("SELECT entity,revision FROM publication_heads WHERE workspace=? AND owner=?",(ws,cfg["user"])).fetchall()}; [publish(cfg,state,ws,r,root,True,heads) for r in records if r["kind"] not in TABLES]
+                    attest_rows(path,cfg,ws,records); epoch=cfg["workspaces"][ws]["epoch"]; known={r[0] for r in state.execute("SELECT replica FROM replica_receipts WHERE workspace=? AND epoch=? UNION SELECT replica FROM replica_outbox WHERE workspace=? AND epoch=?",(ws,epoch,ws,epoch)).fetchall()}; reconcile_replicas(cfg,state,root,ws,row_replicas(path,cfg,ws,records,key(cfg,ws,epoch),known)); heads={r[0]:r[1] for r in state.execute("SELECT entity,revision FROM publication_heads WHERE workspace=? AND owner=?",(ws,cfg["user"])).fetchall()}; [publish(cfg,state,ws,r,root,True,heads) for r in records if r["kind"] not in TABLES]
                 final=path.stat().st_mtime_ns; [state.execute("INSERT OR REPLACE INTO meta VALUES (?,?)",(f"core_mtime:{ws}",str(final))) for ws,meta in scans]
             [publish(cfg,state,ws,r,root,True,heads) for ws,meta in cfg["workspaces"].items() if ws in ready and ws in active and meta["kind"]=="personal" and f"{ws}:{meta['epoch']}" in cfg["keys"] for heads in [{r[0]:r[1] for r in state.execute("SELECT entity,revision FROM publication_heads WHERE workspace=? AND owner=?",(ws,cfg["user"])).fetchall()}] for r in bridge_records(root,state,ws,meta["kind"])]; state.commit(); upload(cfg,state,root,ready)
             for ws,meta in cfg["workspaces"].items():

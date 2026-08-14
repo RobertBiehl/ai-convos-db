@@ -7,7 +7,7 @@ from pathlib import Path
 
 from ai_convos.cli import ARCHIVE_COLUMNS as COLUMNS, PROVENANCE_KINDS as PROVENANCE, init_schema, observe_provenance, open_db, project_archive_row, project_logical_row, project_provenance, project_row_proof, project_workspace_controls, repository as resolve_repository, set_attachment_path
 from ai_convos_changegraph.provenance import query as graph_query
-from .protocol import digest, logical_row, row_proof, seal_replica, verify_row_proof
+from .protocol import digest, fingerprint, logical_row, row_proof, seal_replica, verify_row_proof
 
 STATE_VERSION="1"
 STATE = """
@@ -23,8 +23,8 @@ CREATE TABLE IF NOT EXISTS event_sequences(workspace TEXT,author TEXT,seq INT,ev
 CREATE TABLE IF NOT EXISTS sequence_gaps(workspace TEXT,author TEXT,seq INT,parents TEXT,PRIMARY KEY(workspace,author,seq)) WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS attachment_parts(workspace TEXT,author TEXT,blob TEXT,idx INT,total INT,attachment TEXT,sha256 TEXT,size INT,chunk_hash TEXT,path TEXT,PRIMARY KEY(workspace,author,blob,idx)) WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS attachment_blobs(workspace TEXT,author TEXT,attachment TEXT,path TEXT,PRIMARY KEY(workspace,author,attachment)) WITHOUT ROWID;
-CREATE TABLE IF NOT EXISTS replica_outbox(workspace TEXT,revision TEXT,epoch INT,uploader TEXT,path TEXT,size INT,PRIMARY KEY(workspace,revision,epoch,uploader)) WITHOUT ROWID;
-CREATE TABLE IF NOT EXISTS replica_receipts(workspace TEXT,revision TEXT,epoch INT,uploader TEXT,cursor INT,PRIMARY KEY(workspace,revision,epoch,uploader)) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS replica_outbox(workspace TEXT,replica TEXT,epoch INT,uploader TEXT,path TEXT,size INT,PRIMARY KEY(workspace,replica,epoch,uploader)) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS replica_receipts(workspace TEXT,replica TEXT,epoch INT,cursor INT,PRIMARY KEY(workspace,replica,epoch)) WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS policies(workspace TEXT,kind TEXT,value TEXT,PRIMARY KEY(workspace,kind,value)) WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS sync_states(workspace TEXT PRIMARY KEY,lifecycle TEXT NOT NULL,tail INT NOT NULL DEFAULT 0,floor INT NOT NULL DEFAULT 0,error TEXT) WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY,value TEXT) WITHOUT ROWID;
@@ -176,14 +176,26 @@ def attest_rows(db_path,cfg,workspace,records):
     except BaseException: db.execute("ROLLBACK"); raise
     finally: db.close()
 def row_replicas(db_path,cfg,workspace,records,key,known=()):
-    fields=("workspace","row_kind","row_id","encoding_v","content_hash","revision","previous_revision","state","author_user_id","author_device_id","authorization_epoch","signature"); db=open_db(db_path,True); out=[]
+    fields=("workspace","row_kind","row_id","encoding_v","content_hash","revision","previous_revision","state","author_user_id","author_device_id","authorization_epoch","signature"); db=open_db(db_path,True); bodies={}
+    proof=lambda values:{"v":1,"kind":"row.proof",**dict(zip(fields,values))}
+    keep=lambda row,p:bodies.setdefault(fingerprint(key,digest(p)),(row,p))
     try:
         for record in (r for r in records if r["kind"] in TABLES):
             p=record["payload"]; row=logical_row(p["table"],p["columns"],p["row"]); values=db.execute("SELECT workspace_id,row_kind,source_row_id,encoding_v,content_hash,revision,previous_revision,state,author_user_id,author_device_id,authorization_epoch,signature FROM remote.row_proofs p WHERE workspace_id=? AND row_kind=? AND source_row_id=? AND author_user_id=? AND content_hash=? AND NOT EXISTS (SELECT 1 FROM remote.row_proofs c WHERE c.previous_revision=p.revision)",(workspace,row["kind"],row["id"],cfg["user"],digest(row))).fetchall()
             if len(values)!=1: raise ValueError(f"current row proof unavailable: {row['kind']}:{row['id']}")
-            proof={"v":1,"kind":"row.proof",**dict(zip(fields,values[0]))}
-            if proof["revision"] not in known: out.append(seal_replica(row,proof,workspace,cfg["workspaces"][workspace]["epoch"],key,cfg["device"]["id"]))
-        return out
+            keep(row,proof(values[0]))
+        for table,physical,source,pid,user in db.execute("SELECT table_name,physical_row_id,source_row_id,proof_id,author_user_id FROM remote.row_origins WHERE workspace_id=? AND proof_id IS NOT NULL",(workspace,)).fetchall():
+            values=db.execute("SELECT workspace_id,row_kind,source_row_id,encoding_v,content_hash,revision,previous_revision,state,author_user_id,author_device_id,authorization_epoch,signature FROM remote.row_proofs WHERE id=?",(pid,)).fetchone(); p=proof(values); cur=db.execute(f"SELECT * EXCLUDE (embedding) FROM {table} WHERE id=?",(physical,)) if table=="messages" else db.execute(f"SELECT * FROM {table} WHERE id=?",(physical,)); cols=[d[0] for d in cur.description]; raw=cur.fetchone()
+            if p["state"]=="deleted": row=logical_row(table,identity=source,state="deleted")
+            elif raw:
+                raw=list(map(clean,raw)); raw[cols.index("id")]=source
+                for column,parent in FKS.get(table,()):
+                    i=cols.index(column); mapped=db.execute("SELECT source_row_id FROM remote.row_origins WHERE table_name=? AND physical_row_id=? AND workspace_id=? AND author_user_id=?",(parent,raw[i],workspace,user)).fetchone(); raw[i]=mapped[0] if mapped else raw[i]
+                row=logical_row(table,cols,raw,source)
+            else: continue
+            keep(row,p)
+        for raw,values in db.execute("SELECT CAST(c.body AS VARCHAR),p.workspace_id,p.row_kind,p.source_row_id,p.encoding_v,p.content_hash,p.revision,p.previous_revision,p.state,p.author_user_id,p.author_device_id,p.authorization_epoch,p.signature FROM remote.row_conflicts c JOIN remote.row_proofs p ON p.id=c.proof_id WHERE p.workspace_id=?",(workspace,)).fetchall(): keep(json.loads(raw),proof(values))
+        return [seal_replica(row,p,workspace,cfg["workspaces"][workspace]["epoch"],key,cfg["device"]["id"]) for token,(row,p) in bodies.items() if token not in known]
     finally: db.close()
 def apply_row_replica(db_path,body,workspace,controls,recover=None,local_user=None,db=None):
     row,proof=body["row"],body["proof"]; candidates=[{k:r[k] for k in ("user","root_public","device","certificate")} for c in controls if c["workspace"]==proof["workspace"]==workspace and c["epoch"]==proof["authorization_epoch"] and proof["author_device_id"] in c["devices"] for r in [c["devices"][proof["author_device_id"]]]]; signer_=candidates[0] if candidates and all(c==candidates[0] for c in candidates) else (_ for _ in ()).throw(ValueError("row proof authorization unavailable")); verify_row_proof(proof,row,signer_["certificate"],signer_["root_public"]); own=db is None

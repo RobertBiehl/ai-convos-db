@@ -257,8 +257,13 @@ pending envelope in memory and reseals it.
 
 Incoming plaintext exists in memory only until DuckDB projection commits.
 Canonical rows use the same lifecycle with a repairable replica envelope keyed
-by `(workspace, revision, epoch, uploader)`. The SQLite outbox retains only its
-encrypted-file path, size, and tuple; acknowledgement leaves only a cursor.
+by an epoch-keyed opaque proof identity and uploader. After state loss, a peer
+advertises these identities in flat pages; the relay returns those already
+present, and only missing bodies are encrypted and uploaded. The SQLite outbox
+retains only its encrypted-file path, size, and tuple; acknowledgement leaves
+only a cursor. An imported row is reconstructed from its canonical DuckDB row
+and retained origin proof, so any authorized holder can repair it without the
+author's key.
 Dispatch is exact on `(kind, payload_v)`. Unknown families and unsupported core
 versions are required by default and block publication; only receiver-known,
 archive-isolated auxiliary families whose product is not installed may defer
