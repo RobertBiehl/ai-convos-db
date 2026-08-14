@@ -158,10 +158,10 @@ def scan(core,graph,kind="personal",repositories=(),roots=()):
     for r in records:
         table,row=r["payload"]["table"],r["payload"]["row"]
         if table=="conversations" and row[0] in convs or table=="messages" and row[0] in msgs or table in ("tool_calls","attachments","file_edits") and row[1] in msgs or table=="artifacts" and row[1] in convs: keep.append(r)
-    allowed_files={r["payload"]["file"] for r in provenance if r["kind"]=="edit.observed" and r["payload"]["id"] in edits}; allowed_repos={r["payload"]["repository"] for r in provenance if r["kind"]=="edit.observed" and r["payload"]["id"] in edits}; allowed_entities=edits|allowed_files|allowed_repos
+    allowed_files={r["payload"]["file"] for r in provenance if r["kind"]=="edit.observed" and r["payload"]["id"] in edits}; allowed_repos={r["payload"]["repository"] for r in provenance if r["kind"]=="edit.observed" and r["payload"]["id"] in edits}
     for r in provenance:
         p,k=r["payload"],r["kind"]
-        if k=="edit.observed" and p["id"] in edits or k=="file.observed" and p["id"] in allowed_files or k=="file.version" and p["file"] in allowed_files or k in ("repository.observed","git.checkpoint","capture.gap") and p.get("repository",p.get("id")) in allowed_repos or k=="checkpoint.link" and p["edit"] in edits or k=="identity.assertion" and (p["left"] in allowed_entities or p["right"] in allowed_entities): keep.append(r)
+        if k=="edit.observed" and p["id"] in edits or k=="file.observed" and p["id"] in allowed_files or k=="file.version" and p["file"] in allowed_files or k in ("repository.observed","git.checkpoint") and p.get("repository",p.get("id")) in allowed_repos or k=="checkpoint.link" and p["edit"] in edits: keep.append(r)
     return keep
 def author_user(value,authors): return (authors or {}).get(value["author"]) or (_ for _ in ()).throw(ValueError("verified author user required"))
 def foreign_id(workspace,author_user,table,old): return digest(f"{workspace}:{author_user}:{table}:{old}")[:16] if old else old

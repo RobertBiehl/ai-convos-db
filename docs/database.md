@@ -126,11 +126,9 @@ product is strictly read-only.
 | `repository_checkouts` | Local-only checkout path, branch, and head |
 | `files` | Repository-relative or opaque external file identity |
 | `file_versions` | Observed full-content hashes |
-| `file_edit_files` | Existing `file_edits.id` to file/hash/evidence edges |
-| `git_checkpoints` | Git head plus exact working-tree state hash and changed paths |
+| `file_edit_files` | Edit-to-file edges plus hashes of captured old/new edit material and evidence quality |
+| `git_checkpoints` | Git head plus capture-time working-tree hash, changed paths, and capture source |
 | `checkpoint_edits` | Checkpoint-to-`file_edits.id` evidence |
-| `assertions` | Typed, reversible identity assertions |
-| `capture_gaps` | Explicit unobserved-change gaps |
 
 There are intentionally no copied prompts, message bodies, changesets,
 file-edit bodies, raw remote payloads, workspace IDs, or device IDs in this

@@ -41,7 +41,7 @@ already parse:
 - **shell:** `NULL` (unknown).
 
 Core captures `old_content` plus repository/file identity, versions, exact
-edit edges, Git checkpoints, assertions, and explicit gaps. Capture runs after
+edit edges, and capture-time Git observations. Capture runs after
 conversation ingestion in a separate transaction, so Git failure can be
 retried without losing the conversation archive. This happens for hooks and
 ordinary sync whether or not Changegraph or Remote is installed.
