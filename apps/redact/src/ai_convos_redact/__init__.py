@@ -66,7 +66,7 @@ def protect(record,root=None,workspace="team"):
     if record["kind"] in ("attachment.record","attachment.chunk"):
         _audit(root,workspace,record,[dict(kind="attachment_redacted",path="$.payload",line=1,start=0)])
         if record["kind"]=="attachment.chunk": return None
-        p=record["payload"]; row=dict(zip(p["columns"],p["row"])); row.update(filename="[REDACTED:attachment]",mime_type=None,size=None,path=None,url=None); return dict(record,payload={**p,"row":[row[c] for c in p["columns"]]})
+        p=record["payload"]; row=dict(zip(p["columns"],p["row"])); row.update(filename="[REDACTED:attachment]",mime_type=None,size=None,path=None,url=None,**({"body_hash":None} if "body_hash" in row else {})); return dict(record,payload={**p,"row":[row[c] for c in p["columns"]]})
     payload,findings=inspect(record["payload"],"$.payload"); _audit(root,workspace,record,findings)
     return dict(record,payload=payload)
 def scan_data(cache=False):

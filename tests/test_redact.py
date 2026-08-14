@@ -83,9 +83,9 @@ def test_every_team_publish_is_scrubbed_before_encryption_and_personal_is_lossle
 
 
 def test_team_attachment_is_explicit_placeholder_without_body(tmp_path):
-    cfg,keys=config(); state=connect(tmp_path/"remote/state.db"); columns=cli.ARCHIVE_COLUMNS["attachments"]; record={"kind":"attachment.record","entity":"attachments:a","payload":{"table":"attachments","columns":columns,"row":["a","m","secret.bin","application/octet-stream",6,None,"https://secret",None]}}
+    cfg,keys=config(); state=connect(tmp_path/"remote/state.db"); columns=cli.ARCHIVE_COLUMNS["attachments"]+["body_hash"]; record={"kind":"attachment.record","entity":"attachments:a","payload":{"table":"attachments","columns":columns,"row":["a","m","secret.bin","application/octet-stream",6,None,"https://secret",None,"a"*64]}}
     assert publish(cfg,state,"team",record,tmp_path) and publish(cfg,state,"team",{"kind":"attachment.chunk","entity":"attachment:a:x:0","payload":{"body":"secret"}},tmp_path) is None
-    path=Path(state.execute("SELECT path FROM outbox WHERE workspace='team'").fetchone()[0]); value=open_event(json.loads(path.read_text()),keys["team"],cfg["device"]["sign_public"]); row=dict(zip(columns,value["payload"]["row"])); assert row["id"]=="a" and row["filename"]=="[REDACTED:attachment]" and all(row[k] is None for k in ("mime_type","size","path","url"))
+    path=Path(state.execute("SELECT path FROM outbox WHERE workspace='team'").fetchone()[0]); value=open_event(json.loads(path.read_text()),keys["team"],cfg["device"]["sign_public"]); row=dict(zip(columns,value["payload"]["row"])); assert row["id"]=="a" and row["filename"]=="[REDACTED:attachment]" and all(row[k] is None for k in ("mime_type","size","path","url","body_hash"))
     assert redact.audit_data(tmp_path)["by_kind"]=={"attachment_redacted":2}
 
 

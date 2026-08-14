@@ -141,8 +141,9 @@ questions do not become invariants by implication.
 
 > Attachment metadata is canonical. A retained attachment body is stored once
 > in the content-addressed body store and referenced by the archive; database
-> rows do not duplicate its bytes. Body ingestion is bounded and streamed, with
-> a 32 MiB per-body limit unless policy deliberately changes it.
+> rows do not duplicate its bytes. The signed attachment row includes the
+> expected body hash. Body ingestion is bounded by a 32 MiB per-body limit
+> unless policy deliberately changes it.
 
 ## Signed replication units
 

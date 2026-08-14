@@ -5,9 +5,9 @@ import pytest
 from cryptography.exceptions import InvalidSignature, InvalidTag
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
-from ai_convos_remote.protocol import (b64, certificate, digest, event, fingerprint, identity, logical_row, open_event, open_key, open_origin, open_replica, public_id, row_proof,
+from ai_convos_remote.protocol import (b64, certificate, digest, event, fingerprint, identity, logical_row, open_blob, open_event, open_key, open_origin, open_replica, public_id, row_proof,
                                        public, purge_certificate, recover, recovery_bundle, seal_event, seal_key,
-                                       seal_origin, seal_replica, verify_certificate, verify_event, verify_purge, verify_row_proof)
+                                       seal_blob, seal_origin, seal_replica, verify_certificate, verify_event, verify_purge, verify_row_proof)
 
 def fixed_identity():
     sign, box = Ed25519PrivateKey.from_private_bytes(bytes(range(32))), X25519PrivateKey.from_private_bytes(bytes(range(32, 64)))
@@ -33,9 +33,10 @@ def test_logical_row_vector_ignores_storage_layout_and_local_fields():
 
 
 def test_logical_attachment_excludes_body_location_and_temporary_url():
-    columns=["id","message_id","filename","mime_type","size","path","url","created_at"]; values=["a","m","x.png","image/png",3,"/one","https://temporary/one",datetime(2026,1,1)]
+    columns=["id","message_id","filename","mime_type","size","path","url","created_at","body_hash"]; values=["a","m","x.png","image/png",3,"/one","https://temporary/one",datetime(2026,1,1),"a"*64]
     other=[*values]; other[5:7]=["/two","https://temporary/two"]
     assert logical_row("attachments",columns,values)==logical_row("attachments",columns,other)
+    other[-1]="b"*64; assert logical_row("attachments",columns,values)!=logical_row("attachments",columns,other)
     with pytest.raises(ValueError,match="logical row"): logical_row("messages",identity="m",state="unknown")
 
 
@@ -63,6 +64,12 @@ def test_delivery_replica_separates_origin_author_from_uploader():
 def test_origin_bundle_is_encrypted_once_and_bound_to_destination_epoch():
     key=bytes(range(32)); controls=[{"workspace":"origin-workspace","revision":1}]; env=seal_origin(controls,"replacement",3,key,"peer"); assert open_origin(env,key)==controls and env["workspace"]=="replacement" and "origin-workspace" not in json.dumps({k:v for k,v in env.items() if k!="ciphertext"})
     with pytest.raises(ValueError,match="origin bundle"): open_origin({**env,"epoch":4},key)
+
+
+def test_blob_replica_is_bounded_content_addressed_and_epoch_bound():
+    key=bytes(range(32)); data=b"retained body"; env=seal_blob(data,"team",2,key,"peer"); assert open_blob(env,key)==(data,digest(data)) and "retained body" not in json.dumps(env)
+    with pytest.raises(ValueError,match="blob replica"): open_blob({**env,"epoch":3},key)
+    with pytest.raises(ValueError,match="32 MiB"): seal_blob(b"x"*(32*1024**2+1),"team",2,key,"peer")
 
 
 def test_event_encryption_tamper_signature_and_header_binding():

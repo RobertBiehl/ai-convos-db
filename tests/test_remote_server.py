@@ -3,7 +3,7 @@ import copy, json, sqlite3
 import pytest
 import ai_convos_remote_server as server_module
 from ai_convos_remote.control import CONTROL_V, record, sign, state_hash
-from ai_convos_remote.protocol import certificate, digest, event, identity, logical_row, purge_certificate, row_proof, seal_event, seal_key, seal_replica, sign_control
+from ai_convos_remote.protocol import certificate, digest, event, identity, logical_row, open_blob, purge_certificate, row_proof, seal_blob, seal_event, seal_key, seal_replica, sign_control
 from ai_convos_remote_server import action, connect, ledger_state
 
 
@@ -48,6 +48,13 @@ def test_repairable_replica_is_uploader_bounded_and_replaceable(tmp_path,monkeyp
     with pytest.raises(PermissionError,match="rejected"): action(db,{"op":"replica_upload_many","envelopes":[{**replacement,"uploader":a["device"]["id"]}]},b["token"])
     monkeypatch.setattr(server_module,"REPLICA_QUOTA",1)
     with pytest.raises(ValueError,match="quota"): action(db,{"op":"replica_upload_many","envelopes":[replacement]},b["token"])
+
+
+def test_blob_replica_is_raw_bounded_repairable_and_history_scoped(tmp_path,monkeypatch):
+    db=connect(tmp_path/"server.db"); a,b=account(db,"alice"),account(db,"bob"); ws,k1,k2="team",bytes([1])*32,bytes([2])*32; state=create_ws(db,a,ws,k1,"team"); env=seal_blob(b"body",ws,1,k1,a["device"]["id"]); state=rotate_ws(db,a,state,k2,((a,"admin"),(b,"member"))); ack=action(db,{"op":"blob_upload","envelope":env},a["token"]); assert db.execute("SELECT LENGTH(ciphertext) FROM blob_replicas").fetchone()[0]==20 and action(db,{"op":"blob_pull","workspace":ws},b["token"])["blobs"]==[]
+    state=history_ws(a,state,b["user"]); action(db,sign_control(a["device"],{"op":"grant_all","workspace":ws,"user":b["user"],"control":state,"envelopes":{"1":{b["device"]["id"]:seal_key(k1,b["device"]["box_public"],f"workspace:{ws}:epoch:1")},"2":{b["device"]["id"]:seal_key(k2,b["device"]["box_public"],f"workspace:{ws}:epoch:2")}}}),a["token"]); pulled=action(db,{"op":"blob_pull","workspace":ws},b["token"])["blobs"][0]; assert pulled["cursor"]==ack["cursor"] and open_blob(pulled["envelope"],k1)[0]==b"body"
+    monkeypatch.setattr(server_module,"BLOB_QUOTA",1)
+    with pytest.raises(ValueError,match="quota"): action(db,{"op":"blob_upload","envelope":env},a["token"])
 
 
 def test_team_add_default_history_grant_remove_and_rotation(tmp_path):

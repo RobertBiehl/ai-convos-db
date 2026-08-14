@@ -40,9 +40,9 @@ def atomic_write(path: Path, text):
     path.parent.mkdir(parents=True, exist_ok=True); mode = path.stat().st_mode&0o777 if path.exists() else 0o600; fd, tmp = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent); f = os.fdopen(fd, "w"); f.write(text); f.close(); os.chmod(tmp, mode); os.replace(tmp, path)
 def atomic_json(path: Path, data): atomic_write(path, json.dumps(data))
 ATTACHMENT_LIMIT=32*1024**2
-def attachment_body(data):
+def attachment_body(data,root=None):
     if len(data)>ATTACHMENT_LIMIT: return None
-    root=DATA_DIR/"attachments"; root.is_symlink() and (_ for _ in ()).throw(ValueError("attachment directory must not be a symlink")); root.mkdir(parents=True,exist_ok=True); os.chmod(root,0o700); blob=hashlib.sha256(data).hexdigest(); path=root/blob
+    root=Path(root or DATA_DIR)/"attachments"; root.is_symlink() and (_ for _ in ()).throw(ValueError("attachment directory must not be a symlink")); root.mkdir(parents=True,exist_ok=True); os.chmod(root,0o700); blob=hashlib.sha256(data).hexdigest(); path=root/blob
     if path.exists():
         if path.is_symlink() or not path.is_file() or path.stat().st_size!=len(data): raise ValueError("attachment body conflicts with content hash")
         with path.open("rb") as source: actual=hashlib.file_digest(source,"sha256").hexdigest()
@@ -80,6 +80,7 @@ CREATE TABLE IF NOT EXISTS remote.row_signers(author_user_id VARCHAR,author_devi
 CREATE TABLE IF NOT EXISTS remote.workspace_controls(workspace_id VARCHAR,revision UINTEGER,epoch UINTEGER,state_hash VARCHAR,control JSON,PRIMARY KEY(workspace_id,revision));
 CREATE TABLE IF NOT EXISTS remote.row_proofs(id VARCHAR PRIMARY KEY,workspace_id VARCHAR,authorization_workspace_id VARCHAR,row_kind VARCHAR,source_row_id VARCHAR,encoding_v USMALLINT,content_hash VARCHAR,revision VARCHAR,previous_revision VARCHAR,state VARCHAR,author_user_id VARCHAR,author_device_id VARCHAR,authorization_epoch UINTEGER,signature VARCHAR);
 CREATE TABLE IF NOT EXISTS remote.row_conflicts(proof_id VARCHAR PRIMARY KEY,body JSON);
+CREATE TABLE IF NOT EXISTS attachment_bodies(attachment_id VARCHAR PRIMARY KEY,content_hash VARCHAR NOT NULL,size UINTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS archive_state(singleton BOOLEAN PRIMARY KEY,archive_id UUID NOT NULL,generation UBIGINT NOT NULL);
 """
 ARCHIVE_COLUMNS={"conversations":["id","source","title","created_at","updated_at","model","cwd","git_branch","project_id","metadata"],"messages":["id","conversation_id","role","content","thinking","created_at","model","metadata","parent_id"],"tool_calls":["id","message_id","tool_name","input","output","status","duration_ms","created_at"],"attachments":["id","message_id","filename","mime_type","size","path","url","created_at"],"artifacts":["id","conversation_id","artifact_type","title","content","language","created_at","version"],"file_edits":["id","message_id","file_path","edit_type","content","created_at","old_content"]}
@@ -186,11 +187,24 @@ def project_workspace_controls(db,controls):
     return len(controls)
 def project_logical_row(db,row,proof,proof_id,native=False):
     table,source=row["kind"],row["id"]; mapped=lambda kind,value:value if native or value is None else provenance_digest(f"{proof['workspace']}:{proof['author_user_id']}:{kind}:{value}")[:16]; physical=mapped(table,source); origin=None if native else {"workspace_id":proof["workspace"],"author_user_id":proof["author_user_id"],"author_device_id":proof["author_device_id"],"source_row_id":source,"source_event_id":proof["revision"],"content_key":f"{table}:{source}","observed_at":None,"proof_id":proof_id}
-    if row["state"]=="deleted": db.execute(f"DELETE FROM {table} WHERE id=?",(physical,)); origin and db.execute("INSERT OR REPLACE INTO remote.row_origins VALUES (?,?,?,?,?,?,?,?,?,?)",(table,physical,*(origin[k] for k in ("workspace_id","author_user_id","author_device_id","source_row_id","source_event_id","content_key","observed_at","proof_id")))); _archive_touch(db); return physical
+    if row["state"]=="deleted": db.execute(f"DELETE FROM {table} WHERE id=?",(physical,)); table=="attachments" and db.execute("DELETE FROM attachment_bodies WHERE attachment_id=?",(physical,)); origin and db.execute("INSERT OR REPLACE INTO remote.row_origins VALUES (?,?,?,?,?,?,?,?,?,?)",(table,physical,*(origin[k] for k in ("workspace_id","author_user_id","author_device_id","source_row_id","source_event_id","content_key","observed_at","proof_id")))); _archive_touch(db); return physical
     data={"id":source,**row["data"]}; values=[data[c] if c in data else None for c in ARCHIVE_COLUMNS[table]]; values[0]=physical
     for column,parent in {"messages":(("conversation_id","conversations"),("parent_id","messages")),"tool_calls":(("message_id","messages"),),"attachments":(("message_id","messages"),),"artifacts":(("conversation_id","conversations"),),"file_edits":(("message_id","messages"),)}.get(table,()): values[ARCHIVE_COLUMNS[table].index(column)]=mapped(parent,data[column])
-    project_archive_row(db,table,ARCHIVE_COLUMNS[table],values,origin); return physical
+    project_archive_row(db,table,ARCHIVE_COLUMNS[table],values,origin); table=="attachments" and data["body_hash"] and db.execute("INSERT OR REPLACE INTO attachment_bodies VALUES (?,?,?)",(physical,data["body_hash"],data["size"])); return physical
 def set_attachment_path(db,row_id,path): db.execute("UPDATE attachments SET path=? WHERE id=?",(str(path),row_id)); _archive_touch(db)
+def index_attachment_body(db,row_id,path,size=None):
+    path=Path(path); actual=path.stat().st_size if path.is_file() and not path.is_symlink() else -1
+    if actual<0 or actual>ATTACHMENT_LIMIT or size is not None and actual!=size: return None
+    with path.open("rb") as source: body_hash=hashlib.file_digest(source,"sha256").hexdigest()
+    db.execute("INSERT OR REPLACE INTO attachment_bodies VALUES (?,?,?)",(row_id,body_hash,actual)); _archive_touch(db); return body_hash
+def project_attachment_body(db_path,data,body_hash):
+    if provenance_digest(data)!=body_hash: raise ValueError("attachment body hash mismatch")
+    db=open_db(db_path); rows=db.execute("SELECT b.attachment_id,a.path FROM attachment_bodies b JOIN attachments a ON a.id=b.attachment_id WHERE b.content_hash=?",(body_hash,)).fetchall(); begun=False
+    try:
+        if rows and (path:=attachment_body(data,Path(db_path).parent)) and (ids:=[row_id for row_id,old in rows if old!=str(path)]): db.execute("BEGIN"); begun=True; [set_attachment_path(db,row_id,path) for row_id in ids]; db.execute("COMMIT"); begun=False
+        return len(rows)
+    except BaseException: begun and db.execute("ROLLBACK"); raise
+    finally: db.close()
 def init_schema(conn):
     conn.execute("""CREATE TABLE IF NOT EXISTS conversations (
         id VARCHAR PRIMARY KEY, source VARCHAR NOT NULL, title VARCHAR, created_at TIMESTAMP, updated_at TIMESTAMP,
@@ -218,7 +232,7 @@ def init_schema(conn):
     conn.execute("BEGIN")
     try:
         cols={r[0] for r in conn.execute("SELECT column_name FROM information_schema.columns WHERE table_schema='provenance' AND table_name='file_edit_files'").fetchall()}; [(conn.execute(f"ALTER TABLE provenance.file_edit_files RENAME COLUMN {old} TO {new}"),cols.add(new)) for old,new in (("before_hash","old_content_hash"),("after_hash","new_content_hash")) if old in cols and new not in cols]
-        conn.execute("ALTER TABLE provenance.git_checkpoints ADD COLUMN IF NOT EXISTS capture_source VARCHAR"); conn.execute("ALTER TABLE remote.row_origins ADD COLUMN IF NOT EXISTS proof_id VARCHAR"); conn.execute("ALTER TABLE remote.row_proofs ADD COLUMN IF NOT EXISTS authorization_workspace_id VARCHAR"); conn.execute("UPDATE remote.row_proofs SET authorization_workspace_id=workspace_id WHERE authorization_workspace_id IS NULL"); conn.execute("DROP TABLE IF EXISTS provenance.assertions"); conn.execute("DROP TABLE IF EXISTS provenance.capture_gaps"); conn.execute("COMMIT")
+        conn.execute("ALTER TABLE provenance.git_checkpoints ADD COLUMN IF NOT EXISTS capture_source VARCHAR"); conn.execute("ALTER TABLE remote.row_origins ADD COLUMN IF NOT EXISTS proof_id VARCHAR"); conn.execute("ALTER TABLE remote.row_proofs ADD COLUMN IF NOT EXISTS authorization_workspace_id VARCHAR"); conn.execute("UPDATE remote.row_proofs SET authorization_workspace_id=workspace_id WHERE authorization_workspace_id IS NULL"); [index_attachment_body(conn,*r) for r in conn.execute("SELECT id,path,size FROM attachments WHERE path IS NOT NULL AND id NOT IN (SELECT attachment_id FROM attachment_bodies)").fetchall()]; conn.execute("DROP TABLE IF EXISTS provenance.assertions"); conn.execute("DROP TABLE IF EXISTS provenance.capture_gaps"); conn.execute("COMMIT")
     except BaseException: conn.execute("ROLLBACK"); raise
     conn.execute("INSERT INTO archive_state SELECT TRUE,uuid(),0 WHERE NOT EXISTS (SELECT 1 FROM archive_state)")
     conn.execute("INSTALL fts; LOAD fts")
@@ -768,6 +782,7 @@ def upsert(conn, r: ParseResult):
             if prev and payload(prev) != payload(vals): hist = list(prev); hist[0] = gen_id("history", f"{table}:{r['id']}:{json.dumps(payload(hist), default=str)}"); cur(f"INSERT INTO {table} VALUES ({','.join(['?']*len(hist))}) ON CONFLICT DO NOTHING", hist)
             cur(f"INSERT OR REPLACE INTO {table} VALUES ({','.join(['?']*len(vals))})", vals)
     [replace_preserving(t, rows) for t, rows in (("tool_calls", r.tools), ("attachments", r.attachs), ("artifacts", r.artifacts), ("file_edits", r.edits))]
+    [index_attachment_body(conn,a["id"],a["path"],a.get("size")) for a in r.attachs if a.get("path")]
     if any((r.convs,r.msgs,r.tools,r.attachs,r.artifacts,r.edits)): _archive_touch(conn)
     return len(r.convs), len(r.msgs), len(r.tools), len(r.attachs), len(r.edits), len(new_convs), len(updated), changed_msgs
 

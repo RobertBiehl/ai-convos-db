@@ -10,7 +10,7 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 
 V = 1
-ROW_FIELDS_V1={"conversations":("source","title","created_at","updated_at","model","project_id","metadata"),"messages":("conversation_id","role","content","thinking","created_at","model","metadata","parent_id"),"tool_calls":("message_id","tool_name","input","output","status","duration_ms","created_at"),"attachments":("message_id","filename","mime_type","size","created_at"),"artifacts":("conversation_id","artifact_type","title","content","language","created_at","version"),"file_edits":("message_id","file_path","edit_type","content","created_at","old_content")}
+ROW_FIELDS_V1={"conversations":("source","title","created_at","updated_at","model","project_id","metadata"),"messages":("conversation_id","role","content","thinking","created_at","model","metadata","parent_id"),"tool_calls":("message_id","tool_name","input","output","status","duration_ms","created_at"),"attachments":("message_id","filename","mime_type","size","body_hash","created_at"),"artifacts":("conversation_id","artifact_type","title","content","language","created_at","version"),"file_edits":("message_id","file_path","edit_type","content","created_at","old_content")}
 ROW_JSON_V1={"metadata","input","output"}; ROW_TIME_V1={"created_at","updated_at"}
 ROW_PROOF_FIELDS={"v","kind","workspace","authorization_workspace","row_kind","row_id","encoding_v","content_hash","revision","previous_revision","state","author_user_id","author_device_id","authorization_epoch","signature"}
 def canon(v): return json.dumps(v, sort_keys=True, separators=(",", ":"), ensure_ascii=True, allow_nan=False).encode()
@@ -107,6 +107,13 @@ def seal_origin(controls,workspace,epoch,key,uploader):
 def open_origin(value,key):
     try: header={k:value[k] for k in ("v","kind","workspace","origin","epoch","uploader","nonce")}; body=json.loads(AESGCM(key).decrypt(unb64(value["nonce"]),unb64(value["ciphertext"]),canon(header))); controls=body["controls"]; return controls if set(value)==set(header)|{"ciphertext"} and value["v"]==1 and value["kind"]=="origin.bundle" and isinstance(controls,list) and controls and value["origin"]==fingerprint(key,digest(controls)) else (_ for _ in ()).throw(ValueError)
     except (InvalidTag,KeyError,TypeError,ValueError) as e: raise ValueError("invalid origin bundle") from e
+
+def seal_blob(data,workspace,epoch,key,uploader):
+    if len(data)>32*1024**2: raise ValueError("attachment body exceeds 32 MiB")
+    nonce=os.urandom(12); body_hash=digest(data); header={"v":1,"kind":"blob.replica","workspace":workspace,"blob":fingerprint(key,body_hash),"epoch":epoch,"uploader":uploader,"size":len(data),"nonce":b64(nonce)}; return {**header,"ciphertext":b64(AESGCM(key).encrypt(nonce,data,canon(header)))}
+def open_blob(value,key):
+    try: header={k:value[k] for k in ("v","kind","workspace","blob","epoch","uploader","size","nonce")}; data=AESGCM(key).decrypt(unb64(value["nonce"]),unb64(value["ciphertext"]),canon(header)); body_hash=digest(data); return (data,body_hash) if set(value)==set(header)|{"ciphertext"} and value["v"]==1 and value["kind"]=="blob.replica" and 0<=value["size"]<=32*1024**2 and len(data)==value["size"] and value["blob"]==fingerprint(key,body_hash) else (_ for _ in ()).throw(ValueError)
+    except (InvalidTag,KeyError,TypeError,ValueError) as e: raise ValueError("invalid blob replica") from e
 
 def _wrap_key(shared, context): return HKDF(algorithm=hashes.SHA256(), length=32, salt=None, info=b"convos-key-v1:" + context.encode()).derive(shared)
 def seal_key(key, recipient_public, context):
