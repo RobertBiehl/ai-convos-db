@@ -8,6 +8,10 @@ read_when:
 
 # Architecture
 
+Normative product boundaries for archive ownership, replication, recovery, and
+provenance live in [Product invariants](invariants.md). Implementation plans and
+older design notes yield to those rules unless they are deliberately revised.
+
 ## Overview
 
 Single-file CLI that normalizes conversations from multiple AI providers into a unified DuckDB database with full-text search.
