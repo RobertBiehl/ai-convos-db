@@ -3,13 +3,13 @@ import fcntl, json, os, sqlite3, time, urllib.error, urllib.parse, urllib.reques
 from contextlib import contextmanager
 from pathlib import Path; from typing import Optional
 
-import duckdb, typer
+import typer
 from ai_convos_redact import protect as protect_record
 _pending=[]
 def register(app): _pending.append(app) if "remote" not in globals() else app.add_typer(remote,name="remote")
-from ai_convos.cli import PROJECT_ROOT, archive_state as core_archive_state, drain_hooks, init_schema, install_hooks, repository
+from ai_convos.cli import PROJECT_ROOT, archive_state as core_archive_state, drain_hooks, init_schema, install_hooks, open_db, repository
 from .control import approved, electorate, proposal as device_proposal, record as control_record, sign as control_sign, state_hash, verify_proposal, verify_state, vote as device_vote
-from .projection import attest_rows, bridge_purges, bridge_records, connect, cutover_state, event_support, inspect_state, project, project_many, query as graph_query, read_state, relocate_attachments, reset_history, row_replicas, scan, sequence, verify_history
+from .projection import TABLES, apply_row_replicas, attest_rows, bridge_purges, bridge_records, connect, cutover_state, event_support, inspect_state, project, project_many, query as graph_query, read_state, relocate_attachments, reset_history, row_replicas, scan, sequence, verify_history
 from .protocol import (b64, certificate, digest, event, identity, material_event, open_event, open_key, open_replica, public, public_id, purge_certificate, recover,
                        recovery_bundle, seal_event, seal_history, seal_key, seal_replica, sign_control, signer, unb64, verify_certificate, verify_purge)
 from .service import edit_hooks, enable
@@ -22,7 +22,7 @@ def core_path(root=None): return local_root(root)/"data"/"convos.db"
 def archive_info(root=None,create=False):
     path=core_path(root)
     if not path.exists() and not create: return None
-    path.parent.mkdir(parents=True,exist_ok=True); db=duckdb.connect(str(path)); init_schema(db)
+    path.parent.mkdir(parents=True,exist_ok=True); db=open_db(path); init_schema(db)
     try: return core_archive_state(db)
     finally: db.close()
 def load(root=None):
@@ -229,6 +229,23 @@ def purge_events(cfg,state,ws,intents):
         certificates.append(purge_certificate(cfg["device"],ws,target,[previous[0]] if previous else [],anchor))
     for i in range(0,len(certificates),500):
         batch=certificates[i:i+500]; request(cfg,{"op":"purge","workspace":ws,"certificates":batch}); [drop_event(state,ws,value["event"]) for value in batch]; state.commit()
+def pull_row_replicas(cfg,state,root,ws,recover=None):
+    sid=ws["id"]; after=int((state.execute("SELECT value FROM meta WHERE key=?",(f"replica_cursor:{sid}",)).fetchone() or [0])[0]); total=0
+    while True:
+        result=request(cfg,{"op":"replica_pull","workspace":sid,"after":after,"limit":500}); floor,tail=result["floor"],result["tail"]
+        if not all(isinstance(v,int) and not isinstance(v,bool) and v>=0 for v in (floor,tail)) or floor>tail and tail or after>tail: raise ValueError("relay replica cursor window is invalid")
+        bodies=[]; cursor=after
+        for item in result["replicas"]:
+            env=item["envelope"]
+            if not isinstance(item["cursor"],int) or isinstance(item["cursor"],bool) or not cursor<item["cursor"]<=tail or env["workspace"]!=sid or not access_from(cfg,sid)<=env["epoch"]<=cfg["controls"][sid]["epoch"]: raise ValueError("row replica envelope response mismatch")
+            cursor=item["cursor"]
+            bodies.append(open_replica(env,key(cfg,sid,env["epoch"])))
+        apply_row_replicas(core_path(root),bodies,sid,ws["controls"],recover,cfg["user"])
+        for item in result["replicas"]:
+            env=item["envelope"]; state.execute("INSERT OR REPLACE INTO replica_receipts VALUES (?,?,?,?,?)",(sid,env["revision"],env["epoch"],env["uploader"],item["cursor"])); after=max(after,item["cursor"]); total+=1
+        state.execute("INSERT OR REPLACE INTO meta VALUES (?,?)",(f"replica_cursor:{sid}",str(after))); state.commit()
+        if after>=tail: return total
+        if not result["replicas"]: raise ValueError("relay replica tail cannot be reached")
 def pull(cfg,state,root=None):
     root=local_root(root)
     server=refresh(cfg,root)
@@ -239,9 +256,9 @@ def pull(cfg,state,root=None):
         records={r["device"]["id"]:r for control in ws["controls"] for r in control["devices"].values()}; devices={device:r["device"] for device,r in records.items()}; authors={device:r["user"] for device,r in records.items()}
         after=(state.execute("SELECT cursor FROM cursors WHERE workspace=?",(sid,)).fetchone() or [0])[0]; seen=(state.execute("SELECT value FROM meta WHERE key=?",(f"history_from:{sid}",)).fetchone() or [str(ws["history_from"])])[0]; earliest=min([k["epoch"] for k in ws["keys"]],default=ws["epoch"]); old_key=int((state.execute("SELECT value FROM meta WHERE key=?",(f"key_from:{sid}",)).fetchone() or [earliest])[0]); start=access_from(cfg,sid); candidates=[control["boundary"] for control in ws["controls"] if control["boundary"]["epoch"]==start]; boundary=candidates[0] if candidates and all(value==candidates[0] for value in candidates) else (_ for _ in ()).throw(ValueError("signed history boundary is ambiguous")); proof=digest(boundary); old_proof=(state.execute("SELECT value FROM meta WHERE key=?",(f"boundary:{sid}",)).fetchone() or [None])[0]; mode=(state.execute("SELECT value FROM meta WHERE key=?",(f"archive_mode:{sid}",)).fetchone() or [None])[0]; recover=mode if mode=="adopt" or ws["kind"]=="personal" and mode in ("native","import") else None
         deferred=state.execute("SELECT kind,payload_v,required FROM deferred_events WHERE workspace=?",(sid,)).fetchall(); reclassify=any(event_support(r)!=("required" if r["required"] else "optional") for r in deferred)
-        if not current or ws["history_from"]<int(seen) or earliest<old_key or proof!=old_proof or reclassify: after=0; reset_history(state,sid,boundary); state.execute("INSERT OR REPLACE INTO meta VALUES (?,?)",(f"boundary:{sid}",proof)); state.commit()
+        if not current or ws["history_from"]<int(seen) or earliest<old_key or proof!=old_proof or reclassify: after=0; reset_history(state,sid,boundary); state.execute("INSERT OR REPLACE INTO meta VALUES (?,?),(?,?)",(f"boundary:{sid}",proof,f"replica_cursor:{sid}","0")); state.commit()
         try:
-            total=0
+            total=0; replicas=pull_row_replicas(cfg,state,root,ws,recover)
             while True:
                 result=request(cfg,{"op":"pull","workspace":sid,"after":after,"limit":500}); floor,tail=result["floor"],result["tail"]
                 if not all(isinstance(v,int) and not isinstance(v,bool) and v>=0 for v in (floor,tail)) or floor>tail and tail or after>tail: raise ValueError("relay cursor window is invalid")
@@ -272,7 +289,7 @@ def pull(cfg,state,root=None):
                 if not result["events"]: raise ValueError("relay tail cannot be reached")
             verify_history(state,sid,ws["controls"],start)
             if mode=="import": raise ValueError("archive rollback or replacement recovered additively; publication remains blocked")
-            state.execute("INSERT OR REPLACE INTO sync_states VALUES (?,'ready',?,?,NULL)",(sid,tail,floor)); state.commit(); summary[sid]={"events":total,"cursor":after,"tail":tail,"floor":floor}
+            state.execute("INSERT OR REPLACE INTO sync_states VALUES (?,'ready',?,?,NULL)",(sid,tail,floor)); state.commit(); summary[sid]={"events":total,"replicas":replicas,"cursor":after,"tail":tail,"floor":floor}
         except Exception as e:
             state.rollback(); state.execute("INSERT OR REPLACE INTO sync_states VALUES (?,'blocked',COALESCE((SELECT tail FROM sync_states WHERE workspace=?),0),COALESCE((SELECT floor FROM sync_states WHERE workspace=?),0),?)",(sid,sid,sid,str(e))); state.commit(); raise
     return summary
@@ -295,12 +312,12 @@ def sync_once(root=None,force=False):
         try:
             drain_hooks(); refresh(cfg,root); ready={r[0] for r in state.execute("SELECT workspace FROM sync_states WHERE lifecycle='ready'").fetchall()}; upload(cfg,state,root,ready); prepare_archive(cfg,state,root); pull(cfg,state,root); ready={r[0] for r in state.execute("SELECT workspace FROM sync_states WHERE lifecycle='ready'").fetchall()}; flush_selected(cfg,state,root,ready); path=core_path(root); stamp=path.stat().st_mtime_ns if path.exists() else 0; active={w["id"] for w in cfg["server_state"]["workspaces"]}; scans=[(ws,meta) for ws,meta in cfg["workspaces"].items() if ws in ready and ws in active and f"{ws}:{meta['epoch']}" in cfg["keys"] and (force or stamp!=int((state.execute("SELECT value FROM meta WHERE key=?",(f"core_mtime:{ws}",)).fetchone() or ["0"])[0]))] if path.is_file() else []
             if scans:
-                core=duckdb.connect(str(path),read_only=True); batches=[]
+                core=open_db(path,True); batches=[]
                 for ws,meta in scans:
                     pol=state.execute("SELECT kind,value FROM policies WHERE workspace=?",(ws,)).fetchall(); repos=[p[1] for p in pol if p[0]=="repository"]; roots=[cfg.get("bindings",{}).get(f"{ws}:{p[1]}") for p in pol if p[0]=="path" and cfg.get("bindings",{}).get(f"{ws}:{p[1]}")]; records=[safe for r in scan(core,state,meta["kind"],repos,roots) if (safe:=protect_record(r,root,ws) if meta["kind"]=="team" else r) is not None]; batches.append((ws,records))
                 core.close()
                 for ws,records in batches:
-                    attest_rows(path,cfg,ws,records); epoch=cfg["workspaces"][ws]["epoch"]; known={r[0] for r in state.execute("SELECT revision FROM replica_receipts WHERE workspace=? AND epoch=? UNION SELECT revision FROM replica_outbox WHERE workspace=? AND epoch=?",(ws,epoch,ws,epoch)).fetchall()}; [queue_replica(state,root,env) for env in row_replicas(path,cfg,ws,records,key(cfg,ws,epoch),known)]; heads={r[0]:r[1] for r in state.execute("SELECT entity,revision FROM publication_heads WHERE workspace=? AND owner=?",(ws,cfg["user"])).fetchall()}; [publish(cfg,state,ws,r,root,True,heads) for r in records]
+                    attest_rows(path,cfg,ws,records); epoch=cfg["workspaces"][ws]["epoch"]; known={r[0] for r in state.execute("SELECT revision FROM replica_receipts WHERE workspace=? AND epoch=? UNION SELECT revision FROM replica_outbox WHERE workspace=? AND epoch=?",(ws,epoch,ws,epoch)).fetchall()}; [queue_replica(state,root,env) for env in row_replicas(path,cfg,ws,records,key(cfg,ws,epoch),known)]; heads={r[0]:r[1] for r in state.execute("SELECT entity,revision FROM publication_heads WHERE workspace=? AND owner=?",(ws,cfg["user"])).fetchall()}; [publish(cfg,state,ws,r,root,True,heads) for r in records if r["kind"] not in TABLES]
                 final=path.stat().st_mtime_ns; [state.execute("INSERT OR REPLACE INTO meta VALUES (?,?)",(f"core_mtime:{ws}",str(final))) for ws,meta in scans]
             [publish(cfg,state,ws,r,root,True,heads) for ws,meta in cfg["workspaces"].items() if ws in ready and ws in active and meta["kind"]=="personal" and f"{ws}:{meta['epoch']}" in cfg["keys"] for heads in [{r[0]:r[1] for r in state.execute("SELECT entity,revision FROM publication_heads WHERE workspace=? AND owner=?",(ws,cfg["user"])).fetchall()}] for r in bridge_records(root,state,ws,meta["kind"])]; state.commit(); upload(cfg,state,root,ready)
             for ws,meta in cfg["workspaces"].items():

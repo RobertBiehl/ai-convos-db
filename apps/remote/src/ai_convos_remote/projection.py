@@ -5,10 +5,9 @@ from functools import lru_cache
 from importlib.metadata import entry_points
 from pathlib import Path
 
-import duckdb
-from ai_convos.cli import ARCHIVE_COLUMNS as COLUMNS, PROVENANCE_KINDS as PROVENANCE, init_schema, observe_provenance, project_archive_row, project_provenance, project_row_proof, project_workspace_controls, repository as resolve_repository, set_attachment_path
+from ai_convos.cli import ARCHIVE_COLUMNS as COLUMNS, PROVENANCE_KINDS as PROVENANCE, init_schema, observe_provenance, open_db, project_archive_row, project_logical_row, project_provenance, project_row_proof, project_workspace_controls, repository as resolve_repository, set_attachment_path
 from ai_convos_changegraph.provenance import query as graph_query
-from .protocol import digest, logical_row, row_proof, seal_replica
+from .protocol import digest, logical_row, row_proof, seal_replica, verify_row_proof
 
 STATE_VERSION="9"
 STATE = """
@@ -114,7 +113,7 @@ def relocate_attachments(db_path,remote_root):
     db_path,remote_root=Path(db_path),Path(remote_root)
     if not db_path.is_file() or not remote_root.exists(): return 0
     if remote_root.is_symlink() or not remote_root.is_dir(): raise ValueError("legacy attachment root must be a regular directory")
-    db=duckdb.connect(str(db_path)); rows=db.execute("SELECT id,path,size FROM attachments WHERE path IS NOT NULL").fetchall(); moved=[]; target_root=db_path.parent/"attachments"; begun=False
+    db=open_db(db_path); rows=db.execute("SELECT id,path,size FROM attachments WHERE path IS NOT NULL").fetchall(); moved=[]; target_root=db_path.parent/"attachments"; begun=False
     try:
         for row_id,value,size in rows:
             source=Path(value)
@@ -166,7 +165,7 @@ def scan(core,graph,kind="personal",repositories=(),roots=()):
         if k=="edit.observed" and p["id"] in edits or k=="file.observed" and p["id"] in allowed_files or k=="file.version" and p["file"] in allowed_files or k in ("repository.observed","git.checkpoint") and p.get("repository",p.get("id")) in allowed_repos or k=="checkpoint.link" and p["edit"] in edits: keep.append(r)
     return keep
 def attest_rows(db_path,cfg,workspace,records):
-    controls=next(w["controls"] for w in cfg["server_state"]["workspaces"] if w["id"]==workspace); device=cfg["device"]; signer=cfg["controls"][workspace]["devices"][device["id"]]; db=duckdb.connect(str(db_path)); init_schema(db); made=0; db.execute("BEGIN")
+    controls=next(w["controls"] for w in cfg["server_state"]["workspaces"] if w["id"]==workspace); device=cfg["device"]; signer=cfg["controls"][workspace]["devices"][device["id"]]; db=open_db(db_path); init_schema(db); made=0; db.execute("BEGIN")
     try:
         project_workspace_controls(db,controls)
         for record in (r for r in records if r["kind"] in TABLES):
@@ -178,7 +177,7 @@ def attest_rows(db_path,cfg,workspace,records):
     except BaseException: db.execute("ROLLBACK"); raise
     finally: db.close()
 def row_replicas(db_path,cfg,workspace,records,key,known=()):
-    fields=("workspace","row_kind","row_id","encoding_v","content_hash","revision","previous_revision","state","author_user_id","author_device_id","authorization_epoch","signature"); db=duckdb.connect(str(db_path),read_only=True); out=[]
+    fields=("workspace","row_kind","row_id","encoding_v","content_hash","revision","previous_revision","state","author_user_id","author_device_id","authorization_epoch","signature"); db=open_db(db_path,True); out=[]
     try:
         for record in (r for r in records if r["kind"] in TABLES):
             p=record["payload"]; row=logical_row(p["table"],p["columns"],p["row"]); values=db.execute("SELECT workspace_id,row_kind,source_row_id,encoding_v,content_hash,revision,previous_revision,state,author_user_id,author_device_id,authorization_epoch,signature FROM remote.row_proofs p WHERE workspace_id=? AND row_kind=? AND source_row_id=? AND author_user_id=? AND content_hash=? AND NOT EXISTS (SELECT 1 FROM remote.row_proofs c WHERE c.previous_revision=p.revision)",(workspace,row["kind"],row["id"],cfg["user"],digest(row))).fetchall()
@@ -187,10 +186,28 @@ def row_replicas(db_path,cfg,workspace,records,key,known=()):
             if proof["revision"] not in known: out.append(seal_replica(row,proof,workspace,cfg["workspaces"][workspace]["epoch"],key,cfg["device"]["id"]))
         return out
     finally: db.close()
+def apply_row_replica(db_path,body,workspace,controls,recover=None,local_user=None,db=None):
+    row,proof=body["row"],body["proof"]; candidates=[{k:r[k] for k in ("user","root_public","device","certificate")} for c in controls if c["workspace"]==proof["workspace"]==workspace and c["epoch"]==proof["authorization_epoch"] and proof["author_device_id"] in c["devices"] for r in [c["devices"][proof["author_device_id"]]]]; signer_=candidates[0] if candidates and all(c==candidates[0] for c in candidates) else (_ for _ in ()).throw(ValueError("row proof authorization unavailable")); verify_row_proof(proof,row,signer_["certificate"],signer_["root_public"]); own=db is None
+    if own: db=open_db(db_path); init_schema(db); db.execute("BEGIN")
+    try:
+        scope=(proof["workspace"],proof["row_kind"],proof["row_id"],proof["author_user_id"]); old=db.execute("SELECT 1 FROM remote.row_proofs WHERE revision=? AND workspace_id=? AND row_kind=? AND source_row_id=? AND author_user_id=?",(proof["revision"],*scope)).fetchone(); heads={r[0] for r in db.execute("SELECT DISTINCT p.revision FROM remote.row_proofs p WHERE p.workspace_id=? AND p.row_kind=? AND p.source_row_id=? AND p.author_user_id=? AND NOT EXISTS (SELECT 1 FROM remote.row_proofs c WHERE c.workspace_id=p.workspace_id AND c.row_kind=p.row_kind AND c.source_row_id=p.source_row_id AND c.author_user_id=p.author_user_id AND c.previous_revision=p.revision)",scope).fetchall()}; stale=db.execute("SELECT 1 FROM remote.row_proofs WHERE previous_revision=? AND workspace_id=? AND row_kind=? AND source_row_id=? AND author_user_id=?",(proof["revision"],*scope)).fetchone(); project_workspace_controls(db,controls); pid=project_row_proof(db,proof,signer_["root_public"],signer_["certificate"])
+        if old or stale: own and db.execute("COMMIT"); return False
+        if heads and (proof["previous_revision"] not in heads or len(heads)>1): db.execute("INSERT OR REPLACE INTO remote.row_conflicts VALUES (?,?)",(pid,json.dumps(row,sort_keys=True,separators=(",",":")))); own and db.execute("COMMIT"); return False
+        owned=proof["author_user_id"]==local_user
+        if not (owned and recover=="adopt"): project_logical_row(db,row,proof,pid,owned and recover=="native")
+        own and db.execute("COMMIT"); return True
+    except BaseException: own and db.execute("ROLLBACK"); raise
+    finally: own and db.close()
+def apply_row_replicas(db_path,bodies,workspace,controls,recover=None,local_user=None):
+    if not bodies: return []
+    db=open_db(db_path); init_schema(db); db.execute("BEGIN")
+    try: result=[apply_row_replica(db_path,body,workspace,controls,recover,local_user,db) for body in bodies]; db.execute("COMMIT"); return result
+    except BaseException: db.execute("ROLLBACK"); raise
+    finally: db.close()
 def author_user(value,authors): return (authors or {}).get(value["author"]) or (_ for _ in ()).throw(ValueError("verified author user required"))
 def foreign_id(workspace,author_user,table,old): return digest(f"{workspace}:{author_user}:{table}:{old}")[:16] if old else old
 def attachment_path(db_path,db,target,path):
-    target_db=db or (duckdb.connect(str(db_path)) if Path(db_path).exists() else None); own=target_db is not None and db is None
+    target_db=db or (open_db(db_path) if Path(db_path).exists() else None); own=target_db is not None and db is None
     try: own and target_db.execute("BEGIN"); target_db and set_attachment_path(target_db,target,path); own and target_db.execute("COMMIT")
     except BaseException:
         if own: target_db.execute("ROLLBACK")
@@ -228,7 +245,7 @@ def apply_record(db_path,state,value,workspace,local_device=None,db=None,authors
     mapped=lambda table,old:old if native else foreign_id(workspace,user,table,old); values=list(p["row"]); values[0]=mapped(table,values[0])
     for column,parent in FKS.get(table,()): idx=p["columns"].index(column); values[idx]=mapped(parent,values[idx])
     own=db is None
-    if own: Path(db_path).parent.mkdir(parents=True,exist_ok=True); db=duckdb.connect(str(db_path)); init_schema(db); db.execute("BEGIN")
+    if own: Path(db_path).parent.mkdir(parents=True,exist_ok=True); db=open_db(db_path); init_schema(db); db.execute("BEGIN")
     try:
         project_archive_row(db,table,p["columns"],values,None if native else {"workspace_id":workspace,"author_user_id":user,"author_device_id":value["author"],"source_row_id":p["row"][0],"source_event_id":value["id"],"content_key":value["entity"],"observed_at":value["observed_at"]})
         if table=="attachments" and (blob:=state.execute("SELECT path FROM attachment_blobs WHERE workspace=? AND author=? AND attachment=?",(workspace,value["author"],p["row"][0])).fetchone()): set_attachment_path(db,values[0],blob[0])
@@ -285,7 +302,7 @@ def project(db_path,state,value,workspace,local_device=None,db=None,root=None,ba
     if owned and recover=="adopt": return True
     if value["author"]==local_device and not owned: return True
     own=db is None
-    if own: Path(db_path).parent.mkdir(parents=True,exist_ok=True); db=duckdb.connect(str(db_path)); init_schema(db); db.execute("BEGIN")
+    if own: Path(db_path).parent.mkdir(parents=True,exist_ok=True); db=open_db(db_path); init_schema(db); db.execute("BEGIN")
     try: result=project_provenance(db,value,lambda table,old:old if native else foreign_id(workspace,user,table,old)); own and db.execute("COMMIT"); return result
     except BaseException:
         if own: db.execute("ROLLBACK")
@@ -294,7 +311,7 @@ def project(db_path,state,value,workspace,local_device=None,db=None,root=None,ba
         if own: db.close()
 def project_many(db_path,state,items,local_device=None,root=None,commit=True,authors=None,recover=None,local_user=None):
     records=any(v["kind"] in set(TABLES)|PROVENANCE and (v["author"]!=local_device or recover and author_user(v,authors)==local_user) for _,v in items); db=None
-    if records: Path(db_path).parent.mkdir(parents=True,exist_ok=True); db=duckdb.connect(str(db_path)); init_schema(db)
+    if records: Path(db_path).parent.mkdir(parents=True,exist_ok=True); db=open_db(db_path); init_schema(db)
     committed=False
     try:
         if db: db.execute("BEGIN")
@@ -308,6 +325,6 @@ def project_many(db_path,state,items,local_device=None,root=None,commit=True,aut
         if db: db.close()
     return len(items)
 def query(db_path,name,arg=None):
-    db=duckdb.connect(str(db_path),read_only=True)
+    db=open_db(db_path,True)
     try: return graph_query(db,name,arg)
     finally: db.close()
