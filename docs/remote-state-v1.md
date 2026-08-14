@@ -106,25 +106,18 @@ derived content are forbidden.
 ### Relay
 
 The relay stores opaque delivery envelopes and encrypted blobs for availability
-and fast restore. Canonical rows and their proofs remain on authorized peers and
-can rebuild it. The relay also currently retains auxiliary signed-event
-envelopes and personal-memory purge certificates. It reports:
+and fast restore. Canonical rows, memory objects, tombstones, and their proofs
+remain on authorized peers and can rebuild it. It reports:
 
 - the exact workspace tail;
 - the earliest retained cursor available to the requesting device;
 - event envelopes or lazy manifests after a cursor;
 - exact envelope fetch by event ID;
-- self-contained author-signed purge certificates where eligible personal
-  memory bodies were removed. Each certificate binds the original envelope
-  header to a retained later signed deletion event, closes the original author
-  sequence only after client verification, and permanently denies replay.
+- encrypted row-replica and blob inventories for idempotent repair.
 
 The relay never interprets payloads. Server database and blob storage are one
-optional operational backup unit, not the only copy of repairable archive data.
-The current `memory.canonical` adapter is the exception: its event and purge
-history is not yet independently repairable after simultaneous relay and
-`state.db` loss. Semantic-proof cutover must remove that exception before the
-disposable-relay recovery claim applies to memory.
+optional operational backup unit, not the only copy of repairable archive or
+personal-memory data.
 
 ## Canonical provenance schema
 

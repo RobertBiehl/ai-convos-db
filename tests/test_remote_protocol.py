@@ -6,8 +6,8 @@ from cryptography.exceptions import InvalidSignature, InvalidTag
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
 from ai_convos_remote.protocol import (b64, certificate, digest, event, fingerprint, identity, logical_fact, logical_row, open_blob, open_event, open_key, open_origin, open_replica, public_id, row_proof,
-                                       public, purge_certificate, recover, recovery_bundle, seal_event, seal_key,
-                                       seal_blob, seal_origin, seal_replica, verify_certificate, verify_event, verify_purge, verify_row_proof)
+                                       public, recover, recovery_bundle, seal_event, seal_key, semantic_proof,
+                                       seal_blob, seal_origin, seal_replica, verify_certificate, verify_event, verify_row_proof, verify_semantic_proof)
 
 def fixed_identity():
     sign, box = Ed25519PrivateKey.from_private_bytes(bytes(range(32))), X25519PrivateKey.from_private_bytes(bytes(range(32, 64)))
@@ -110,9 +110,8 @@ def test_replay_under_another_identity_and_payload_mutation_rejected():
     with pytest.raises((InvalidSignature, ValueError)): verify_event(changed, a["sign_public"])
 
 
-def test_purge_certificate_is_deterministic_and_every_field_is_signed():
-    device=identity("author"); target={"event":"a"*64,"author":device["id"],"epoch":2,"seq":3,"kind":"memory.canonical","payload_v":1}; anchor={"event":"b"*64}; proof=purge_certificate(device,"workspace",target,["c"*64],anchor)
-    assert proof==purge_certificate(device,"workspace",target,["c"*64],anchor) and verify_purge(proof,device["sign_public"])==proof
-    changes={"workspace":"other","event":"d"*64,"author":"e"*32,"epoch":3,"seq":4,"parents":["f"*64],"event_kind":"message.record","payload_v":2,"superseded_by":"0"*64}
-    for field,value in changes.items():
-        with pytest.raises(ValueError,match="purge certificate"): verify_purge({**proof,field:value},device["sign_public"])
+def test_semantic_proof_is_self_contained_and_compacts_bodyless_ancestry():
+    root,device=identity("root"),identity("device"); user=public_id(root["sign_public"]); active={"v":1,"kind":"memory.canonical","id":"memory:global:m","state":"active","data":{"content":"one"}}; first=semantic_proof(root,user,device["id"],"personal",2,active); deleted={**active,"state":"deleted","data":None}; tombstone=semantic_proof(root,user,device["id"],"personal",3,deleted,first); fork=semantic_proof(root,user,device["id"],"personal",3,{**active,"data":{"content":"fork"}},first); merged=semantic_proof(root,user,device["id"],"personal",4,{**active,"data":{"content":"merged"}},[tombstone,fork])
+    assert verify_semantic_proof(first,active,user)==first and verify_semantic_proof(tombstone,deleted,user)==tombstone and tombstone["ancestors"]==[first["revision"]] and tombstone["previous_revision"]==first["revision"] and {tombstone["revision"],fork["revision"],first["revision"]}<=set(merged["ancestors"])
+    for changed in ({**tombstone,"workspace":"other"},{**tombstone,"author_user_id":"0"*32},{**tombstone,"ancestors":[]},{**tombstone,"content_hash":"0"*64}):
+        with pytest.raises(ValueError,match="semantic proof"): verify_semantic_proof(changed,deleted,user)

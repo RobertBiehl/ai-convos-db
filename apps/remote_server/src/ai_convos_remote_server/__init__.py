@@ -35,9 +35,6 @@ CREATE TABLE IF NOT EXISTS row_replicas(cursor INTEGER PRIMARY KEY AUTOINCREMENT
 CREATE TABLE IF NOT EXISTS replica_usage(workspace TEXT,uploader TEXT,bytes INT NOT NULL,PRIMARY KEY(workspace,uploader));
 CREATE TABLE IF NOT EXISTS blob_replicas(cursor INTEGER PRIMARY KEY AUTOINCREMENT,workspace TEXT,blob TEXT,epoch INT,uploader TEXT,size INT,nonce TEXT,ciphertext BLOB,created REAL,updated REAL,UNIQUE(workspace,blob,epoch,uploader));
 CREATE TABLE IF NOT EXISTS origin_bundles(cursor INTEGER PRIMARY KEY AUTOINCREMENT,workspace TEXT,origin TEXT,epoch INT,uploader TEXT,envelope TEXT,wire_hash TEXT,created REAL,updated REAL,UNIQUE(workspace,origin,epoch,uploader));
-CREATE TABLE IF NOT EXISTS event_purges(workspace TEXT,event TEXT,author TEXT,epoch INT,seq INT,superseded_by TEXT,certificate TEXT,cursor INT,deleted REAL,PRIMARY KEY(workspace,event));
-CREATE UNIQUE INDEX IF NOT EXISTS purge_author_sequence ON event_purges(workspace,author,seq);
-CREATE INDEX IF NOT EXISTS purge_anchor ON event_purges(workspace,superseded_by);
 CREATE TABLE IF NOT EXISTS workspace_controls(workspace TEXT,revision INT,state_hash TEXT UNIQUE,state TEXT,PRIMARY KEY(workspace,revision));
 CREATE TABLE IF NOT EXISTS device_proposals(id TEXT PRIMARY KEY,workspace TEXT,base TEXT,target_user TEXT,target_device TEXT,proposal TEXT,not_before REAL,expires REAL,active INT);
 CREATE TABLE IF NOT EXISTS device_votes(proposal TEXT,voter_user TEXT,voter_device TEXT,approve INT,vote TEXT,PRIMARY KEY(proposal,voter_user));
@@ -45,7 +42,7 @@ CREATE TABLE IF NOT EXISTS device_votes(proposal TEXT,voter_user TEXT,voter_devi
 
 def connect(path):
     existed=Path(path).exists() and Path(path).stat().st_size>0; db=sqlite3.connect(path); db.row_factory=sqlite3.Row; old=existed and db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='events'").fetchone()
-    if old and db.execute("PRAGMA user_version").fetchone()[0]!=1: db.close(); raise ValueError("relay database is incompatible; create a fresh relay")
+    if old and (db.execute("PRAGMA user_version").fetchone()[0]!=1 or db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='event_purges'").fetchone()): db.close(); raise ValueError("relay database is incompatible; create a fresh relay")
     db.executescript("PRAGMA journal_mode=WAL;PRAGMA foreign_keys=ON;PRAGMA secure_delete=ON;PRAGMA busy_timeout=30000;"+SCHEMA+"PRAGMA user_version=1;"); db.execute("INSERT OR IGNORE INTO relay_meta VALUES ('registration_secret',?)",(b64(os.urandom(32)),)); db.commit(); return db
 def token_hash(token): return hashlib.sha256(token.encode()).hexdigest()
 def auth(db, token):
@@ -70,18 +67,13 @@ def certify(db,actor,req):
 def rows(db, sql, args=()): return [dict(r) for r in db.execute(sql, args).fetchall()]
 def verify_signed(value,sign_public):
     signature=unb64(value["signature"]); body={k:v for k,v in value.items() if k!="signature"}; Ed25519PublicKey.from_public_bytes(unb64(sign_public)).verify(signature,canon(body)); return value
-PURGE_FIELDS={"v","kind","workspace","event","author","epoch","seq","parents","event_kind","payload_v","superseded_by","signature"}
-def verify_purge(value,actor):
-    if not isinstance(value,dict) or set(value)!=PURGE_FIELDS or value["v"]!=V or value["kind"]!="event.purge" or value["event_kind"]!="memory.canonical" or value["payload_v"]!=1 or value["author"]!=actor["id"] or not isinstance(value["workspace"],str) or any(not isinstance(value[k],str) or len(value[k])!=64 for k in ("event","superseded_by")) or any(not isinstance(value[k],int) or isinstance(value[k],bool) or value[k]<1 for k in ("epoch","seq")) or not isinstance(value["parents"],list) or len(value["parents"])!=(value["seq"]>1) or any(not isinstance(p,str) or len(p)!=64 for p in value["parents"]): raise ValueError("invalid purge certificate")
-    try: return verify_signed(value,actor["sign_public"])
-    except (InvalidSignature,KeyError,TypeError,ValueError) as e: raise PermissionError("invalid purge certificate signature") from e
 def verify_record(value):
     body=verify_certificate(value["certificate"],value["root_public"]); device=value["device"]
     if public_id(value["root_public"])!=value["user"] or public_id(device["sign_public"])!=device["id"] or body["user"]!=value["user"] or body["device"]!=device: raise ValueError("device record mismatch")
     return value
 def control_hash(value): return digest(value)
 def ledger_state(db,ws):
-    values=rows(db,"SELECT cursor,event,author,seq FROM events WHERE workspace=? UNION ALL SELECT cursor,event,author,seq FROM event_purges WHERE workspace=?",(ws,ws)); heads={author:{"seq":row["seq"],"event":row["event"]} for author in {r["author"] for r in values} for row in [max((r for r in values if r["author"]==author),key=lambda r:r["seq"])]}; return {"tail":max((r["cursor"] for r in values),default=0),"heads":heads}
+    values=rows(db,"SELECT cursor,event,author,seq FROM events WHERE workspace=?",(ws,)); heads={author:{"seq":row["seq"],"event":row["event"]} for author in {r["author"] for r in values} for row in [max((r for r in values if r["author"]==author),key=lambda r:r["seq"])]}; return {"tail":max((r["cursor"] for r in values),default=0),"heads":heads}
 def current_control(db,ws):
     row=db.execute("SELECT state FROM workspace_controls WHERE workspace=? ORDER BY revision DESC LIMIT 1",(ws,)).fetchone(); return json.loads(row[0]) if row else None
 def electorate(state,target): return sorted({d["user"] for d in state["devices"].values() if d["user"]!=target})
@@ -218,8 +210,6 @@ def store_event(db,actor,env):
         if old["wire_hash"]!=wire: raise ValueError("event id already has different ciphertext")
         return {"cursor":old["cursor"],"created":False}
     if env["epoch"]!=epoch: raise PermissionError("event epoch rejected")
-    if db.execute("SELECT 1 FROM event_purges WHERE workspace=? AND event=?",(ws,env["event"])).fetchone(): raise ValueError("event was purged")
-    if (used:=db.execute("SELECT event FROM event_purges WHERE workspace=? AND author=? AND seq=?",(ws,env["author"],env["seq"])).fetchone()) and used[0]!=env["event"]: raise ValueError("event author sequence was purged")
     cursor=db.execute("INSERT INTO ledger_cursors DEFAULT VALUES").lastrowid; db.execute("INSERT INTO events VALUES (?,?,?,?,?,?,?,?,?)",(cursor,ws,env["event"],env["author"],env["epoch"],env["seq"],json.dumps(env),wire,time.time())); return {"cursor":cursor,"created":True}
 def store_replica(db,actor,env):
     fields={"v","kind","workspace","replica","epoch","uploader","nonce","ciphertext"}; ws=env["workspace"]; member=device_member(db,ws,actor); current=db.execute("SELECT epoch FROM workspaces WHERE id=?",(ws,)).fetchone()[0]
@@ -259,32 +249,6 @@ def immediate(db,fn):
     db.execute("BEGIN IMMEDIATE")
     try: value=fn(); db.commit(); return value
     except BaseException: db.rollback(); raise
-def purge_events(db,actor,req):
-    certs=req.get("certificates"); ws=req.get("workspace")
-    if not isinstance(certs,list) or not certs or len(certs)>500: raise ValueError("purge requires 1 to 500 certificates")
-    certs=[verify_purge(value,actor) for value in certs]
-    if any(value["workspace"]!=ws for value in certs) or len({value["event"] for value in certs})!=len(certs) or len({value["seq"] for value in certs})!=len(certs): raise ValueError("purge certificate batch mismatch")
-    device_member(db,ws,actor); targets={value["event"] for value in certs}
-    try:
-        db.execute("BEGIN IMMEDIATE")
-        if db.execute("SELECT kind FROM workspaces WHERE id=?",(ws,)).fetchone()[0]!="personal" or targets&{value["superseded_by"] for value in certs} or any(db.execute("SELECT 1 FROM event_purges WHERE workspace=? AND superseded_by=?",(ws,event)).fetchone() for event in targets): raise PermissionError("event purge denied")
-        fresh=[]
-        for value in certs:
-            encoded=canon(value).decode(); old=db.execute("SELECT certificate FROM event_purges WHERE workspace=? AND event=?",(ws,value["event"])).fetchone()
-            if old:
-                if old[0]!=encoded: raise ValueError("purge certificate conflicts with existing proof")
-                continue
-            row=db.execute("SELECT envelope FROM events WHERE workspace=? AND event=?",(ws,value["event"])).fetchone(); anchor=db.execute("SELECT author,seq FROM events WHERE workspace=? AND event=?",(ws,value["superseded_by"])).fetchone()
-            if not row or not anchor or anchor["author"]!=value["author"] or anchor["seq"]<=value["seq"]: raise PermissionError("event purge denied")
-            env=json.loads(row["envelope"])
-            if {k:env[k] for k in ("workspace","event","author","epoch","seq","parents")}!={k:value[k] for k in ("workspace","event","author","epoch","seq","parents")}: raise ValueError("purge certificate does not match event envelope")
-            fresh.append((value,encoded))
-        for value,encoded in fresh:
-            cursor=db.execute("INSERT INTO ledger_cursors DEFAULT VALUES").lastrowid; db.execute("INSERT INTO event_purges VALUES (?,?,?,?,?,?,?,?,?)",(ws,value["event"],value["author"],value["epoch"],value["seq"],value["superseded_by"],encoded,cursor,time.time()))
-        if fresh: db.execute(f"DELETE FROM events WHERE workspace=? AND event IN ({','.join('?'*len(fresh))})",(ws,*(value["event"] for value,encoded in fresh)))
-        db.commit(); return {"purged":len(certs)}
-    except BaseException: db.rollback(); raise
-
 def action(db, req, token=None):
     op = req["op"]
     if op == "register_challenge": return {"challenge":registration_challenge(db,req)}
@@ -363,14 +327,12 @@ def action(db, req, token=None):
         ws=req["workspace"]; m=device_member(db,ws,actor); after,limit=req.get("after",0),req.get("limit",500)
         if not isinstance(after,int) or isinstance(after,bool) or after<0 or not isinstance(limit,int) or isinstance(limit,bool) or not 1<=limit<=500: raise ValueError("replica page is invalid")
         access="workspace=? AND epoch>=? AND EXISTS(SELECT 1 FROM key_envelopes k WHERE k.workspace=row_replicas.workspace AND k.epoch=row_replicas.epoch AND k.device=?)"; args=(ws,m["history_from"],actor["id"]); bounds=db.execute(f"SELECT MIN(cursor),MAX(cursor) FROM row_replicas WHERE {access}",args).fetchone(); values=bounded(db.execute(f"SELECT cursor,envelope FROM row_replicas WHERE {access} AND cursor>? ORDER BY cursor LIMIT ?",args+(after,limit)),lambda r:len(r["envelope"])); return {"floor":bounds[0] or 0,"tail":bounds[1] or 0,"replicas":[{"cursor":r["cursor"],"envelope":json.loads(r["envelope"])} for r in values]}
-    if op == "purge": return purge_events(db,actor,req)
     if op == "pull":
         ws=req["workspace"]; m=device_member(db,ws,actor); limit=req.get("limit",500)
         if not isinstance(limit,int) or isinstance(limit,bool) or not 1<=limit<=500: raise ValueError("pull limit must be 1 to 500")
         access="workspace=? AND epoch>=? AND EXISTS(SELECT 1 FROM key_envelopes k WHERE k.workspace=x.workspace AND k.epoch=x.epoch AND k.device=?)"; args=(ws,m["history_from"],actor["id"])
-        bounds=db.execute(f"SELECT MIN(cursor),MAX(cursor) FROM (SELECT cursor,workspace,epoch FROM events x WHERE {access} UNION ALL SELECT cursor,workspace,epoch FROM event_purges x WHERE {access})",args+args).fetchone(); floor,tail=(bounds[0] or 0),(bounds[1] or 0)
-        out=rows(db,f"SELECT * FROM (SELECT cursor,event,envelope,LENGTH(envelope) size,NULL certificate FROM events x WHERE {access} AND cursor>? UNION ALL SELECT cursor,event,NULL envelope,0 size,certificate FROM event_purges x WHERE {access} AND cursor>?) ORDER BY cursor LIMIT ?",args+(req.get("after",0),)+args+(req.get("after",0),limit))
-        return {"floor":floor,"tail":tail,"events":[{"cursor":r["cursor"],**({"purge":json.loads(r["certificate"])} if r["certificate"] else {"lazy":True,"event":r["event"],"size":r["size"]} if r["size"]>65536 else {"envelope":json.loads(r["envelope"])})} for r in out]}
+        bounds=db.execute(f"SELECT MIN(cursor),MAX(cursor) FROM events x WHERE {access}",args).fetchone(); floor,tail=(bounds[0] or 0),(bounds[1] or 0); out=rows(db,f"SELECT cursor,event,envelope,LENGTH(envelope) size FROM events x WHERE {access} AND cursor>? ORDER BY cursor LIMIT ?",args+(req.get("after",0),limit))
+        return {"floor":floor,"tail":tail,"events":[{"cursor":r["cursor"],**({"lazy":True,"event":r["event"],"size":r["size"]} if r["size"]>65536 else {"envelope":json.loads(r["envelope"])})} for r in out]}
     if op == "fetch":
         m=device_member(db,req["workspace"],actor); row=db.execute("SELECT cursor,envelope FROM events WHERE workspace=? AND event=? AND epoch>=? AND EXISTS(SELECT 1 FROM key_envelopes k WHERE k.workspace=events.workspace AND k.epoch=events.epoch AND k.device=?)",(req["workspace"],req["event"],m["history_from"],actor["id"])).fetchone()
         if not row: raise ValueError("event not found")

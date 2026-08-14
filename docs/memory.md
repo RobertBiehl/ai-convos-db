@@ -74,10 +74,12 @@ The packages remain independently usable: memory has no remote dependency, and
 remote continues normally when memory is absent.
 
 Canonical content, IDs, repository identity, revisions, and tombstones travel
-inside the existing signed end-to-end encrypted event envelope. The relay sees
-the same unavoidable envelope metadata as other personal events--workspace,
-device author, sequence, ciphertext size, and timing--but not memory content,
-repository names, or checkout paths. Absolute paths never enter the event.
+as user-root-signed semantic objects inside ordinary end-to-end encrypted row
+replicas. The proof binds the personal workspace, object identity, content
+hash, state, full causal ancestry, author user and device, and authorization
+epoch. The relay sees workspace, uploader, epoch, ciphertext size, and timing,
+but not memory content, repository names, or checkout paths. Absolute paths
+never enter the object.
 Matching Git origins bind a received repository scope to a local clone; a
 remote-only scope remains portable until such a clone is observed.
 Archive evidence stays device-local: remote records contain no message or
@@ -85,21 +87,21 @@ conversation IDs, titles, timestamps, roles, or evidence hashes.
 
 Offline edits queue locally. Repeated delivery and older revisions are
 idempotent. A single remote source advances an unchanged canonical
-automatically. Concurrent local and remote changes are deliberately not
+automatically. Each current proof carries the hashes of its complete ancestry,
+so intermediate bodies may be discarded without making a later descendant
+ambiguous. Concurrent local and remote changes are deliberately not
 last-write-wins: the local canonical stays visible and the remote revision
 appears in the normal three-way `review`/agent-resolution workflow. A remote
-deletion automatically purges an unchanged remote-only canonical, its memory
-revisions, and decrypted remote event payloads. A locally revised, projected,
+deletion automatically purges an unchanged remote-only canonical and its local
+memory revisions. A locally revised, projected,
 or mixed-origin canonical is retained instead; its remote origin becomes
 missing so local or provider-owned knowledge cannot be erased by another
 device.
 
-Large canonicals are split into bounded encrypted parts before publication and
-reassembled transactionally after every part arrives. Each envelope stays below
-the remote's lazy-event threshold, so large memory remains automatic without
-forcing eager download of unrelated large conversations or attachments.
-Out-of-order parts cannot expose a partial canonical, stale parts cannot replace
-a newer completed revision, and plaintext exists only in the local ledgers.
+Each canonical is one semantic object and one replica, subject to the relay's
+48 MiB row-replica ceiling. This keeps signing, verification, conflict handling,
+and recovery identical for small and large memories without a second part
+assembly protocol. Plaintext exists only in local memory ledgers.
 
 What users still need to do is the one-time setup for both products: enable the
 installed products with `convos init`, approve the Codex hook once, configure
@@ -241,23 +243,15 @@ Claude projection. Remove or refresh that owned projection first. Native
 provider memories are never changed or deleted.
 
 With encrypted personal sync configured, the next successful worker cycle
-publishes a tombstone, removes the author's prior ciphertext events from the
-relay, and permanently rejects re-upload of those event IDs. This remains one
-automatic sync operation: author-signed purge certificates are generated and
-verified internally without another prompt or key step. Other devices purge
-unchanged remote-only copies and decrypted event payloads. Local
-divergence, another provider origin, or a managed projection prevents automatic
-canonical deletion and remains visible for review. Existing private memory or
-relay backups are historical copies and are not rewritten; expire pre-forget
-backups according to the desired retention policy.
-
-This memory remote adapter is the current exception to disposable relay state.
-Its deletion proof is a purge certificate retained by the relay and derived
-through remote sync state, rather than a proof retained with the semantic memory
-object. Simultaneous loss of the relay and `state.db` therefore cannot yet
-repair that evidence from the memory ledger alone. The planned semantic-proof
-cutover replaces this special event/purge path; this limitation is not part of
-the intended permanent contract.
+publishes a root-signed bodyless tombstone containing the full known revision
+ancestry. Other devices purge unchanged remote-only copies. Any authorized
+holder can re-encrypt and repair the intact tombstone on a replacement relay
+without the author's private key; only the author can sign a successor.
+Local divergence, another provider origin, or a managed projection prevents
+automatic canonical deletion and remains visible for review. Tombstones govern
+current semantic state; they cannot erase plaintext or ciphertext already kept
+by another peer, an operator, a filesystem snapshot, or a backup, so historical
+retention remains an explicit policy.
 
 `history MEMORY` renders source or canonical identity plus every chronological
 revision as readable Markdown. Canonicals accept the same scoped human

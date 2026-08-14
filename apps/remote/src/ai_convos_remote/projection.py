@@ -8,7 +8,7 @@ from pathlib import Path
 from ai_convos.cli import ARCHIVE_COLUMNS as COLUMNS, PROVENANCE_KINDS as PROVENANCE, _insert_pages, index_attachment_body, init_schema, open_db, project_logical_rows, project_provenance, project_row_proofs, project_workspace_controls, provenance_records, set_attachment_path
 from ai_convos_changegraph.provenance import query as graph_query
 from .control import verify_state
-from .protocol import digest, fingerprint, logical_fact, logical_row, row_proof, seal_blob, seal_replica, verify_row_proof
+from .protocol import digest, fingerprint, logical_fact, logical_row, row_proof, seal_blob, seal_replica, semantic_proof, verify_row_proof, verify_semantic_proof
 
 STATE_VERSION="1"
 STATE = """
@@ -34,7 +34,7 @@ CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY,value TEXT) WITHOUT ROWID;
 STATE_TABLES={"outbox","receipts","publication_heads","cursors","lazy_events","deferred_events","event_sequences","sequence_gaps","replica_receipts","blob_outbox","blob_receipts","origin_bindings","control_dependencies","policies","team_scopes","sync_states","meta"}
 STATE_FORBIDDEN={"published","event_log","history_material","history_outbox","history_queue","attachment_chunks","imported_rows","raw_events","repositories","files","file_versions","changesets","edits","checkpoints","assertions","gaps","boundaries","sharing_boundaries"}
 TABLES={"conversation.record":"conversations","message.record":"messages","tool.record":"tool_calls","attachment.record":"attachments","artifact.record":"artifacts","file_edit.record":"file_edits"}
-CORE_EVENTS={(kind,1) for kind in {"workspace.policy","workspace.membership","workspace.device"}}; AUXILIARY_EVENTS={"memory.canonical"}; SIGNED=set(TABLES)|PROVENANCE
+CORE_EVENTS={(kind,1) for kind in {"workspace.policy","workspace.membership","workspace.device"}}; SIGNED=set(TABLES)|PROVENANCE
 FKS={"messages":(("conversation_id","conversations"),("parent_id","messages")),"tool_calls":(("message_id","messages"),),"attachments":(("message_id","messages"),),"artifacts":(("conversation_id","conversations"),),"file_edits":(("message_id","messages"),)}
 
 def _connect(path,journal="WAL"):
@@ -91,7 +91,7 @@ def connect(path):
 @lru_cache(maxsize=1)
 def bridges():
     result=[entry.load()() for entry in entry_points(group="convos.remote")]
-    if any(set(b)!={"v","events","records","project","purges"} or b["v"]!=1 or isinstance(b["v"],bool) or any(not callable(b[k]) for k in ("records","project","purges")) or any(not isinstance(e,tuple) or len(e)!=2 or not isinstance(e[0],str) or not isinstance(e[1],int) or isinstance(e[1],bool) or e[1]<1 for e in b["events"]) for b in result): raise ValueError("Unsupported remote bridge")
+    if any(set(b)!={"v","objects","records","accept","token"} or b["v"]!=2 or isinstance(b["v"],bool) or any(not callable(b[k]) for k in ("records","accept","token")) or not isinstance(b["objects"],set) or not b["objects"] or any(not isinstance(v,str) or not v for v in b["objects"]) for b in result) or len([v for b in result for v in b["objects"]])!=len({v for b in result for v in b["objects"]}): raise ValueError("Unsupported remote bridge")
     return result
 def control_chain(controls):
     ordered=sorted(controls,key=lambda c:c["revision"]); previous=None
@@ -104,13 +104,16 @@ def stored_controls(db_path,origins):
 def event_support(value):
     kind,version=value["kind"],value["payload_v"]
     if not isinstance(kind,str) or not isinstance(version,int) or isinstance(version,bool) or version<1: raise ValueError("invalid event schema")
-    installed={event for bridge in bridges() for event in bridge["events"]}
-    return "supported" if (kind,version) in CORE_EVENTS or (kind,version) in installed else "optional" if kind in AUXILIARY_EVENTS and not any(event[0]==kind for event in installed) else "required"
-def bridge_records(root,state,workspace,kind): return [record for bridge in bridges() for record in bridge["records"](root,state,workspace,kind)]
-def bridge_purges(root,state,workspace,kind):
-    values=[value for bridge in bridges() for value in bridge["purges"](root,state,workspace,kind)]
-    if any(not isinstance(v,dict) or set(v)!={"event","superseded_by"} or any(not isinstance(v[k],str) or len(v[k])!=64 for k in v) or v["event"]==v["superseded_by"] for v in values): raise ValueError("invalid remote purge intent")
-    return [dict(event=e,superseded_by=s) for e,s in sorted({(v["event"],v["superseded_by"]) for v in values})]
+    return "supported" if (kind,version) in CORE_EVENTS else "required"
+def bridge_records(root,cfg,workspace,kind): return [record for bridge in bridges() for record in bridge["records"](root,cfg["user"],workspace,kind)]
+def bridge_stamp(root): return digest({kind:bridge["token"](root) for bridge in bridges() for kind in bridge["objects"]})
+def bridge_accept(root,row,proof,project=True):
+    found=[bridge for bridge in bridges() if row["kind"] in bridge["objects"]]
+    return bool(found and found[0]["accept"](root,row,proof,project))
+def bridge_replicas(root,cfg,workspace,kind,key_,known=(),inventory=None):
+    for value in bridge_records(root,cfg,workspace,kind):
+        if value["proof"] is None: proof=semantic_proof(cfg["root"],cfg["user"],cfg["device"]["id"],workspace,cfg["workspaces"][workspace]["epoch"],value["row"],value["previous"]); bridge_accept(root,value["row"],proof,False)
+    values=[(value,fingerprint(key_,digest(value["proof"]))) for value in bridge_records(root,cfg,workspace,kind) if value["proof"]]; present=set(inventory([(replica,cfg["workspaces"][workspace]["epoch"]) for value,replica in values])) if inventory else set(known); return [seal_replica(value["row"],value["proof"],workspace,cfg["workspaces"][workspace]["epoch"],key_,cfg["device"]["id"]) for value,replica in values if replica not in present]
 def clean(v):
     if isinstance(v,(datetime,date)): return v.isoformat()
     if isinstance(v,dict): return {k:clean(x) for k,x in v.items()}
@@ -241,14 +244,18 @@ def blob_replicas(db_path,cfg,workspace,records,keys,known=(),origins=(),origin_
         if path.is_symlink() or not path.is_file() or path.stat().st_size!=size or size>32*1024**2 or file_hash(path)!=body_hash: raise ValueError("retained attachment body is inconsistent")
         out.append(seal_blob(path.read_bytes(),workspace,epoch,keys[epoch],cfg["device"]["id"]))
     return out
-def verified_replica(body,workspace,controls):
-    row,proof=body["row"],body["proof"]; allowed={workspace,*[c["workspace"] for c in controls]}; candidates=[{k:r[k] for k in ("user","root_public","device","certificate")} for c in controls if proof["workspace"] in allowed and c["workspace"]==proof["authorization_workspace"] and c["epoch"]==proof["authorization_epoch"] and proof["author_device_id"] in c["devices"] for r in [c["devices"][proof["author_device_id"]]]]; signer_=candidates[0] if candidates and all(c==candidates[0] for c in candidates) else (_ for _ in ()).throw(ValueError("row proof authorization unavailable")); verify_row_proof(proof,row,signer_["certificate"],signer_["root_public"]); return row,proof,signer_
+def verified_replica(body,workspace,controls,user):
+    row,proof=body["row"],body["proof"]
+    if proof.get("kind")=="semantic.proof": verify_semantic_proof(proof,row,user); return row,proof,None
+    allowed={workspace,*[c["workspace"] for c in controls]}; candidates=[{k:r[k] for k in ("user","root_public","device","certificate")} for c in controls if proof["workspace"] in allowed and c["workspace"]==proof["authorization_workspace"] and c["epoch"]==proof["authorization_epoch"] and proof["author_device_id"] in c["devices"] for r in [c["devices"][proof["author_device_id"]]]]; signer_=candidates[0] if candidates and all(c==candidates[0] for c in candidates) else (_ for _ in ()).throw(ValueError("row proof authorization unavailable")); verify_row_proof(proof,row,signer_["certificate"],signer_["root_public"]); return row,proof,signer_
 def temp_rows(db,name,columns,rows): db.execute(f"CREATE OR REPLACE TEMP TABLE {name} AS SELECT x.* FROM UNNEST(from_json(?,?)) t(x)",(json.dumps([dict(zip(columns,row)) for row in rows]),json.dumps([{c:"VARCHAR" for c in columns}])))
-def apply_row_replicas(db_path,bodies,workspace,controls,recover=None,local_user=None,db=None):
+def apply_row_replicas(db_path,bodies,workspace,controls,recover=None,local_user=None,db=None,root=None):
     if not bodies: return []
+    values=[verified_replica(body,workspace,controls,local_user) for body in bodies]; accepted=[False]*len(values); semantic=[i for i,value in enumerate(values) if value[1]["kind"]=="semantic.proof"]; [accepted.__setitem__(i,bridge_accept(root,values[i][0],values[i][1])) for i in semantic]; indexes=[i for i in range(len(values)) if i not in semantic]
+    if not indexes: return accepted
     names=("workspace","authorization_workspace","row_kind","row_id","encoding_v","content_hash","revision","previous_revision","state","author_user_id","author_device_id","authorization_epoch","signature"); proof=lambda values:{"v":1,"kind":"row.proof",**dict(zip(names,values))}; own=db is None; db=db or open_db(db_path); own and init_schema(db); db.execute("BEGIN")
     try:
-        items=[verified_replica(body,workspace,controls) for body in bodies]; columns=("workspace","kind","row_id","author","revision"); temp_rows(db,"incoming",columns,[tuple(p[k] for k in ("workspace","row_kind","row_id","author_user_id","revision")) for row,p,signer_ in items]); old={tuple(r) for r in db.execute("SELECT p.workspace_id,p.row_kind,p.source_row_id,p.author_user_id,p.revision FROM remote.row_proofs p JOIN incoming i ON (p.workspace_id,p.row_kind,p.source_row_id,p.author_user_id,p.revision)=(i.workspace,i.kind,i.row_id,i.author,i.revision)").fetchall()}; project_workspace_controls(db,controls); groups={}
+        items=[values[i] for i in indexes]; columns=("workspace","kind","row_id","author","revision"); temp_rows(db,"incoming",columns,[tuple(p[k] for k in ("workspace","row_kind","row_id","author_user_id","revision")) for row,p,signer_ in items]); old={tuple(r) for r in db.execute("SELECT p.workspace_id,p.row_kind,p.source_row_id,p.author_user_id,p.revision FROM remote.row_proofs p JOIN incoming i ON (p.workspace_id,p.row_kind,p.source_row_id,p.author_user_id,p.revision)=(i.workspace,i.kind,i.row_id,i.author,i.revision)").fetchall()}; project_workspace_controls(db,controls); groups={}
         [groups.setdefault((p["author_user_id"],p["author_device_id"]),(signer_,[]))[1].append(p) for row,p,signer_ in items]; [project_row_proofs(db,proofs,signer_["root_public"],signer_["certificate"]) for signer_,proofs in groups.values()]; fresh=[(digest(p),json.dumps(row,sort_keys=True,separators=(",",":"))) for row,p,signer_ in items if (*((p[k] for k in ("workspace","row_kind","row_id","author_user_id"))),p["revision"]) not in old]; fresh and _insert_pages(db,"remote.row_conflicts",fresh,("proof_id","body"),mode=" OR IGNORE"); projected=[]; chosen={}; resolved=[]
         fields="p.workspace_id,p.authorization_workspace_id,p.row_kind,p.source_row_id,p.encoding_v,p.content_hash,p.revision,p.previous_revision,p.state,p.author_user_id,p.author_device_id,p.authorization_epoch,p.signature"; chains={}
         for r in db.execute(f"SELECT p.id,CAST(c.body AS VARCHAR),{fields} FROM remote.row_proofs p JOIN (SELECT DISTINCT workspace,kind,row_id,author FROM incoming) i ON (p.workspace_id,p.row_kind,p.source_row_id,p.author_user_id)=(i.workspace,i.kind,i.row_id,i.author) LEFT JOIN remote.row_conflicts c ON c.proof_id=p.id").fetchall(): chains.setdefault((r[2],r[4],r[5],r[11]),{})[r[8]]=(r[0],json.loads(r[1]) if r[1] else None,proof(r[2:]))
@@ -259,7 +266,7 @@ def apply_row_replicas(db_path,bodies,workspace,controls,recover=None,local_user
                 if row is not None and not (p["author_user_id"]==local_user and recover=="adopt"): projected.append((row,p,pid,p["author_user_id"]==local_user and recover=="native"))
         if resolved: temp_rows(db,"resolved_scopes",columns[:4],resolved); db.execute("DELETE FROM remote.row_conflicts c USING remote.row_proofs p,resolved_scopes r WHERE c.proof_id=p.id AND (p.workspace_id,p.row_kind,p.source_row_id,p.author_user_id)=(r.workspace,r.kind,r.row_id,r.author)")
         project_logical_rows(db,projected)
-        db.execute("COMMIT"); return [(*((p[k] for k in ("workspace","row_kind","row_id","author_user_id"))),p["revision"]) not in old and chosen.get(tuple(p[k] for k in ("workspace","row_kind","row_id","author_user_id")))==p["revision"] for row,p,signer_ in items]
+        db.execute("COMMIT"); results=[(*((p[k] for k in ("workspace","row_kind","row_id","author_user_id"))),p["revision"]) not in old and chosen.get(tuple(p[k] for k in ("workspace","row_kind","row_id","author_user_id")))==p["revision"] for row,p,signer_ in items]; [accepted.__setitem__(i,value) for i,value in zip(indexes,results)]; return accepted
     except BaseException: db.execute("ROLLBACK"); raise
     finally: own and db.close()
 def author_user(value,authors): return (authors or {}).get(value["author"]) or (_ for _ in ()).throw(ValueError("verified author user required"))
@@ -288,9 +295,6 @@ def project(db_path,state,value,workspace,local_device=None,db=None,root=None,ba
     if event_support(value)!="supported": return False
     if value["kind"]=="workspace.policy":
         p=value["payload"]; state.execute("INSERT OR REPLACE INTO policies VALUES (?,?,?)",(workspace,p["kind"],p["value"])); batch or state.commit(); return True
-    if root is not None:
-        for bridge in bridges():
-            if (result:=bridge["project"](root,state,value,workspace,local_device)) is not None: return result
     if value["kind"] not in PROVENANCE: return False
     user=author_user(value,authors); owned=bool(recover and user==local_user); native=owned and recover=="native"
     if owned and recover=="adopt": return True
