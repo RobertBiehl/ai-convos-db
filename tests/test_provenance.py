@@ -34,6 +34,10 @@ def test_core_schema_upgrade_adds_canonical_schemas_without_rewriting_archive(tm
     assert db.execute("SELECT title FROM conversations WHERE id='keep'").fetchone()[0]=="preserved" and db.execute("SELECT COUNT(*) FROM provenance.repositories").fetchone()[0]==db.execute("SELECT COUNT(*) FROM remote.row_origins").fetchone()[0]==0 and archive_state(db)[0]==identity
 
 
+def test_existing_core_is_checkpointed_once_before_automatic_migration(tmp_path):
+    path=tmp_path/"legacy.db"; db=duckdb.connect(str(path)); db.execute("CREATE TABLE conversations(id VARCHAR,title VARCHAR)"); db.execute("INSERT INTO conversations VALUES ('keep','preserved')"); db.close(); db=duckdb.connect(str(path)); init_schema(db); db.close(); backup=path.with_name("legacy.db.pre-v1.bak"); check=duckdb.connect(str(backup),read_only=True); assert check.execute("SELECT * FROM conversations").fetchall()==[("keep","preserved")]; check.close(); stamp=backup.stat().st_mtime_ns; db=duckdb.connect(str(path)); init_schema(db); assert db.execute("SELECT version FROM core_schema").fetchone()[0]==1; db.close(); assert backup.stat().st_mtime_ns==stamp and backup.stat().st_mode&0o777==0o600
+
+
 def test_provenance_upgrade_preserves_edit_evidence_and_removes_unused_graph_tables(tmp_path):
     db=graph(tmp_path/"graph.db"); db.execute("ALTER TABLE provenance.file_edit_files RENAME COLUMN old_content_hash TO before_hash"); db.execute("ALTER TABLE provenance.file_edit_files RENAME COLUMN new_content_hash TO after_hash"); db.execute("ALTER TABLE provenance.git_checkpoints DROP COLUMN capture_source"); db.execute("CREATE TABLE provenance.assertions(id VARCHAR)"); db.execute("CREATE TABLE provenance.capture_gaps(id VARCHAR)"); db.execute("INSERT INTO provenance.file_edit_files VALUES ('e','f','old','new','captured_exact')"); init_schema(db)
     assert db.execute("SELECT old_content_hash,new_content_hash FROM provenance.file_edit_files").fetchone()==("old","new") and not {"assertions","capture_gaps"}&{r[0] for r in db.execute("SELECT table_name FROM information_schema.tables WHERE table_schema='provenance'").fetchall()}

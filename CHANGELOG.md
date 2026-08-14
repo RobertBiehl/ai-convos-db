@@ -13,6 +13,8 @@
 - Make retained personal attachment bodies bounded, signed-hash-associated blob
   replicas that any authorized holder can repair without duplicating bytes in
   DuckDB or settled `state.db`.
+- Checkpoint and validate a private one-time backup before automatically
+  migrating an existing core DuckDB.
 - Simplify team history to future-only or complete-history access, remove
   per-row grants and carrier events, and define the first client/server
   protocol, signed workspace state, rebuildable state schema, optional-app
