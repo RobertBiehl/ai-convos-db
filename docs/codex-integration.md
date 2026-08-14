@@ -131,6 +131,14 @@ the same `call_id`:
 - Developer and system messages are filtered out
 - Content extracted from `input_text`, `output_text`, or `text` blocks
 
+### Attachments
+
+- Inline `input_image` data URLs become attachment rows on their user message
+- Bodies up to 32 MiB are decoded into private content-addressed files under
+  `data/attachments/`; larger images retain metadata without a body
+- Re-syncing is idempotent, and image-only user turns are retained
+- A local path mentioned in text is not an attachment and is never read
+
 ### Tool Calls
 
 Legacy function calls and current custom calls are mapped to `tool_calls`:
