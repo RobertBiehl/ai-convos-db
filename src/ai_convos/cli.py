@@ -2,7 +2,8 @@
 import json, time, zipfile, hashlib, struct, sqlite3, subprocess, ssl, urllib.request, re, os, sysconfig, site, csv, sys, shutil, shlex, fcntl, signal, tempfile
 from importlib.metadata import entry_points, version
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
+from functools import lru_cache
 from pathlib import Path; from typing import Optional
 from hashlib import pbkdf2_hmac
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
@@ -46,6 +47,107 @@ def detect_source(path: Path):
 
 def latest_mtime(path: Path, globs: tuple[str, ...] = ("*.jsonl", "*.json", "*.zip")): return max((p.stat().st_mtime for g in globs for p in path.rglob(g)), default=0)
 
+_PROVENANCE_SCHEMA = """
+CREATE SCHEMA IF NOT EXISTS provenance;
+CREATE TABLE IF NOT EXISTS provenance.repositories(id VARCHAR PRIMARY KEY,lineage VARCHAR,roots JSON,remotes JSON,last_head VARCHAR,observed_at TIMESTAMP);
+CREATE TABLE IF NOT EXISTS provenance.repository_checkouts(id VARCHAR PRIMARY KEY,repository VARCHAR,root VARCHAR UNIQUE,branch VARCHAR,head VARCHAR);
+CREATE TABLE IF NOT EXISTS provenance.files(id VARCHAR PRIMARY KEY,repository VARCHAR,path VARCHAR,kind VARCHAR);
+CREATE TABLE IF NOT EXISTS provenance.file_versions(id VARCHAR PRIMARY KEY,file_id VARCHAR,content_hash VARCHAR,observed_at TIMESTAMP);
+CREATE TABLE IF NOT EXISTS provenance.file_edit_files(file_edit_id VARCHAR,file_id VARCHAR,before_hash VARCHAR,after_hash VARCHAR,evidence VARCHAR,PRIMARY KEY(file_edit_id,file_id));
+CREATE TABLE IF NOT EXISTS provenance.git_checkpoints(id VARCHAR PRIMARY KEY,repository VARCHAR,head VARCHAR,state_hash VARCHAR,paths JSON,observed_at TIMESTAMP);
+CREATE TABLE IF NOT EXISTS provenance.checkpoint_edits(checkpoint_id VARCHAR,file_edit_id VARCHAR,evidence VARCHAR,PRIMARY KEY(checkpoint_id,file_edit_id));
+CREATE TABLE IF NOT EXISTS provenance.assertions(id VARCHAR PRIMARY KEY,left_id VARCHAR,relation VARCHAR,right_id VARCHAR,evidence VARCHAR,status VARCHAR,observed_at TIMESTAMP);
+CREATE TABLE IF NOT EXISTS provenance.capture_gaps(id VARCHAR PRIMARY KEY,repository VARCHAR,checkpoint_id VARCHAR,path VARCHAR,relation VARCHAR,observed_at TIMESTAMP);
+CREATE SCHEMA IF NOT EXISTS remote;
+CREATE TABLE IF NOT EXISTS remote.row_origins(table_name VARCHAR,physical_row_id VARCHAR,workspace_id VARCHAR,author_user_id VARCHAR,author_device_id VARCHAR,source_row_id VARCHAR,source_event_id VARCHAR,content_key VARCHAR,observed_at TIMESTAMP,PRIMARY KEY(table_name,physical_row_id));
+"""
+ARCHIVE_COLUMNS={"conversations":["id","source","title","created_at","updated_at","model","cwd","git_branch","project_id","metadata"],"messages":["id","conversation_id","role","content","thinking","created_at","model","metadata","parent_id"],"tool_calls":["id","message_id","tool_name","input","output","status","duration_ms","created_at"],"attachments":["id","message_id","filename","mime_type","size","path","url","created_at"],"artifacts":["id","conversation_id","artifact_type","title","content","language","created_at","version"],"file_edits":["id","message_id","file_path","edit_type","content","created_at","old_content"]}
+PROVENANCE_KINDS={"repository.observed","file.observed","file.version","edit.observed","git.checkpoint","checkpoint.link","identity.assertion","capture.gap"}
+def provenance_digest(v): return hashlib.sha256(v if isinstance(v,bytes) else json.dumps(v,sort_keys=True,separators=(",",":"),ensure_ascii=True,allow_nan=False).encode()).hexdigest()
+def _git_run(root,*args): return subprocess.run(("git","-C",str(root),*args),capture_output=True,check=True).stdout
+def _git_maybe(root,*args):
+    try: return _git_run(root,*args)
+    except subprocess.CalledProcessError: return b""
+@lru_cache(maxsize=4096)
+def _git_root(path):
+    probe=path if path.is_dir() else path.parent
+    try: return Path(_git_run(probe,"rev-parse","--show-toplevel").decode().strip()).resolve()
+    except (subprocess.CalledProcessError,FileNotFoundError): return None
+def _git_remotes(root): return sorted({url.replace("git@github.com:","https://github.com/").removesuffix(".git") for line in _git_run(root,"remote","-v").decode(errors="replace").splitlines() if "\t" in line and not (url:=line.split("\t",1)[1].rsplit(" ",1)[0]).startswith(("/","file:"))})
+@lru_cache(maxsize=256)
+def _repository(root):
+    root=Path(root); roots=sorted(_git_maybe(root,"rev-list","--max-parents=0","HEAD").decode().split()); remotes=_git_remotes(root); lineage=provenance_digest({"git_roots":roots}) if roots else None
+    return dict(id=provenance_digest({"remotes":remotes}) if remotes else lineage or provenance_digest({"local":str(root)}),lineage=lineage,root=str(root),roots=roots,remotes=remotes,checkout=provenance_digest(str(root))[:32])
+def repository(path):
+    root=_git_root(Path(path))
+    return {**_repository(str(root)),"head":_git_maybe(root,"rev-parse","--verify","HEAD").decode().strip(),"branch":_git_maybe(root,"symbolic-ref","--short","HEAD").decode().strip()} if root else None
+def _observe_checkout(db,repo): db.execute("INSERT INTO provenance.repository_checkouts VALUES (?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET repository=excluded.repository,root=excluded.root,branch=excluded.branch,head=excluded.head",(repo["checkout"],repo["id"],repo["root"],repo["branch"],repo["head"]))
+def _provenance_where(path,cwd,cache):
+    p=Path(path); p=(Path(cwd)/p if not p.is_absolute() and cwd else p).expanduser().resolve(); root=_git_root(p); repo=cache.get(str(root)) if root else None
+    if root and not repo: repo=repository(root); cache[repo["root"]]=repo
+    return (repo,p.relative_to(repo["root"]).as_posix(),"repository") if repo else (None,f"external/{provenance_digest(str(p))[:24]}/{p.name}","external")
+def _checkpoint(repo):
+    paths=sorted({x[3:].split(" -> ")[-1] for x in _git_run(repo["root"],"status","--porcelain=v1","-z").decode(errors="replace").split("\0") if len(x)>3}); state=provenance_digest((_git_maybe(repo["root"],"diff","--binary","HEAD")+_git_maybe(repo["root"],"diff","--binary","--cached","HEAD")) if repo["head"] else _git_run(repo["root"],"status","--porcelain=v1","-z"))
+    return dict(id=provenance_digest({"repository":repo["id"],"head":repo["head"],"state":state}),repository=repo["id"],head=repo["head"],state_hash=state,paths=paths)
+def _provenance_record(kind,entity,payload,observed_at): return dict(kind=kind,entity=entity,payload=payload,observed_at=observed_at)
+def _observe_provenance(core,edit_ids=None):
+    _git_root.cache_clear(); _repository.cache_clear(); captured=datetime.now(timezone.utc).isoformat().replace("+00:00","Z"); ids=sorted(set(edit_ids or ())) if edit_ids is not None else None; selected="" if ids is None else " AND ("+(f"fe.id IN ({','.join('?'*len(ids))}) OR " if ids else "")+"NOT EXISTS (SELECT 1 FROM provenance.file_edit_files x WHERE x.file_edit_id=fe.id))"
+    sql="""SELECT fe.id,fe.file_path,fe.edit_type,fe.content,fe.old_content,CAST(fe.created_at AS VARCHAR),m.id,m.conversation_id,c.cwd FROM file_edits fe JOIN messages m ON m.id=fe.message_id JOIN conversations c ON c.id=m.conversation_id WHERE NOT EXISTS (SELECT 1 FROM remote.row_origins o WHERE o.table_name='file_edits' AND o.physical_row_id=fe.id)"""+selected+" ORDER BY fe.created_at,fe.id"; edits=[dict(zip(("id","path","type","content","old","ts","turn","conversation","cwd"),r)) for r in core.execute(sql,ids or ()).fetchall()]; records=[]; repos={}; touched={}; versions={}; cache={}; fulls={}
+    for e in edits:
+        repo,path,kind=_provenance_where(e["path"],e["cwd"],cache); rid=repo["id"] if repo else None; fid=provenance_digest({"repository":rid,"path":path})
+        if repo and rid not in repos: repos[rid]=repo; records.append(_provenance_record("repository.observed",rid,{k:repo[k] for k in ("id","lineage","roots","remotes","head")},captured))
+        target=Path(repo["root"],path) if repo else None; key=str(target) if target else None
+        if key not in fulls: fulls[key]=provenance_digest(target.read_bytes()) if target and target.is_file() else None
+        full=fulls[key]
+        records += [_provenance_record("file.observed",fid,{"id":fid,"repository":rid,"path":path,"kind":kind},captured),_provenance_record("edit.observed",e["id"],{"id":e["id"],"turn":e["turn"],"file":fid,"repository":rid,"before_hash":provenance_digest((e["old"] or "").encode()) if e["old"] is not None else None,"after_hash":provenance_digest((e["content"] or "").encode()),"evidence":"captured_exact" if e["type"]=="write" or e["old"] is not None else "content_unknown"},captured)]
+        if full: versions[(rid,fid)]=(e["id"],provenance_digest((e["content"] or "").encode()),full,path)
+        if rid: touched.setdefault(rid,set()).add(path)
+    for rid,repo in repos.items():
+        cp=_checkpoint(repo); records.append(_provenance_record("git.checkpoint",cp["id"],cp,captured))
+        for (r,fid),(edit,after,full,path) in versions.items():
+            if r==rid: vid=provenance_digest({"file":fid,"content":full}); records.append(_provenance_record("file.version",vid,{"id":vid,"file":fid,"content_hash":full},captured))
+            if r==rid and path not in cp["paths"] and after==full: records.append(_provenance_record("checkpoint.link",provenance_digest({"checkpoint":cp["id"],"edit":edit}),{"checkpoint":cp["id"],"edit":edit,"evidence":"full_content_match"},captured))
+        records += [_provenance_record("capture.gap",provenance_digest({"checkpoint":cp["id"],"path":path}),{"repository":rid,"checkpoint":cp["id"],"path":path,"relation":"unobserved_change"},captured) for path in set(cp["paths"])-touched.get(rid,set())]
+    return records,repos
+def observe_provenance(core): return _observe_provenance(core)[0]
+def project_provenance(db,value,map_id=lambda table,value:value):
+    p,k=value["payload"],value["kind"]; observed=value["observed_at"]
+    if k not in PROVENANCE_KINDS: return False
+    if k not in ("checkpoint.link","capture.gap") and p["id"]!=value["entity"]: raise ValueError("provenance entity mismatch")
+    if k=="repository.observed": db.execute("INSERT OR REPLACE INTO provenance.repositories VALUES (?,?,?,?,?,?)",(p["id"],p["lineage"],json.dumps(p["roots"]),json.dumps(p["remotes"]),p["head"],observed))
+    elif k=="file.observed":
+        if p["id"]!=provenance_digest({"repository":p["repository"],"path":p["path"]}): raise ValueError("provenance file identity mismatch")
+        db.execute("INSERT OR IGNORE INTO provenance.files VALUES (?,?,?,?)",(p["id"],p["repository"],p["path"],p["kind"]))
+    elif k=="file.version":
+        if p["id"]!=provenance_digest({"file":p["file"],"content":p["content_hash"]}): raise ValueError("provenance version identity mismatch")
+        db.execute("INSERT OR IGNORE INTO provenance.file_versions VALUES (?,?,?,?)",(p["id"],p["file"],p["content_hash"],observed))
+    elif k=="edit.observed":
+        edit,turn=map_id("file_edits",p["id"]),map_id("messages",p["turn"]); row=db.execute("SELECT message_id FROM file_edits WHERE id=?",(edit,)).fetchone()
+        if not row or row[0]!=turn: raise ValueError("provenance edit/turn mismatch")
+        db.execute("INSERT OR REPLACE INTO provenance.file_edit_files VALUES (?,?,?,?,?)",(edit,p["file"],p["before_hash"],p["after_hash"],p["evidence"]))
+    elif k=="git.checkpoint":
+        if p["id"]!=provenance_digest({"repository":p["repository"],"head":p["head"],"state":p["state_hash"]}): raise ValueError("provenance checkpoint identity mismatch")
+        db.execute("INSERT OR IGNORE INTO provenance.git_checkpoints VALUES (?,?,?,?,?,?)",(p["id"],p["repository"],p["head"],p["state_hash"],json.dumps(p["paths"]),observed))
+    elif k=="checkpoint.link":
+        if value["entity"]!=provenance_digest({"checkpoint":p["checkpoint"],"edit":p["edit"]}): raise ValueError("provenance checkpoint link mismatch")
+        db.execute("INSERT OR IGNORE INTO provenance.checkpoint_edits VALUES (?,?,?)",(p["checkpoint"],map_id("file_edits",p["edit"]),p["evidence"]))
+    elif k=="identity.assertion": db.execute("INSERT OR IGNORE INTO provenance.assertions VALUES (?,?,?,?,?,?,?)",(p["id"],p["left"],p["relation"],p["right"],p["evidence"],p["status"],observed))
+    elif k=="capture.gap":
+        if value["entity"]!=provenance_digest({"checkpoint":p["checkpoint"],"path":p["path"]}): raise ValueError("provenance gap identity mismatch")
+        db.execute("INSERT OR IGNORE INTO provenance.capture_gaps VALUES (?,?,?,?,?,?)",(value["entity"],p["repository"],p["checkpoint"],p["path"],p["relation"],observed))
+    return True
+def capture_provenance(core,edit_ids=None):
+    records,repos=_observe_provenance(core,edit_ids); core.execute("BEGIN")
+    try: [_observe_checkout(core,r) for r in repos.values()]; [project_provenance(core,r) for r in records]; core.execute("COMMIT")
+    except BaseException: core.execute("ROLLBACK"); raise
+    return records
+def project_archive_row(db,table,columns,values,origin=None):
+    if table not in ARCHIVE_COLUMNS or columns!=ARCHIVE_COLUMNS[table] or len(values)!=len(columns): raise ValueError("record schema/entity mismatch")
+    required=("workspace_id","author_user_id","author_device_id","source_row_id","source_event_id","content_key","observed_at")
+    if origin and set(origin)!=set(required): raise ValueError("record origin schema mismatch")
+    updates=",".join(f"{c}=excluded.{c}" for c in columns[1:])+(f",embedding=CASE WHEN {table}.content IS DISTINCT FROM excluded.content THEN NULL ELSE {table}.embedding END" if table=="messages" else ""); db.execute(f"INSERT INTO {table} ({','.join(columns)}) VALUES ({','.join('?'*len(columns))}) ON CONFLICT(id) DO UPDATE SET {updates}",values)
+    if origin: db.execute("INSERT OR REPLACE INTO remote.row_origins VALUES (?,?,?,?,?,?,?,?,?)",(table,values[0],*(origin[k] for k in required)))
+def set_attachment_path(db,row_id,path): db.execute("UPDATE attachments SET path=? WHERE id=?",(str(path),row_id))
 def init_schema(conn):
     conn.execute("""CREATE TABLE IF NOT EXISTS conversations (
         id VARCHAR PRIMARY KEY, source VARCHAR NOT NULL, title VARCHAR, created_at TIMESTAMP, updated_at TIMESTAMP,
@@ -69,6 +171,7 @@ def init_schema(conn):
         content TEXT, created_at TIMESTAMP)""")
     conn.execute("ALTER TABLE file_edits ADD COLUMN IF NOT EXISTS old_content TEXT")
     conn.execute("ALTER TABLE messages ADD COLUMN IF NOT EXISTS parent_id VARCHAR")  # thread tree; ALTER (not CREATE) keeps column order identical for fresh and migrated dbs
+    conn.execute(_PROVENANCE_SCHEMA)
     conn.execute("INSTALL fts; LOAD fts")
 
 def counts_by_source(conn):
@@ -648,7 +751,7 @@ def drain_hooks(embed=False, local_only=False):
                 if snap != [st2.st_mtime_ns, st2.st_size]: retry_hook(work); continue
                 if not r.convs: done.append((work, key, snap, set())); continue
                 conn = get_db(); init_schema(conn)
-                try: changed = upsert(conn, r)[-1] | ({m["id"] for m in r.msgs} if e.get("retry") else set())
+                try: changed = upsert(conn, r)[-1] | ({m["id"] for m in r.msgs} if e.get("retry") else set()); capture_provenance(conn,[x["id"] for x in r.edits])
                 finally: conn.close()
                 atomic_json(work, {**e, "snap":snap, "changed":sorted(changed)})
                 done.append((work, key, snap, changed))
@@ -1013,7 +1116,7 @@ def sync(watch: bool = typer.Option(False, "-w"), interval: int = typer.Option(3
     def do_sync():
         nonlocal state, dirty, local, web, imports
         sync_lock = (DATA_DIR/".sync.lock").open("w"); fcntl.flock(sync_lock, fcntl.LOCK_EX); state = load_state(); local, web, imports = state.setdefault("local", {}), state.setdefault("web", {}), state.setdefault("imports", {}); chatgpt_ok.clear(); chatgpt_frontiers.clear()
-        t0 = time.perf_counter(); dirty, total, changed, jobs, newc, updc = False, [0]*5, set(), [], 0, 0
+        t0 = time.perf_counter(); dirty, total, changed, jobs, newc, updc, provenance_edits = False, [0]*5, set(), [], 0, 0, set()
         def checkpoint(r):
             ids = {m["id"] for m in r.msgs}
             with (HOOK_DIR/".lock").open("w") as lock:
@@ -1052,10 +1155,14 @@ def sync(watch: bool = typer.Option(False, "-w"), interval: int = typer.Option(3
                     total = [total[i]+v for i, v in enumerate([c, m, t, a, e])]
                     newc, updc = newc+n, updc+u
                     changed |= changed_ids
+                    if r is not None: provenance_edits |= {x["id"] for x in r.edits}
                     if r is not None and (st := j.get("state")):
                         if j["name"] == "chatgpt": st[2]["coverage"] = sorted(known)
                         set_state(*st)
                     if src := j.get("source"): typer.echo(f"Updated {j['label']} ({n} new, {u} updated convs; {fmt([c, m, t, a, e])} processed){' before failure' if r is None else ''}{' in %.2fs' % (time.perf_counter()-j['t']) if verbose else ''}")
+        conn = get_db()
+        try: capture_provenance(conn,provenance_edits)
+        finally: conn.close()
         mark_dirty(changed)
         if dirty: atomic_json(STATE_PATH, state)
         sync_lock.close()

@@ -11,15 +11,12 @@ read_when:
 
 DuckDB database at `<root>/data/convos.db`. Default root is `~/.convos` (override with `CONVOS_PROJECT_ROOT`).
 
-The optional encrypted remote keeps its immutable event ledger and typed
-provenance projection in `<root>/remote/state.db`. This is separate from the
-core schema and rebuildable from signed events. Stable application views are
-`file_history`, `changeset_files`, `conversation_changes`,
-`commit_conversations`, `repository_activity`,
-`workspace_repository_activity`, `identity_assertions`, `capture_gaps`,
-`device_activity`, `checkpoint_states`, `sharing_boundaries`, and
-`repository_lineages`. Use `convos remote graph VIEW [ARG]`; applications do
-not parse encrypted envelopes.
+Core owns the `provenance` schema in this same DuckDB. It stores canonical
+repository, file, hash, checkpoint, assertion, and gap facts while joining
+prompts, conversations, and edits from the existing archive tables. Remote
+submits verified facts through the core projector. Transport cursors and
+device/workspace activity remain in `<root>/remote/state.db`; durable imported
+row authorship lives in `remote.row_origins` in DuckDB.
 
 ## Tables
 
@@ -114,6 +111,33 @@ File modifications from CLI tools.
 | content | TEXT | New content or edit description |
 | created_at | TIMESTAMP | Edit timestamp |
 | old_content | TEXT | Replaced text (`old_string` for `edit`; NULL for `write`/`shell`) |
+
+### provenance schema
+
+The schema is initialized and written by core because it is part of the archive
+contract. Capture runs on hooks and ordinary sync; the installable changegraph
+product is strictly read-only.
+
+| Relation | Canonical facts |
+|----------|-----------------|
+| `repositories` | Repository identity, lineage, roots, remotes, and last observed head |
+| `repository_checkouts` | Local-only checkout path, branch, and head |
+| `files` | Repository-relative or opaque external file identity |
+| `file_versions` | Observed full-content hashes |
+| `file_edit_files` | Existing `file_edits.id` to file/hash/evidence edges |
+| `git_checkpoints` | Git head plus exact working-tree state hash and changed paths |
+| `checkpoint_edits` | Checkpoint-to-`file_edits.id` evidence |
+| `assertions` | Typed, reversible identity assertions |
+| `capture_gaps` | Explicit unobserved-change gaps |
+
+There are intentionally no copied prompts, message bodies, changesets,
+file-edit bodies, raw remote payloads, workspace IDs, or device IDs in this
+schema.
+
+`remote.row_origins` is the separate identifier-only exception for remotely
+projected archive rows. Core writes it atomically with each imported row so
+deleting synchronization state cannot change authorship or make a foreign row
+publishable.
 
 ## Full-Text Search
 
