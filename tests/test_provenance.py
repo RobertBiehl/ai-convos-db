@@ -3,9 +3,9 @@ import json, subprocess, sys
 import duckdb
 import pytest
 import ai_convos.cli as core_module
-from ai_convos.cli import ARCHIVE_COLUMNS, archive_state, capture_provenance as capture, init_schema, project_archive_row, project_provenance as project, provenance_digest as digest, repository
+from ai_convos.cli import ARCHIVE_COLUMNS, archive_state, capture_provenance as capture, init_schema, project_archive_row, project_provenance as project, project_row_proof, project_workspace_controls, provenance_digest as digest, repository
 from ai_convos_changegraph.provenance import query
-from ai_convos_remote.protocol import event, identity
+from ai_convos_remote.protocol import certificate, event, identity, logical_row, public_id, row_proof
 
 
 def git(path,*args): return subprocess.run(("git","-C",str(path),*args),check=True,capture_output=True).stdout.decode().strip()
@@ -42,6 +42,21 @@ def test_provenance_upgrade_preserves_edit_evidence_and_removes_unused_graph_tab
 def test_archive_generation_is_transactional_and_counts_only_owned_rows(tmp_path):
     db=duckdb.connect(str(tmp_path/"core.db")); init_schema(db); initial=archive_state(db); row=["c","codex","one","2026-01-01","2026-01-01",None,None,None,None,"{}"]
     db.execute("BEGIN"); project_archive_row(db,"conversations",ARCHIVE_COLUMNS["conversations"],row); assert archive_state(db)[1:]==(initial[1]+1,1); db.execute("ROLLBACK"); assert archive_state(db)==initial
+
+
+def test_row_proofs_and_signers_are_durable_idempotent_core_metadata(tmp_path):
+    db=graph(tmp_path/"graph.db"); root,device=identity("root"),identity("device"); user=public_id(root["sign_public"]); cert=certificate(root,user,device); row=logical_row("messages",identity="m",state="deleted"); proof=row_proof(device,user,"origin",2,row); generation=archive_state(db)[1]; db.execute("BEGIN"); pid=project_row_proof(db,proof,root["sign_public"],cert); assert project_row_proof(db,proof,root["sign_public"],cert)==pid; db.execute("COMMIT")
+    assert db.execute("SELECT workspace_id,row_kind,source_row_id,state,revision,previous_revision FROM remote.row_proofs").fetchone()==("origin","messages","m","deleted",proof["revision"],None) and db.execute("SELECT COUNT(*) FROM remote.row_signers").fetchone()[0]==1 and archive_state(db)[1]==generation and project_row_proof(db,proof,root["sign_public"],certificate(root,user,device))==pid
+    with pytest.raises(ValueError,match="signer conflict"): project_row_proof(db,proof,identity("other")["sign_public"],cert)
+
+
+def test_core_upgrade_adds_origin_proof_link_without_losing_attribution(tmp_path):
+    db=graph(tmp_path/"graph.db"); db.execute("ALTER TABLE remote.row_origins DROP COLUMN proof_id"); db.execute("INSERT INTO remote.row_origins VALUES ('messages','p','w','u','d','s','e','k','2026-01-01')"); init_schema(db); assert db.execute("SELECT workspace_id,author_user_id,proof_id FROM remote.row_origins").fetchone()==("w","u",None)
+
+
+def test_workspace_authorization_chain_is_normalized_and_conflicts_fail(tmp_path):
+    db=graph(tmp_path/"graph.db"); controls=[{"workspace":"w","revision":1,"epoch":1,"members":{"u":"admin"}},{"workspace":"w","revision":2,"epoch":2,"members":{"u":"admin","v":"member"}}]; assert project_workspace_controls(db,controls)==project_workspace_controls(db,controls)==2 and db.execute("SELECT revision,epoch FROM remote.workspace_controls ORDER BY revision").fetchall()==[(1,1),(2,2)]
+    with pytest.raises(ValueError,match="control conflict"): project_workspace_controls(db,[{**controls[1],"members":{"u":"member"}}])
 
 
 def test_git_checkpoint_is_capture_observation_not_dirty_path_gap(tmp_path):

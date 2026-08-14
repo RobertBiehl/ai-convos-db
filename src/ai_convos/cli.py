@@ -73,7 +73,10 @@ CREATE TABLE IF NOT EXISTS provenance.file_edit_files(file_edit_id VARCHAR,file_
 CREATE TABLE IF NOT EXISTS provenance.git_checkpoints(id VARCHAR PRIMARY KEY,repository VARCHAR,head VARCHAR,state_hash VARCHAR,paths JSON,observed_at TIMESTAMP,capture_source VARCHAR);
 CREATE TABLE IF NOT EXISTS provenance.checkpoint_edits(checkpoint_id VARCHAR,file_edit_id VARCHAR,evidence VARCHAR,PRIMARY KEY(checkpoint_id,file_edit_id));
 CREATE SCHEMA IF NOT EXISTS remote;
-CREATE TABLE IF NOT EXISTS remote.row_origins(table_name VARCHAR,physical_row_id VARCHAR,workspace_id VARCHAR,author_user_id VARCHAR,author_device_id VARCHAR,source_row_id VARCHAR,source_event_id VARCHAR,content_key VARCHAR,observed_at TIMESTAMP,PRIMARY KEY(table_name,physical_row_id));
+CREATE TABLE IF NOT EXISTS remote.row_origins(table_name VARCHAR,physical_row_id VARCHAR,workspace_id VARCHAR,author_user_id VARCHAR,author_device_id VARCHAR,source_row_id VARCHAR,source_event_id VARCHAR,content_key VARCHAR,observed_at TIMESTAMP,proof_id VARCHAR,PRIMARY KEY(table_name,physical_row_id));
+CREATE TABLE IF NOT EXISTS remote.row_signers(author_user_id VARCHAR,author_device_id VARCHAR,root_public VARCHAR,certificate JSON,PRIMARY KEY(author_user_id,author_device_id));
+CREATE TABLE IF NOT EXISTS remote.workspace_controls(workspace_id VARCHAR,revision UINTEGER,epoch UINTEGER,state_hash VARCHAR,control JSON,PRIMARY KEY(workspace_id,revision));
+CREATE TABLE IF NOT EXISTS remote.row_proofs(id VARCHAR PRIMARY KEY,workspace_id VARCHAR,row_kind VARCHAR,source_row_id VARCHAR,encoding_v USMALLINT,content_hash VARCHAR,revision VARCHAR,previous_revision VARCHAR,state VARCHAR,author_user_id VARCHAR,author_device_id VARCHAR,authorization_epoch UINTEGER,signature VARCHAR);
 CREATE TABLE IF NOT EXISTS archive_state(singleton BOOLEAN PRIMARY KEY,archive_id UUID NOT NULL,generation UBIGINT NOT NULL);
 """
 ARCHIVE_COLUMNS={"conversations":["id","source","title","created_at","updated_at","model","cwd","git_branch","project_id","metadata"],"messages":["id","conversation_id","role","content","thinking","created_at","model","metadata","parent_id"],"tool_calls":["id","message_id","tool_name","input","output","status","duration_ms","created_at"],"attachments":["id","message_id","filename","mime_type","size","path","url","created_at"],"artifacts":["id","conversation_id","artifact_type","title","content","language","created_at","version"],"file_edits":["id","message_id","file_path","edit_type","content","created_at","old_content"]}
@@ -162,10 +165,22 @@ def capture_provenance(path=None,edit_ids=None,source="sync"):
 def project_archive_row(db,table,columns,values,origin=None):
     if table not in ARCHIVE_COLUMNS or columns!=ARCHIVE_COLUMNS[table] or len(values)!=len(columns): raise ValueError("record schema/entity mismatch")
     required=("workspace_id","author_user_id","author_device_id","source_row_id","source_event_id","content_key","observed_at")
-    if origin and set(origin)!=set(required): raise ValueError("record origin schema mismatch")
+    if origin and set(origin) not in (set(required),set(required)|{"proof_id"}): raise ValueError("record origin schema mismatch")
     updates=",".join(f"{c}=excluded.{c}" for c in columns[1:])+(f",embedding=CASE WHEN {table}.content IS DISTINCT FROM excluded.content THEN NULL ELSE {table}.embedding END" if table=="messages" else ""); db.execute(f"INSERT INTO {table} ({','.join(columns)}) VALUES ({','.join('?'*len(columns))}) ON CONFLICT(id) DO UPDATE SET {updates}",values)
-    if origin: db.execute("INSERT OR REPLACE INTO remote.row_origins VALUES (?,?,?,?,?,?,?,?,?)",(table,values[0],*(origin[k] for k in required)))
+    if origin: db.execute("INSERT OR REPLACE INTO remote.row_origins VALUES (?,?,?,?,?,?,?,?,?,?)",(table,values[0],*(origin[k] for k in required),origin.get("proof_id")))
     _archive_touch(db)
+def project_row_proof(db,proof,root_public,certificate):
+    fields=("workspace","row_kind","row_id","encoding_v","content_hash","revision","previous_revision","state","author_user_id","author_device_id","authorization_epoch","signature"); expected={"v","kind",*fields}; signer=(proof["author_user_id"],proof["author_device_id"]); packed=json.dumps(certificate,sort_keys=True,separators=(",",":"),ensure_ascii=True,allow_nan=False)
+    if set(proof)!=expected or proof["v"]!=1 or proof["kind"]!="row.proof" or set(certificate)!={"v","user","device","issued_at","signature"} or certificate["v"]!=1 or set(certificate["device"])!={"id","name","sign_public","box_public"} or (certificate["user"],certificate["device"]["id"])!=signer: raise ValueError("row proof storage schema mismatch")
+    if (old:=db.execute("SELECT root_public,CAST(certificate AS VARCHAR) FROM remote.row_signers WHERE author_user_id=? AND author_device_id=?",signer).fetchone()) and (old[0]!=root_public or json.loads(old[1])["device"]!=certificate["device"]): raise ValueError("row signer conflict")
+    db.execute("INSERT OR IGNORE INTO remote.row_signers VALUES (?,?,?,?)",(*signer,root_public,packed)); pid=provenance_digest(proof); db.execute("INSERT OR IGNORE INTO remote.row_proofs VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",(pid,*(proof[k] for k in fields))); return pid
+def project_workspace_controls(db,controls):
+    for value in controls:
+        if not {"workspace","revision","epoch"}<=set(value) or not isinstance(value["revision"],int) or not isinstance(value["epoch"],int): raise ValueError("workspace control storage schema mismatch")
+        raw=json.dumps(value,sort_keys=True,separators=(",",":"),ensure_ascii=True,allow_nan=False); key=(value["workspace"],value["revision"]); proof=provenance_digest(value); old=db.execute("SELECT state_hash FROM remote.workspace_controls WHERE workspace_id=? AND revision=?",key).fetchone()
+        if old and old[0]!=proof: raise ValueError("workspace control conflict")
+        db.execute("INSERT OR IGNORE INTO remote.workspace_controls VALUES (?,?,?,?,?)",(*key,value["epoch"],proof,raw))
+    return len(controls)
 def set_attachment_path(db,row_id,path): db.execute("UPDATE attachments SET path=? WHERE id=?",(str(path),row_id)); _archive_touch(db)
 def init_schema(conn):
     conn.execute("""CREATE TABLE IF NOT EXISTS conversations (
@@ -194,7 +209,7 @@ def init_schema(conn):
     conn.execute("BEGIN")
     try:
         cols={r[0] for r in conn.execute("SELECT column_name FROM information_schema.columns WHERE table_schema='provenance' AND table_name='file_edit_files'").fetchall()}; [(conn.execute(f"ALTER TABLE provenance.file_edit_files RENAME COLUMN {old} TO {new}"),cols.add(new)) for old,new in (("before_hash","old_content_hash"),("after_hash","new_content_hash")) if old in cols and new not in cols]
-        conn.execute("ALTER TABLE provenance.git_checkpoints ADD COLUMN IF NOT EXISTS capture_source VARCHAR"); conn.execute("DROP TABLE IF EXISTS provenance.assertions"); conn.execute("DROP TABLE IF EXISTS provenance.capture_gaps"); conn.execute("COMMIT")
+        conn.execute("ALTER TABLE provenance.git_checkpoints ADD COLUMN IF NOT EXISTS capture_source VARCHAR"); conn.execute("ALTER TABLE remote.row_origins ADD COLUMN IF NOT EXISTS proof_id VARCHAR"); conn.execute("DROP TABLE IF EXISTS provenance.assertions"); conn.execute("DROP TABLE IF EXISTS provenance.capture_gaps"); conn.execute("COMMIT")
     except BaseException: conn.execute("ROLLBACK"); raise
     conn.execute("INSERT INTO archive_state SELECT TRUE,uuid(),0 WHERE NOT EXISTS (SELECT 1 FROM archive_state)")
     conn.execute("INSTALL fts; LOAD fts")
