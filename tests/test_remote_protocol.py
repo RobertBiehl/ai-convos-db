@@ -6,7 +6,7 @@ from cryptography.exceptions import InvalidSignature, InvalidTag
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
 from ai_convos_remote.protocol import (b64, certificate, digest, event, fingerprint, identity, logical_row, open_event, open_key, open_replica, public_id, row_proof,
-                                       material_event, public, purge_certificate, recover, recovery_bundle, seal_event, seal_history, seal_key,
+                                       public, purge_certificate, recover, recovery_bundle, seal_event, seal_key,
                                        seal_replica, verify_certificate, verify_event, verify_purge, verify_row_proof)
 
 def fixed_identity():
@@ -95,11 +95,3 @@ def test_purge_certificate_is_deterministic_and_every_field_is_signed():
     changes={"workspace":"other","event":"d"*64,"author":"e"*32,"epoch":3,"seq":4,"parents":["f"*64],"event_kind":"message.record","payload_v":2,"superseded_by":"0"*64}
     for field,value in changes.items():
         with pytest.raises(ValueError,match="purge certificate"): verify_purge({**proof,field:value},device["sign_public"])
-
-
-def test_nested_history_verifies_self_certifying_authors():
-    source,admin,recipient=identity("source"),identity("admin"),identity("recipient"); inner=event(source,1,"x.future","x",{"value":1}); middle=event(admin,1,"history.republish","history:1",{"sealed":seal_history(inner,[recipient],"history:1")}); outer=event(admin,2,"history.republish","history:2",{"sealed":seal_history(middle,[recipient],"history:2")}); devices={d["id"]:public(d) for d in (source,admin,recipient)}
-    assert material_event(outer,devices,recipient)==inner
-    devices[source["id"]]=public(admin)
-    with pytest.raises(ValueError,match="key mismatch"): material_event(outer,devices,recipient)
-    with pytest.raises(ValueError,match="unsealed"): material_event(event(admin,3,"history.republish","legacy",{"event":inner}),devices,recipient)

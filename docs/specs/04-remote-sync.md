@@ -163,8 +163,8 @@ clocks never establish causality.
 For personal-memory privacy deletion, a device may purge only explicit event
 ids that it authored and only after publishing the corresponding memory
 tombstone. The relay verifies each author signature, exact stored envelope
-header, later same-author anchor, personal scope, and permanent selected-history
-protection before atomically storing certificates and deleting live ciphertext.
+header, later same-author anchor, and personal scope before atomically storing
+certificates and deleting live ciphertext.
 Clients verify the historical device key and signed deletion anchor before
 changing sequence or receipt state. Missing or invalid proof blocks readiness.
 Purge is idempotent, and stored proofs prevent event-ID or author-sequence reuse.
@@ -201,12 +201,9 @@ relay can still hide a newest suffix after the latest signed boundary because
 v1 has no gossip or transparency log.
 
 New members receive only the new epoch by default. Complete-history grant seals
-selected old epoch keys to their devices. Selected-history grant republishes
-chosen immutable events under the current epoch, with the event content key
-sealed only to the target member's authorized devices, so unrelated old content
-and keys are not disclosed to the server or other workspace members. Same-user
-device approval rewraps those selected events to the new device through a
-durable local outbox.
+all retained old epoch keys to their devices. Same-user device approval rewraps
+those epoch keys to the new device. Work requiring a different audience uses a
+different workspace; the protocol has no per-row history grants.
 
 The recovery bundle contains the user root private material and personal
 workspace keyring, encrypted by the recovery key and stored as an opaque server
@@ -281,7 +278,7 @@ CLI.
 
 Automated acceptance must run one server, two devices for one user, and a second
 user with two devices. It must prove enrollment, automatic personal delivery,
-team policy projection, default-no-history invitation, explicit selected/all
+team policy projection, default-future-only invitation, explicit all-history
 history, removal and rotation, tamper rejection, retry idempotency, offline and
 out-of-order convergence, crash recovery, backup/restore, empty projection
 rebuild, cross-repository changesets, checkpoint gaps, local-only queries, lazy

@@ -2,16 +2,16 @@ import copy, time
 
 import pytest
 
-from ai_convos_remote.control import approved, proposal, record, sign, state_hash, verify_state, vote
+from ai_convos_remote.control import CONTROL_V, approved, proposal, record, sign, state_hash, verify_state, vote
 from ai_convos_remote.protocol import certificate, digest, identity
 
 
 def person(name):
     root,device=identity(name+" root"),identity(name); return root,device,record(root["id"],root["sign_public"],device,certificate(root,root["id"],device))
 def genesis(root,device,entry):
-    body={"v":1,"kind":"workspace.state","workspace":"w","scope":"team","revision":1,"prev":None,"epoch":1,"boundary":{"epoch":1,"tail":0,"heads":{}},"key_commitment":digest(b"k1"),"members":{root["id"]:{"role":"admin","joined":1,"history_from":1,"selected":[]}},"devices":{device["id"]:entry},"removed":[],"action":"create","approval":None}; return sign(device,body)
+    body={"v":CONTROL_V,"kind":"workspace.state","workspace":"w","scope":"team","revision":1,"prev":None,"epoch":1,"boundary":{"epoch":1,"tail":0,"heads":{}},"key_commitment":digest(b"k1"),"members":{root["id"]:{"role":"admin","joined":1,"history_from":1}},"devices":{device["id"]:entry},"removed":[],"action":"create","approval":None}; return sign(device,body)
 def successor(device,base,action,devices=None,members=None,removed=None,approval=None,epoch=None):
-    next_epoch=epoch if epoch is not None else base["epoch"]+1; boundary=copy.deepcopy(base["boundary"]); boundary["epoch"]=next_epoch; return sign(device,{"v":1,"kind":"workspace.state","workspace":"w","scope":base["scope"],"revision":base["revision"]+1,"prev":state_hash(base),"epoch":next_epoch,"boundary":boundary,"key_commitment":digest(f"k{base['epoch']+1}".encode()),"members":members or copy.deepcopy(base["members"]),"devices":devices or copy.deepcopy(base["devices"]),"removed":removed if removed is not None else list(base["removed"]),"action":action,"approval":approval,"approved_at":time.time()})
+    next_epoch=epoch if epoch is not None else base["epoch"]+1; boundary=copy.deepcopy(base["boundary"]); boundary["epoch"]=next_epoch; return sign(device,{"v":CONTROL_V,"kind":"workspace.state","workspace":"w","scope":base["scope"],"revision":base["revision"]+1,"prev":state_hash(base),"epoch":next_epoch,"boundary":boundary,"key_commitment":digest(f"k{base['epoch']+1}".encode()),"members":members or copy.deepcopy(base["members"]),"devices":devices or copy.deepcopy(base["devices"]),"removed":removed if removed is not None else list(base["removed"]),"action":action,"approval":approval,"approved_at":time.time()})
 
 
 def test_self_approval_inherits_user_state_and_rejects_cross_user_or_removed():
@@ -24,7 +24,7 @@ def test_self_approval_inherits_user_state_and_rejects_cross_user_or_removed():
 
 
 def test_majority_is_one_vote_per_user_and_bound_to_signed_base():
-    ar,ad,a=person("alice"); br,bd,b=person("bob"); cr,cd,c=person("carol"); dr,dd,d=person("dora"); base=genesis(ar,ad,a); base["members"]|={br["id"]:{"role":"member","joined":1,"history_from":1,"selected":[]},cr["id"]:{"role":"member","joined":1,"history_from":1,"selected":[]},dr["id"]:{"role":"member","joined":1,"history_from":1,"selected":[]}}; base["devices"]|={bd["id"]:b,cd["id"]:c,dd["id"]:d}; base=sign(ad,{k:v for k,v in base.items() if k not in ("author","signature")})
+    ar,ad,a=person("alice"); br,bd,b=person("bob"); cr,cd,c=person("carol"); dr,dd,d=person("dora"); base=genesis(ar,ad,a); base["members"]|={br["id"]:{"role":"member","joined":1,"history_from":1},cr["id"]:{"role":"member","joined":1,"history_from":1},dr["id"]:{"role":"member","joined":1,"history_from":1}}; base["devices"]|={bd["id"]:b,cd["id"]:c,dd["id"]:d}; base=sign(ad,{k:v for k,v in base.items() if k not in ("author","signature")})
     _,target,entry=person("alice-recovered"); entry={**entry,"user":ar["id"],"root_public":ar["sign_public"],"certificate":certificate(ar,ar["id"],target),"device":{k:target[k] for k in ("id","name","sign_public","box_public")},"history":False}; req=proposal(target,"w",base,entry,time.time()+60)
     votes=[vote(bd,br["id"],req),vote(cd,cr["id"],req)]; assert approved(base,req,votes)==(2,3)
     state=successor(bd,base,"quorum_approve",{**base["devices"],target["id"]:entry},approval={"proposal":req,"votes":votes}); assert verify_state(state,base)
@@ -43,14 +43,15 @@ def test_state_chain_rejects_role_change_split_transition_and_bad_commitment_sha
     with pytest.raises(ValueError,match="membership"): verify_state(successor(ad,base,"membership",{**base["devices"],target["id"]:entry}),base)
 
 
-def test_selected_history_is_append_only_in_signed_controls():
-    ar,ad,a=person("alice"); base=genesis(ar,ad,a); base["members"][ar["id"]]["selected"]=["a"*64]; base=sign(ad,{k:v for k,v in base.items() if k not in ("author","signature")}); body={k:copy.deepcopy(v) for k,v in base.items() if k not in ("author","signature")}; body.update(revision=2,prev=state_hash(base),action="history",approval=None,approved_at=time.time()); body["members"][ar["id"]]["selected"]=[]
-    with pytest.raises(ValueError,match="history transition"): verify_state(sign(ad,body),base)
-    body["members"][ar["id"]]["selected"]=["a"*64,"b"*64]; assert verify_state(sign(ad,body),base)
+def test_complete_history_entitlement_can_expand_but_not_narrow():
+    ar,ad,a=person("alice"); br,bd,b=person("bob"); base=genesis(ar,ad,a); members={**base["members"],br["id"]:{"role":"member","joined":2,"history_from":2}}; joined=successor(ad,base,"membership",{**base["devices"],bd["id"]:b},members); assert verify_state(joined,base)
+    body={k:copy.deepcopy(v) for k,v in joined.items() if k not in ("author","signature")}; body.update(revision=3,prev=state_hash(joined),action="history",approval=None,approved_at=time.time()); body["members"][br["id"]]["history_from"]=1; granted=sign(ad,body); assert verify_state(granted,joined)
+    body={k:copy.deepcopy(v) for k,v in granted.items() if k not in ("author","signature")}; body.update(revision=4,prev=state_hash(granted),approved_at=time.time()); body["members"][br["id"]]["history_from"]=2
+    with pytest.raises(ValueError,match="history transition"): verify_state(sign(ad,body),granted)
 
 
 def test_personal_workspace_cannot_add_or_start_with_other_users():
-    ar,ad,a=person("alice"); br,bd,b=person("bob"); base=genesis(ar,ad,a); injected={**base,"scope":"personal","members":{**base["members"],br["id"]:{"role":"member","joined":1,"history_from":1,"selected":[]}},"devices":{**base["devices"],bd["id"]:b}}; injected=sign(ad,{k:v for k,v in injected.items() if k not in ("author","signature")})
+    ar,ad,a=person("alice"); br,bd,b=person("bob"); base=genesis(ar,ad,a); injected={**base,"scope":"personal","members":{**base["members"],br["id"]:{"role":"member","joined":1,"history_from":1}},"devices":{**base["devices"],bd["id"]:b}}; injected=sign(ad,{k:v for k,v in injected.items() if k not in ("author","signature")})
     with pytest.raises(ValueError,match="genesis"): verify_state(injected)
-    personal=sign(ad,{**{k:v for k,v in base.items() if k not in ("author","signature")},"scope":"personal"}); members={**personal["members"],br["id"]:{"role":"member","joined":2,"history_from":2,"selected":[]}}
+    personal=sign(ad,{**{k:v for k,v in base.items() if k not in ("author","signature")},"scope":"personal"}); members={**personal["members"],br["id"]:{"role":"member","joined":2,"history_from":2}}
     with pytest.raises(ValueError,match="membership"): verify_state(successor(ad,personal,"membership",{**personal["devices"],bd["id"]:b},members),personal)

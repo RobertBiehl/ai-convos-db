@@ -212,16 +212,15 @@ conversation when work must remain outside it.
 Membership and history:
 
 ```bash
-convos remote grant-selected backend alice EVENT_ID [EVENT_ID ...]
 convos remote grant-all backend alice
 convos remote remove backend alice
 convos remote remove-device backend DEVICE_ID
 ```
 
-New members receive no old events or keys by default. `grant-selected`
-republishes chosen signed evidence with its content key wrapped only to the
-member's authorized devices. `grant-all` wraps old epoch keys to those devices
-and resets their history boundary. User or device removal rotates the epoch.
+New members receive no old events or keys by default. `grant-all` wraps old
+epoch keys to their devices and resets their history boundary. There is no
+per-row visibility mode: use a separate workspace for a different audience.
+User or device removal rotates the epoch.
 Device removal is workspace-specific, so it does not disable the device's
 personal workspace or unrelated teams. It cannot erase plaintext or keys
 already obtained.
@@ -251,11 +250,10 @@ convos remote approve-device backend DEVICE_ID
 ```
 
 The new device inherits that device's workspace access, the user's existing
-role, and the same history-inheritance flag. No administrator action is needed.
-Selected-history evidence is rewrapped to the new device; a durable local
-outbox retries that publication after a crash. An explicit rejection
-invalidates the proposal, and an explicitly removed device ID cannot use this
-path or be reauthorized.
+role, and the same history-inheritance flag. Complete-history epoch keys are
+rewrapped to it when applicable. No administrator action is needed. An explicit
+rejection invalidates the proposal, and an explicitly removed device ID cannot
+use this path or be reauthorized.
 
 If the user has no authorized device in the workspace, authorization requires a
 strict majority of the other users represented by authorized devices in the
@@ -269,8 +267,8 @@ it. A one-user team with no authorized device has no electorate and cannot use
 team voting.
 
 Majority recovery is future-only. It restores the user's existing membership
-and role but does not silently release older keys. History grants remain
-administrator-controlled with `grant-selected` and `grant-all`. Alternatively,
+and role but does not silently release older keys. Complete history remains
+administrator-controlled with `grant-all`. Alternatively,
 the recovered device can ask the other represented users to activate the
 history entitlement it already had:
 
@@ -284,8 +282,8 @@ convos remote approve-history backend DEVICE_ID
 
 History activation is a separate signed majority decision and does not change
 membership or role. It can only install epoch keys held by the device that
-finalizes the vote and selected evidence available to that device; voting
-cannot recreate material that no remaining device has.
+finalizes the vote; voting cannot recreate material that no remaining device
+has.
 On the recovered device, the next ordinary sync detects that its earliest
 available epoch moved backward, rewinds the delivery cursor, and idempotently
 imports all newly decryptable events. `convos remote approvals backend` shows

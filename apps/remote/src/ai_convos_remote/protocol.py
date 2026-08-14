@@ -77,15 +77,7 @@ def verify_purge(value,sign_public):
     except (InvalidSignature,KeyError,TypeError,ValueError) as e: raise ValueError("invalid purge certificate") from e
     return value
 def signer(devices,author): value=devices[author]["sign_public"]; return value if public_id(value)==author else (_ for _ in ()).throw(ValueError("device signing key mismatch"))
-def material_event(value,devices=None,device=None):
-    while value["kind"]=="history.republish":
-        p=value["payload"]; "sealed" in p or (_ for _ in ()).throw(ValueError("unsealed history event rejected")); value=open_history(p["sealed"],device,value["entity"]) if device and device["id"] in p["sealed"]["keys"] else None
-        if value is None: return None
-        if devices is not None: verify_event(value,signer(devices,value["author"]))
-    return value
 def sign_control(device,body): return {**body,"control_signature":b64(_priv(Ed25519PrivateKey,device["sign_private"]).sign(canon(body)))}
-def seal_history(value,devices,context): key,nonce=os.urandom(32),os.urandom(12); return {"nonce":b64(nonce),"ciphertext":b64(AESGCM(key).encrypt(nonce,canon(value),context.encode())),"keys":{d["id"]:seal_key(key,d["box_public"],context) for d in devices}}
-def open_history(value,device,context): return json.loads(AESGCM(open_key(value["keys"][device["id"]],device["box_private"],context)).decrypt(unb64(value["nonce"]),unb64(value["ciphertext"]),context.encode()))
 
 def seal_event(value, workspace, epoch, key):
     nonce = os.urandom(12); header = dict(v=V, workspace=workspace, epoch=epoch, event=value["id"], author=value["author"], seq=value["seq"], parents=value["parents"], nonce=b64(nonce))

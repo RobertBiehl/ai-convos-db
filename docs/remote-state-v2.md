@@ -93,15 +93,13 @@ Long-lived `state.db` rows contain only:
   retained only in event receipts and DuckDB origin attribution;
 - exact `(workspace, author, sequence) -> event_id` sequence identity;
 - compact parent data only for unresolved out-of-order gaps;
-- content-free selected-history original-to-carrier mappings; missing delivery
-  work is derived from signed grants and acknowledged carrier receipts;
 - lazy/deferred event manifests, policies, retries, and last failure;
 - content-free acknowledged event and row-replica receipts.
 
 The only content-bearing remote working state permitted is an unacknowledged
 encrypted outbox file. Plaintext event JSON, acknowledged envelopes,
-selected-history material, attachment chunk bodies in SQLite, raw provenance
-JSON, prompts, and other derived content are forbidden.
+attachment chunk bodies in SQLite, raw provenance JSON, prompts, and other
+derived content are forbidden.
 
 ### Relay
 
@@ -269,12 +267,9 @@ workspace from publishing. Both leave a content-free manifest and remain
 fetchable from the relay. When a handler becomes available, Remote replays from
 the signed history boundary.
 
-Selected-history grants fetch exact envelopes from the relay, decrypt and
-verify them in memory, reseal them for authorized devices, upload, and discard
-the material. The signed append-only grant is the authority. Every refresh
-derives missing per-device carriers from signed selections minus acknowledged
-or pending carrier events, so deleting `state.db` or crashing after the control
-commit cannot forget delivery.
+History has only two access modes: membership-forward and all retained epochs.
+Complete-history grants rewrap epoch keys; no row body passes through
+`state.db`, and no per-row carrier bookkeeping exists.
 
 Attachment chunks remain encrypted until streamed to a mode-0600 temporary
 file under remote working storage. Hash and size validation precede atomic
@@ -340,7 +335,7 @@ idempotent schema initializer, which adds provenance, origins, and
 tables. This is the frictionless user-data migration path and is covered by a
 preservation test.
 
-Remote state schema 7 has no compatibility transform in this pre-stability
+Remote state schema 1 has no compatibility transform in this pre-stability
 release.
 Inspection and doctor are side-effect-free. An absent state is initialized as
 empty metadata. A mutating sync handles an incompatible or damaged regular
@@ -363,8 +358,8 @@ Historical canonical facts stranded in a legacy state remain recoverable from
 that bundle; this cutover does not make Remote or Changegraph parse the old
 schema.
 
-The relay protocol itself is not migrated. Client and server v3, backed by a
-fresh relay database at SQLite `user_version=5`, are deployed together after
+The relay protocol itself is not migrated. Client and server v1, backed by a
+fresh relay database at SQLite `user_version=1`, are deployed together after
 old workers are stopped.
 
 ## Product behavior
@@ -411,8 +406,8 @@ contains merge commits or fixup commits.
 - Explicit sync reaches the advertised tail in one invocation.
 - Settled state contains no synthetic plaintext.
 - State growth after acknowledgement is independent of payload size.
-- Signed selected-history grants recreate missing per-device delivery after a
-  crash or complete `state.db` loss.
+- Complete-history grants remain effective after a crash or complete
+  `state.db` loss because their signed control and key envelopes are relay state.
 - Completed personal attachment bodies remain available under archive-owned
   storage after `state.db` and remote working storage are removed.
 - Team repository/path routing publishes structurally complete conversations;
