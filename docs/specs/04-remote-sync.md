@@ -134,21 +134,23 @@ event ID, author, epoch, sequence, exact parents, fixed event kind/payload
 version, and the retained later deletion-event ID. Team events cannot use this
 operation.
 
-Required initial kinds:
+Required initial semantic kinds:
 
 - `conversation.record`, `message.record`, `tool.record`, `attachment.record`,
   `artifact.record`, `file_edit.record`
 - `repository.observed`, `git.checkpoint`, `file.version`, `edit.observed`
 - `checkpoint.link`, `workspace.policy`, `workspace.membership`
 
-Provenance events carry semantic references, not copied content: edit identity
-is `file_edits.id`, changeset identity is the existing message/turn, and prompt
+Archive rows and provenance facts carry independently signed logical-row
+proofs. Workspace policy and membership remain signed events. Provenance facts
+carry semantic references, not copied content: edit identity is
+`file_edits.id`, changeset identity is the existing message/turn, and prompt
 text is resolved from `messages` after projection.
 
 ## Envelopes and idempotency
 
-Canonical archive rows carry independently signed origin proofs and travel in
-separate repairable delivery replicas. A proof records both its immutable
+Canonical archive rows and provenance facts carry independently signed origin
+proofs and travel in separate repairable delivery replicas. A proof records both its immutable
 origin workspace and the workspace/epoch that authorized that revision. They
 are normally identical; after explicit team re-founding, a successor keeps its
 old origin and predecessor while naming the fresh authorization workspace.

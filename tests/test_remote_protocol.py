@@ -5,7 +5,7 @@ import pytest
 from cryptography.exceptions import InvalidSignature, InvalidTag
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
-from ai_convos_remote.protocol import (b64, certificate, digest, event, fingerprint, identity, logical_row, open_blob, open_event, open_key, open_origin, open_replica, public_id, row_proof,
+from ai_convos_remote.protocol import (b64, certificate, digest, event, fingerprint, identity, logical_fact, logical_row, open_blob, open_event, open_key, open_origin, open_replica, public_id, row_proof,
                                        public, purge_certificate, recover, recovery_bundle, seal_event, seal_key,
                                        seal_blob, seal_origin, seal_replica, verify_certificate, verify_event, verify_purge, verify_row_proof)
 
@@ -38,6 +38,13 @@ def test_logical_attachment_excludes_body_location_and_temporary_url():
     assert logical_row("attachments",columns,values)==logical_row("attachments",columns,other)
     other[-1]="b"*64; assert logical_row("attachments",columns,values)!=logical_row("attachments",columns,other)
     with pytest.raises(ValueError,match="logical row"): logical_row("messages",identity="m",state="unknown")
+
+
+def test_logical_provenance_fact_signs_semantics_not_checkout_observation():
+    record={"kind":"repository.observed","entity":"r","payload":{"id":"r","lineage":"l","roots":["portable"],"remotes":[],"head":"local-head"},"observed_at":"2026-01-01T00:00:00Z"}; row=logical_fact(record); assert row["data"]=={"lineage":"l","roots":["portable"],"remotes":[]} and row==logical_fact({**record,"payload":{**record["payload"],"head":"other-head"},"observed_at":"2027-01-01T00:00:00Z"})
+    root,device=identity("root"),fixed_identity(); user=public_id(root["sign_public"]); proof=row_proof(device,user,"w",1,row); assert verify_row_proof(proof,row,certificate(root,user,device),root["sign_public"])
+    with pytest.raises(ValueError,match="row proof"): verify_row_proof(proof,{**row,"data":{**row["data"],"lineage":"changed"}},certificate(root,user,device),root["sign_public"])
+    with pytest.raises(ValueError,match="row proof"): verify_row_proof(row_proof(device,user,"w",1,{**row,"state":"deleted","data":None}),{**row,"state":"deleted","data":None},certificate(root,user,device),root["sign_public"])
 
 
 def test_row_proof_binds_origin_revision_predecessor_and_deletion():

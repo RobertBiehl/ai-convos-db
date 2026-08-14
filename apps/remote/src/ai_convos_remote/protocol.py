@@ -11,6 +11,7 @@ from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 
 V = 1
 ROW_FIELDS_V1={"conversations":("source","title","created_at","updated_at","model","project_id","metadata"),"messages":("conversation_id","role","content","thinking","created_at","model","metadata","parent_id"),"tool_calls":("message_id","tool_name","input","output","status","duration_ms","created_at"),"attachments":("message_id","filename","mime_type","size","body_hash","created_at"),"artifacts":("conversation_id","artifact_type","title","content","language","created_at","version"),"file_edits":("message_id","file_path","edit_type","content","created_at","old_content")}
+PROVENANCE_FIELDS_V1={"repository.observed":("lineage","roots","remotes"),"file.observed":("repository","path","kind"),"file.version":("file","content_hash","observed_at"),"edit.observed":("turn","file","repository","old_content_hash","new_content_hash","evidence"),"git.checkpoint":("repository","head","state_hash","paths","observed_at","capture_source"),"checkpoint.link":("checkpoint","edit","evidence")}; SEMANTIC_FIELDS_V1=ROW_FIELDS_V1|PROVENANCE_FIELDS_V1
 ROW_JSON_V1={"metadata","input","output"}; ROW_TIME_V1={"created_at","updated_at"}
 ROW_PROOF_FIELDS={"v","kind","workspace","authorization_workspace","row_kind","row_id","encoding_v","content_hash","revision","previous_revision","state","author_user_id","author_device_id","authorization_epoch","signature"}
 def canon(v): return json.dumps(v, sort_keys=True, separators=(",", ":"), ensure_ascii=True, allow_nan=False).encode()
@@ -26,6 +27,10 @@ def logical_row(table,columns=(),values=(),identity=None,v=1,state="active"):
     if not required<=set(row): raise ValueError("incomplete logical row")
     norm=lambda k,v: json.loads(v) if v is not None and k in ROW_JSON_V1 and isinstance(v,str) else v.isoformat(timespec="microseconds") if v is not None and k in ROW_TIME_V1 and isinstance(v,datetime) else v
     return {"v":v,"kind":table,"id":identity or row["id"],"state":state,"data":{k:norm(k,row[k]) for k in ROW_FIELDS_V1[table]}}
+def logical_fact(record):
+    kind,p=record["kind"],record["payload"]
+    if kind not in PROVENANCE_FIELDS_V1 or record["entity"]!=(p.get("id") if kind!="checkpoint.link" else digest({"checkpoint":p["checkpoint"],"edit":p["edit"]})): raise ValueError("invalid provenance fact")
+    return {"v":1,"kind":kind,"id":record["entity"],"state":"active","data":{k:(v.isoformat(timespec="microseconds") if isinstance(v,datetime) else v) for k in PROVENANCE_FIELDS_V1[kind] for v in [record["observed_at"] if k=="observed_at" else p[k]]}}
 def _priv(cls, value): return cls.from_private_bytes(unb64(value))
 def _pub(cls, value): return cls.from_public_bytes(unb64(value))
 def _raw(k): return b64(k.private_bytes_raw() if hasattr(k, "private_bytes_raw") else k.public_bytes_raw())
@@ -52,7 +57,7 @@ def verify_row_proof(value,row,cert,root_public):
     try:
         signed={k:v for k,v in value.items() if k!="signature"}; device=verify_certificate(cert,root_public)["device"]; previous=value["previous_revision"]
         claim={k:value[k] for k in ("row_kind","row_id","encoding_v","content_hash","previous_revision","state")}
-        if set(row)!={"v","kind","id","state","data"} or row["kind"] not in ROW_FIELDS_V1 or not isinstance(row["id"],str) or not row["id"] or row["v"]!=1 or row["state"] not in ("active","deleted") or row["data"] is not None and (row["state"]!="active" or set(row["data"])!=set(ROW_FIELDS_V1[row["kind"]])) or row["state"]=="deleted" and row["data"] is not None: raise ValueError
+        if set(row)!={"v","kind","id","state","data"} or row["kind"] not in SEMANTIC_FIELDS_V1 or not isinstance(row["id"],str) or not row["id"] or row["v"]!=1 or row["state"] not in ("active","deleted") or row["kind"] in PROVENANCE_FIELDS_V1 and row["state"]!="active" or row["data"] is not None and (row["state"]!="active" or set(row["data"])!=set(SEMANTIC_FIELDS_V1[row["kind"]])) or row["state"]=="deleted" and row["data"] is not None: raise ValueError
         if set(value)!=ROW_PROOF_FIELDS or value["v"]!=1 or value["kind"]!="row.proof" or any(not isinstance(value[k],str) or not value[k] for k in ("workspace","authorization_workspace")) or (value["row_kind"],value["row_id"],value["encoding_v"],value["content_hash"],value["state"])!=(row["kind"],row["id"],row["v"],digest(row),row["state"]) or value["revision"]!=digest({"v":1,**claim}) or previous is not None and (not isinstance(previous,str) or len(previous)!=64 or any(c not in "0123456789abcdef" for c in previous) or previous==value["revision"]) or not isinstance(value["authorization_epoch"],int) or isinstance(value["authorization_epoch"],bool) or value["authorization_epoch"]<1 or (cert["user"],device["id"],public_id(root_public),public_id(device["sign_public"]))!=(value["author_user_id"],value["author_device_id"],value["author_user_id"],value["author_device_id"]): raise ValueError
         _pub(Ed25519PublicKey,device["sign_public"]).verify(unb64(value["signature"]),canon(signed)); return value
     except (InvalidSignature,KeyError,TypeError,ValueError) as e: raise ValueError("invalid row proof") from e

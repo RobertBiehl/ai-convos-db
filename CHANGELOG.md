@@ -15,6 +15,9 @@
   DuckDB or settled `state.db`.
 - Checkpoint and validate a private one-time backup before automatically
   migrating an existing core DuckDB.
+- Make provenance canonical core facts with logical-row proofs, so Remote is a
+  read-only consumer and another authorized holder can repair the facts with
+  their original authorship after relay loss.
 - Simplify team history to future-only or complete-history access, remove
   per-row grants and carrier events, and define the first client/server
   protocol, signed workspace state, rebuildable state schema, optional-app

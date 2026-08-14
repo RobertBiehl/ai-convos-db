@@ -133,6 +133,7 @@ product is strictly read-only.
 | `file_edit_files` | Edit-to-file edges plus hashes of captured old/new edit material and evidence quality |
 | `git_checkpoints` | Git head plus capture-time working-tree hash, changed paths, and capture source |
 | `checkpoint_edits` | Checkpoint-to-`file_edits.id` evidence |
+| `local_facts` | Content-free marker that this archive independently observed a fact and may sign it locally |
 
 There are intentionally no copied prompts, message bodies, changesets,
 file-edit bodies, raw remote payloads, workspace IDs, or device IDs in this
@@ -148,6 +149,7 @@ does not change semantic row identity after device recovery.
 | Relation | Durable facts |
 |----------|---------------|
 | `row_origins` | Current physical-to-source row attribution and optional proof link |
+| `provenance_origins` | Imported provenance fact attribution and original proof link |
 | `row_proofs` | Bodyless signed revision, content hash, predecessor, state, author, and authorization epoch |
 | `row_signers` | One normalized root key and device certificate per author device |
 | `workspace_controls` | Signed origin-workspace authorization chain, once per control revision |

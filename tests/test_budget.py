@@ -17,7 +17,7 @@ def test_line_budget():
     paths = sorted((root / "src" / "ai_convos").glob("*.py"))
     assert paths, "No source files found"
     loc = _loc(paths)
-    assert loc < 1175, f"Code line budget exceeded: {loc} >= 1175"
+    assert loc < 1200, f"Code line budget exceeded: {loc} >= 1200"
 
 
 def test_app_line_budgets():

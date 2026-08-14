@@ -260,14 +260,16 @@ Outgoing plaintext is never written to `state.db`. Epoch rotation reopens a
 pending envelope in memory and reseals it.
 
 Incoming plaintext exists in memory only until DuckDB projection commits.
-Canonical rows use the same lifecycle with a repairable replica envelope keyed
-by an epoch-keyed opaque proof identity and uploader. After state loss, a peer
+Canonical archive rows and provenance facts use the same lifecycle with a
+repairable replica envelope keyed by an epoch-keyed opaque proof identity and uploader. After state loss, a peer
 advertises these identities in flat pages; the relay returns those already
 present, and only missing bodies are encrypted and uploaded. The SQLite outbox
 retains only its encrypted-file path, size, and tuple; acknowledgement leaves
-only a cursor. An imported row is reconstructed from its canonical DuckDB row
-and retained origin proof, so any authorized holder can repair it without the
-author's key.
+only a cursor. An imported row or provenance fact is reconstructed from its
+canonical DuckDB projection and retained origin proof, so any authorized holder
+can repair it without the author's key. Remote scanning never observes Git or
+writes provenance; core ingestion and hooks capture those facts before Remote
+reads them.
 For a re-founded workspace, the old signed control chain is encrypted once as
 an origin bundle and shared by all of its row replicas; it is not duplicated
 inside each proof or body. The bundle and those initial replicas remain at the
