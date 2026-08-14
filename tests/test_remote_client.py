@@ -9,7 +9,7 @@ from ai_convos.cli import capture_provenance, init_schema
 from ai_convos_remote import (_upload_batches, add_member, approve_device, approve_history, connect, control_body, create, fetch_lazy, grant_all, grant_selected, key, load, pull, publish, refresh, remove_device,
                               request_device, request_history, setup_client, sync_once, upload, workspace)
 from ai_convos_remote.control import sign as control_sign, vote as device_vote
-from ai_convos_remote.projection import rebuild, scan
+from ai_convos_remote.projection import scan
 from ai_convos_remote.protocol import certificate, event, identity, seal_history, seal_key, sign_control, unb64
 from ai_convos_remote_server import action, connect as server_connect
 
@@ -24,8 +24,16 @@ def conversation(title="shared",id="c"):
     return {"kind":"conversation.record","entity":f"conversations:{id}","payload":{"table":"conversations","columns":cols,"row":[id,"codex",title,"2026-01-01","2026-01-01",None,None,None,None,"{}"]}}
 
 def test_upload_batches_bound_count_and_wire_size():
-    row=lambda size:(None,None,None,"x"*size)
+    row=lambda size:{"size":size}
     assert [len(x) for x in _upload_batches([row(1)]*501,1000)]==[500,1] and [len(x) for x in _upload_batches([row(6)]*2,10)]==[1,1]
+
+
+def test_settled_state_is_payload_size_independent_and_contains_no_bodies(tmp_path,monkeypatch):
+    def settled(root,size):
+        server=server_connect(tmp_path/f"{root.name}.server.db"); monkeypatch.setattr("ai_convos_remote.request",transport(server)); cfg,_=setup_client("http://server","alice",root=root); ws=workspace(cfg,"Personal"); state=connect(root/"remote/state.db"); marker=f"settled-{size}-marker-"+"x"*size; eid=publish(cfg,state,ws,conversation(marker),root); pending=next((root/"remote/outbox").iterdir()); assert marker.encode() not in pending.read_bytes() and state.execute("SELECT COUNT(*) FROM outbox WHERE event=?",(eid,)).fetchone()[0]==1; upload(cfg,state,root); state.execute("PRAGMA wal_checkpoint(TRUNCATE)"); pages=state.execute("PRAGMA page_count").fetchone()[0]; columns={r[1] for table, in state.execute("SELECT name FROM sqlite_master WHERE type='table'") for r in state.execute(f"PRAGMA table_info({table})")}; counts=tuple(state.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] for table in ("receipts","published","event_sequences")); state.close(); files=[root/"remote/state.db",root/"remote/state.db-wal"]
+        assert not list((root/"remote/outbox").iterdir()) and all(marker.encode() not in path.read_bytes() for path in files if path.exists()) and not {"event_json","envelope","content","data"}&columns
+        return (root/"remote/state.db").stat().st_size,pages,counts
+    assert settled(tmp_path/"one",1024)==settled(tmp_path/"two",1024*1024)
 
 
 def test_remote_scan_is_read_only_and_does_not_self_trigger(tmp_path,monkeypatch):
@@ -51,21 +59,21 @@ def test_personal_sync_automatically_bridges_encrypted_memory_between_devices(tm
     sync_once(b,True); db=sqlite3.connect(b/"memory/state.db"); assert db.execute("SELECT content FROM canonicals").fetchall()==[("relay cannot read this",)]; db.close()
     large="second device-safe revision\n"+"x"*70000; memory_module.remember_data(large,"global",created["id"]); sync_once(a,True); sync_once(b,True); count=server.execute("SELECT COUNT(*) FROM events").fetchone()[0]; sync_once(a,True); sync_once(b,True)
     db=sqlite3.connect(b/"memory/state.db"); assert db.execute("SELECT content FROM canonicals").fetchall()==[(large,)] and db.execute("SELECT COUNT(*) FROM remote_parts").fetchone()[0]==0; db.close(); state=connect(b/"remote/state.db"); assert state.execute("SELECT COUNT(*) FROM lazy_events").fetchone()[0]==0; state.close(); assert server.execute("SELECT COUNT(*) FROM events").fetchone()[0]==count and "second device-safe revision" not in "".join(r[0] for r in server.execute("SELECT envelope FROM events").fetchall())
-    state=connect(a/"remote/state.db"); old=[r[0] for r in state.execute("SELECT event FROM event_log WHERE json_extract(event_json,'$.kind')='memory.canonical' AND json_extract(event_json,'$.payload.status')='active'").fetchall()]; state.close(); memory_module.forget_data(created["id"],"global"); sync_once(a,True); assert server.execute(f"SELECT COUNT(*) FROM events WHERE event IN ({','.join('?'*len(old))})",old).fetchone()[0]==0 and server.execute(f"SELECT COUNT(*) FROM event_tombstones WHERE event IN ({','.join('?'*len(old))})",old).fetchone()[0]==len(old)
-    sync_once(b,True); db=sqlite3.connect(b/"memory/state.db"); assert db.execute("SELECT COUNT(*) FROM canonicals").fetchone()[0]==db.execute("SELECT COUNT(*) FROM sources").fetchone()[0]==0; db.close(); state=connect(b/"remote/state.db"); rows=state.execute("SELECT event_json FROM event_log WHERE json_extract(event_json,'$.kind')='memory.canonical'").fetchall(); state.close(); assert len(rows)==1 and "second device-safe revision" not in rows[0][0]
+    state=connect(a/"remote/state.db"); old=[r[0] for r in state.execute("SELECT event FROM receipts WHERE kind='memory.canonical' AND status='active'").fetchall()]; state.close(); memory_module.forget_data(created["id"],"global"); sync_once(a,True); assert server.execute(f"SELECT COUNT(*) FROM events WHERE event IN ({','.join('?'*len(old))})",old).fetchone()[0]==0 and server.execute(f"SELECT COUNT(*) FROM event_tombstones WHERE event IN ({','.join('?'*len(old))})",old).fetchone()[0]==len(old)
+    sync_once(b,True); db=sqlite3.connect(b/"memory/state.db"); assert db.execute("SELECT COUNT(*) FROM canonicals").fetchone()[0]==db.execute("SELECT COUNT(*) FROM sources").fetchone()[0]==0; db.close(); state=connect(b/"remote/state.db"); rows=[tuple(r) for r in state.execute("SELECT status FROM receipts WHERE kind='memory.canonical'").fetchall()]; state.close(); assert rows==[("deleted",)] and b"second device-safe revision" not in (b/"remote/state.db").read_bytes()
     recreated=memory_module.remember_data(large,"global"); assert recreated["id"]!=created["id"]; sync_once(a,True); sync_once(b,True); db=sqlite3.connect(b/"memory/state.db"); assert db.execute("SELECT content FROM canonicals").fetchall()==[(large,)]; db.close()
 
 
 def test_lost_purge_response_retries_without_resurrecting_forgotten_memory(tmp_path,monkeypatch):
-    server=server_connect(tmp_path/"server.db"); direct=transport(server); monkeypatch.setattr("ai_convos_remote.request",direct); monkeypatch.setattr("ai_convos_remote.drain_hooks",lambda:None); a=tmp_path/"a"; setup_client("http://server","alice",root=a); monkeypatch.delenv("CONVOS_MEMORY_DB",raising=False); monkeypatch.setenv("CONVOS_PROJECT_ROOT",str(a)); created=memory_module.remember_data("purge retry secret","global"); sync_once(a,True); state=connect(a/"remote/state.db"); old=[r[0] for r in state.execute("SELECT event FROM event_log WHERE json_extract(event_json,'$.kind')='memory.canonical'").fetchall()]; state.close(); memory_module.forget_data(created["id"],"global"); lost=[False]
+    server=server_connect(tmp_path/"server.db"); direct=transport(server); monkeypatch.setattr("ai_convos_remote.request",direct); monkeypatch.setattr("ai_convos_remote.drain_hooks",lambda:None); a=tmp_path/"a"; setup_client("http://server","alice",root=a); monkeypatch.delenv("CONVOS_MEMORY_DB",raising=False); monkeypatch.setenv("CONVOS_PROJECT_ROOT",str(a)); created=memory_module.remember_data("purge retry secret","global"); sync_once(a,True); state=connect(a/"remote/state.db"); old=[r[0] for r in state.execute("SELECT event FROM receipts WHERE kind='memory.canonical'").fetchall()]; state.close(); memory_module.forget_data(created["id"],"global"); lost=[False]
     def request_lost(cfg,body,auth=True):
         result=direct(cfg,body,auth)
         if body["op"]=="purge" and not lost[0]: lost[0]=True; raise ConnectionError("purge response lost")
         return result
     monkeypatch.setattr("ai_convos_remote.request",request_lost)
     with pytest.raises(ConnectionError,match="response lost"): sync_once(a,True)
-    state=connect(a/"remote/state.db"); assert state.execute(f"SELECT COUNT(*) FROM event_log WHERE event IN ({','.join('?'*len(old))})",old).fetchone()[0]==len(old); state.close(); assert server.execute(f"SELECT COUNT(*) FROM event_tombstones WHERE event IN ({','.join('?'*len(old))})",old).fetchone()[0]==len(old)
-    monkeypatch.setattr("ai_convos_remote.request",direct); sync_once(a,True); state=connect(a/"remote/state.db"); assert state.execute(f"SELECT COUNT(*) FROM event_log WHERE event IN ({','.join('?'*len(old))})",old).fetchone()[0]==0; state.close()
+    state=connect(a/"remote/state.db"); assert state.execute(f"SELECT COUNT(*) FROM receipts WHERE event IN ({','.join('?'*len(old))})",old).fetchone()[0]==len(old); state.close(); assert server.execute(f"SELECT COUNT(*) FROM event_tombstones WHERE event IN ({','.join('?'*len(old))})",old).fetchone()[0]==len(old)
+    monkeypatch.setattr("ai_convos_remote.request",direct); sync_once(a,True); state=connect(a/"remote/state.db"); assert state.execute(f"SELECT COUNT(*) FROM receipts WHERE event IN ({','.join('?'*len(old))})",old).fetchone()[0]==0; state.close()
 
 
 def test_device_certificates_reject_relay_key_substitution_without_auto_certifying(tmp_path,monkeypatch):
@@ -119,13 +127,13 @@ def test_refresh_rejects_relay_key_beyond_signed_history(tmp_path,monkeypatch):
 
 
 def test_relay_workspace_omission_stops_stale_upload(tmp_path,monkeypatch):
-    server=server_connect(tmp_path/"server.db"); direct=transport(server); monkeypatch.setattr("ai_convos_remote.request",direct); a=tmp_path/"a"; alice,_=setup_client("http://server","alice",root=a); team=create(alice,"Team","team",a); state=connect(a/"remote/state.db"); baseline=server.execute("SELECT COUNT(*) FROM events WHERE workspace=?",(team,)).fetchone()[0]; publish(alice,state,team,conversation("must stay local"),a)
+    server=server_connect(tmp_path/"server.db"); direct=transport(server); monkeypatch.setattr("ai_convos_remote.request",direct); a=tmp_path/"a"; alice,_=setup_client("http://server","alice",root=a); team=create(alice,"Team","team",a); state=connect(a/"remote/state.db"); baseline=server.execute("SELECT COUNT(*) FROM events WHERE workspace=?",(team,)).fetchone()[0]; pending=publish(alice,state,team,conversation("must stay local"),a)
     def omit(cfg,body,auth=True):
         result=copy.deepcopy(direct(cfg,body,auth))
         if body["op"]=="state": result["workspaces"]=[w for w in result["workspaces"] if w["id"]!=team]
         return result
     monkeypatch.setattr("ai_convos_remote.request",omit); upload(alice,state,a)
-    assert team in load(a)["workspaces"] and server.execute("SELECT COUNT(*) FROM events WHERE workspace=?",(team,)).fetchone()[0]==baseline and state.execute("SELECT cursor FROM event_log WHERE event_json LIKE '%must stay local%'").fetchone()[0]==0
+    assert team in load(a)["workspaces"] and server.execute("SELECT COUNT(*) FROM events WHERE workspace=?",(team,)).fetchone()[0]==baseline and state.execute("SELECT COUNT(*) FROM outbox WHERE event=?",(pending,)).fetchone()[0]==1
 
 
 def test_team_default_selected_complete_history_and_removal(tmp_path,monkeypatch):
@@ -140,13 +148,12 @@ def test_team_default_selected_complete_history_and_removal(tmp_path,monkeypatch
     with pytest.raises(ValueError,match="outside"): action(server,sign_control(alice["device"],future),alice["token"])
     assert grant_all(alice,team,"bob",a)>=2; bob=load(b); pull(bob,sb,b); assert any(name.endswith(":1") for name in load(b)["keys"])
     add_member(alice,team,"bob",True,root=a); bob=load(b); pull(bob,sb,b); assert team not in {w["id"] for w in load(b)["server_state"]["workspaces"]} and f"{team}:3" not in load(b)["keys"]
-    rebuild(b/"rebuilt.db",sb,device=bob["device"]); assert {r[0] for r in duckdb.connect(str(b/"rebuilt.db"),read_only=True).execute("SELECT title FROM conversations").fetchall()}=={"before bob","after bob"}
 
 
 def test_unknown_events_survive_client_projection(tmp_path,monkeypatch):
     server=server_connect(tmp_path/"server.db"); monkeypatch.setattr("ai_convos_remote.request",transport(server)); a=tmp_path/"a"; cfg,_=setup_client("http://server","alice",root=a); ws=workspace(cfg,"Personal"); state=connect(a/"remote/state.db")
     eid=publish(cfg,state,ws,{"kind":"future.opaque","entity":"future:1","payload":{"new_field":[1,2,3]}},a); upload(cfg,state,a)
-    assert json.loads(state.execute("SELECT event_json FROM event_log WHERE event=?",(eid,)).fetchone()[0])["payload"]["new_field"]==[1,2,3]
+    assert tuple(state.execute("SELECT kind,entity FROM receipts WHERE event=?",(eid,)).fetchone())==("future.opaque","future:1") and b"new_field" not in (a/"remote/state.db").read_bytes() and action(server,{"op":"fetch","workspace":ws,"event":eid},cfg["token"])["envelope"]["event"]==eid
 
 
 def test_large_record_is_fetched_during_convergent_pull(tmp_path,monkeypatch):
@@ -165,11 +172,11 @@ def test_lazy_fetch_rejects_swapped_envelope(tmp_path,monkeypatch):
 def test_attachment_bytes_are_redacted_lazy_and_reassembled(tmp_path,monkeypatch):
     server=server_connect(tmp_path/"server.db"); monkeypatch.setattr("ai_convos_remote.request",transport(server)); a,b=tmp_path/"a",tmp_path/"b"; alice,recovery=setup_client("http://server","alice",root=a); desktop,_=setup_client("http://server","alice","desktop",recovery,root=b); alice=load(a); ws=workspace(alice,"Personal"); state_a,state_b=connect(a/"remote/state.db"),connect(b/"remote/state.db")
     payload=bytes(range(256))*800; source=tmp_path/"private"/"evidence.bin"; source.parent.mkdir(); source.write_bytes(payload); (a/"data").mkdir(); core=duckdb.connect(str(a/"data/convos.db")); init_schema(core); core.execute("INSERT INTO conversations VALUES ('c','codex','attachment','2026-01-01','2026-01-01',NULL,NULL,NULL,NULL,'{}')"); core.execute("INSERT INTO messages VALUES ('m','c','user','see file',NULL,'2026-01-01',NULL,'{}',NULL,NULL)"); core.execute("INSERT INTO attachments VALUES ('a','m','evidence.bin','application/octet-stream',?,?,NULL,'2026-01-01')",(len(payload),str(source))); records=scan(core,state_a); core.close()
-    assert str(source) not in json.dumps(records) and sum(r["kind"]=="attachment.chunk" for r in records)>1; [publish(alice,state_a,ws,r,a) for r in records]; upload(alice,state_a,a); pull(desktop,state_b,b); path=duckdb.connect(str(b/"data/convos.db"),read_only=True).execute("SELECT path FROM attachments").fetchone()[0]; assert open(path,"rb").read()==payload and os.stat(path).st_mode&0o777==0o600 and state_b.execute("SELECT COUNT(*) FROM lazy_events").fetchone()[0]==state_b.execute("SELECT COUNT(*) FROM attachment_chunks").fetchone()[0]==0
+    assert str(source) not in json.dumps(records) and sum(r["kind"]=="attachment.chunk" for r in records)>1; [publish(alice,state_a,ws,r,a) for r in records]; upload(alice,state_a,a); pull(desktop,state_b,b); path=duckdb.connect(str(b/"data/convos.db"),read_only=True).execute("SELECT path FROM attachments").fetchone()[0]; assert open(path,"rb").read()==payload and os.stat(path).st_mode&0o777==0o600 and state_b.execute("SELECT COUNT(*) FROM lazy_events").fetchone()[0]==state_b.execute("SELECT COUNT(*) FROM attachment_parts").fetchone()[0]==0
 
 
 def test_deleted_state_rebaselines_before_publishing_existing_archive(tmp_path,monkeypatch):
-    server=server_connect(tmp_path/"server.db"); direct=transport(server); monkeypatch.setattr("ai_convos_remote.request",direct); monkeypatch.setattr("ai_convos_remote.drain_hooks",lambda:None); a,b=tmp_path/"a",tmp_path/"b"; alice,recovery=setup_client("http://server","alice","laptop",root=a); setup_client("http://server","alice","desktop",recovery,root=b); alice=load(a); ws=workspace(alice,"Personal"); sa=connect(a/"remote/state.db"); publish(alice,sa,ws,conversation("remote","remote"),a); upload(alice,sa,a); sa.close(); sync_once(b,True); state=connect(b/"remote/state.db"); imported=state.execute("SELECT table_name,row_id,event FROM imported_rows").fetchall(); state.close(); assert imported
+    server=server_connect(tmp_path/"server.db"); direct=transport(server); monkeypatch.setattr("ai_convos_remote.request",direct); monkeypatch.setattr("ai_convos_remote.drain_hooks",lambda:None); a,b=tmp_path/"a",tmp_path/"b"; alice,recovery=setup_client("http://server","alice","laptop",root=a); setup_client("http://server","alice","desktop",recovery,root=b); alice=load(a); ws=workspace(alice,"Personal"); sa=connect(a/"remote/state.db"); publish(alice,sa,ws,conversation("remote","remote"),a); upload(alice,sa,a); sa.close(); sync_once(b,True); core=duckdb.connect(str(b/"data/convos.db"),read_only=True); imported=core.execute("SELECT table_name,physical_row_id,source_event_id FROM remote.row_origins").fetchall(); core.close(); assert imported
     before=server.execute("SELECT COUNT(*) FROM events").fetchone()[0]; (b/"remote/state.db").unlink(); db=duckdb.connect(str(b/"data/convos.db")); db.execute("INSERT INTO conversations VALUES ('local','codex','new local','2026-01-02','2026-01-02',NULL,NULL,NULL,NULL,'{}')"); db.close()
     def offline(cfg,body,auth=True):
         if body["op"]=="pull": raise ConnectionError("relay unavailable")
@@ -178,7 +185,7 @@ def test_deleted_state_rebaselines_before_publishing_existing_archive(tmp_path,m
     with pytest.raises(ConnectionError,match="unavailable"): sync_once(b,True)
     assert server.execute("SELECT COUNT(*) FROM events").fetchone()[0]==before
     monkeypatch.setattr("ai_convos_remote.request",direct); sync_once(b,True); assert server.execute("SELECT COUNT(*) FROM events").fetchone()[0]==before+1
-    state=connect(b/"remote/state.db"); assert state.execute("SELECT lifecycle FROM sync_states WHERE workspace=?",(ws,)).fetchone()[0]=="ready" and state.execute("SELECT table_name,row_id,event FROM imported_rows").fetchall()==imported; state.close()
+    state=connect(b/"remote/state.db"); assert state.execute("SELECT lifecycle FROM sync_states WHERE workspace=?",(ws,)).fetchone()[0]=="ready" and not state.execute("SELECT 1 FROM sqlite_master WHERE name='imported_rows'").fetchone(); state.close(); core=duckdb.connect(str(b/"data/convos.db"),read_only=True); assert core.execute("SELECT table_name,physical_row_id,source_event_id FROM remote.row_origins").fetchall()==imported; core.close()
 
 
 def test_pull_converges_past_relay_batch_limit(tmp_path,monkeypatch):
@@ -189,12 +196,12 @@ def test_pull_converges_past_relay_batch_limit(tmp_path,monkeypatch):
 
 
 def test_crash_after_duckdb_projection_replays_before_cursor_commit(tmp_path,monkeypatch):
-    server=server_connect(tmp_path/"server.db"); direct=transport(server); monkeypatch.setattr("ai_convos_remote.request",direct); a,b=tmp_path/"a",tmp_path/"b"; alice,recovery=setup_client("http://server","alice","laptop",root=a); desktop,_=setup_client("http://server","alice","desktop",recovery,root=b); alice=load(a); ws=workspace(alice,"Personal"); state=connect(a/"remote/state.db"); publish(alice,state,ws,conversation("projected once","once"),a); upload(alice,state,a); target=connect(b/"remote/state.db"); real=remote_client.project_many; tables=("event_log","event_sequences","heads","imported_rows","cursors"); baseline=[target.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] for table in tables]
+    server=server_connect(tmp_path/"server.db"); direct=transport(server); monkeypatch.setattr("ai_convos_remote.request",direct); a,b=tmp_path/"a",tmp_path/"b"; alice,recovery=setup_client("http://server","alice","laptop",root=a); desktop,_=setup_client("http://server","alice","desktop",recovery,root=b); alice=load(a); ws=workspace(alice,"Personal"); state=connect(a/"remote/state.db"); publish(alice,state,ws,conversation("projected once","once"),a); upload(alice,state,a); target=connect(b/"remote/state.db"); real=remote_client.project_many; tables=("receipts","event_sequences","heads","cursors"); baseline=[target.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] for table in tables]
     def crash(*args,**kwargs): result=real(*args,**kwargs); raise ConnectionError("after DuckDB commit")
     monkeypatch.setattr(remote_client,"project_many",crash)
     with pytest.raises(ConnectionError,match="DuckDB"): pull(desktop,target,b)
     assert [target.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] for table in tables]==baseline
-    db=duckdb.connect(str(b/"data/convos.db"),read_only=True); assert db.execute("SELECT COUNT(*) FROM conversations").fetchone()[0]==1; db.close()
+    db=duckdb.connect(str(b/"data/convos.db"),read_only=True); assert db.execute("SELECT COUNT(*) FROM conversations").fetchone()[0]==db.execute("SELECT COUNT(*) FROM remote.row_origins").fetchone()[0]==1; db.close()
     monkeypatch.setattr(remote_client,"project_many",real); result=pull(desktop,target,b); assert result[ws]["cursor"]==result[ws]["tail"] and duckdb.connect(str(b/"data/convos.db"),read_only=True).execute("SELECT COUNT(*) FROM conversations").fetchone()[0]==1
 
 
@@ -263,17 +270,18 @@ def test_republished_history_verifies_embedded_author(tmp_path,monkeypatch):
     entity="history:forged"; publish(alice,state,team,{"kind":"history.republish","entity":entity,"payload":{"target":bob["user"],"sealed":seal_history(inner,[bob["device"]],entity)}},a); upload(alice,state,a)
     target=connect(b/"remote/state.db")
     with pytest.raises(InvalidSignature): pull(load(b),target,b)
-    assert not target.execute("SELECT 1 FROM event_log WHERE json_extract(event_json,'$.kind')='history.republish'").fetchone() and not (b/"data/convos.db").exists()
+    assert not target.execute("SELECT 1 FROM receipts WHERE kind='history.republish'").fetchone() and not (b/"data/convos.db").exists()
 
 
 def test_selected_history_cannot_cross_workspaces(tmp_path,monkeypatch):
     server=server_connect(tmp_path/"server.db"); monkeypatch.setattr("ai_convos_remote.request",transport(server)); a,b=tmp_path/"a",tmp_path/"b"; alice,_=setup_client("http://server","alice",root=a); setup_client("http://server","bob",root=b); first,second=create(alice,"First","team",a),create(alice,"Second","team",a); add_member(alice,first,"bob",root=a); add_member(alice,second,"bob",root=a); state=connect(a/"remote/state.db"); eid=publish(alice,state,first,conversation("first-only"),a); upload(alice,state,a); before=server.execute("SELECT COUNT(*) FROM events WHERE workspace=?",(second,)).fetchone()[0]
-    assert grant_selected(alice,state,second,"bob",[eid],a)==0 and server.execute("SELECT COUNT(*) FROM events WHERE workspace=?",(second,)).fetchone()[0]==before
+    with pytest.raises(ValueError,match="receipt"): grant_selected(alice,state,second,"bob",[eid],a)
+    assert server.execute("SELECT COUNT(*) FROM events WHERE workspace=?",(second,)).fetchone()[0]==before
 
 
 def test_selected_history_is_encrypted_to_target_devices(tmp_path,monkeypatch):
     server=server_connect(tmp_path/"server.db"); monkeypatch.setattr("ai_convos_remote.request",transport(server)); a,b,c=tmp_path/"a",tmp_path/"b",tmp_path/"c"; alice,_=setup_client("http://server","alice",root=a); setup_client("http://server","bob",root=b); setup_client("http://server","carol",root=c); team=create(alice,"Team","team",a); state=connect(a/"remote/state.db"); old=publish(alice,state,team,conversation("old-secret"),a); upload(alice,state,a); add_member(alice,team,"bob",root=a); add_member(alice,team,"carol",root=a); grant_selected(alice,state,team,"bob",[old],a); sb,sc=connect(b/"remote/state.db"),connect(c/"remote/state.db"); pull(load(b),sb,b); pull(load(c),sc,c)
-    assert duckdb.connect(str(b/"data/convos.db"),read_only=True).execute("SELECT title FROM conversations").fetchone()[0]=="old-secret" and not (c/"data/convos.db").exists(); assert "old-secret" not in "".join(r[0] for r in sc.execute("SELECT event_json FROM event_log").fetchall())
+    assert duckdb.connect(str(b/"data/convos.db"),read_only=True).execute("SELECT title FROM conversations").fetchone()[0]=="old-secret" and not (c/"data/convos.db").exists(); assert b"old-secret" not in (c/"remote/state.db").read_bytes()
 
 
 def test_lost_upload_response_and_interrupted_pull_recover_idempotently(tmp_path,monkeypatch):
@@ -284,8 +292,8 @@ def test_lost_upload_response_and_interrupted_pull_recover_idempotently(tmp_path
         return result
     monkeypatch.setattr("ai_convos_remote.request",lost)
     with pytest.raises(ConnectionError): upload(alice,state_a,a)
-    assert state_a.execute("SELECT COUNT(*) FROM event_log WHERE direction='out' AND cursor=0").fetchone()[0]==1 and server.execute("SELECT COUNT(*) FROM events").fetchone()[0]==baseline+1
-    monkeypatch.setattr("ai_convos_remote.request",direct); upload(alice,state_a,a); assert state_a.execute("SELECT COUNT(*) FROM event_log WHERE direction='out' AND cursor=0").fetchone()[0]==0 and state_a.execute("SELECT COUNT(*) FROM event_log WHERE direction='out' AND envelope IS NOT NULL").fetchone()[0]==0
+    assert state_a.execute("SELECT COUNT(*) FROM outbox").fetchone()[0]==1 and server.execute("SELECT COUNT(*) FROM events").fetchone()[0]==baseline+1
+    monkeypatch.setattr("ai_convos_remote.request",direct); upload(alice,state_a,a); assert state_a.execute("SELECT COUNT(*) FROM outbox").fetchone()[0]==0 and state_a.execute("SELECT COUNT(*) FROM receipts").fetchone()[0]>0
     def cut(cfg,body,auth=True):
         result=direct(cfg,body,auth)
         if body["op"]=="pull": raise ConnectionError("pull interrupted")
@@ -294,3 +302,15 @@ def test_lost_upload_response_and_interrupted_pull_recover_idempotently(tmp_path
     with pytest.raises(ConnectionError): pull(desktop,state_b,b)
     assert not state_b.execute("SELECT * FROM cursors").fetchall()
     monkeypatch.setattr("ai_convos_remote.request",direct); pull(desktop,state_b,b); assert duckdb.connect(str(b/"data/convos.db"),read_only=True).execute("SELECT title FROM conversations").fetchone()[0]=="crash safe"
+
+
+def test_lost_upload_response_survives_epoch_rotation_without_resealing(tmp_path,monkeypatch):
+    server=server_connect(tmp_path/"server.db"); direct=transport(server); monkeypatch.setattr("ai_convos_remote.request",direct); a,b=tmp_path/"a",tmp_path/"b"; alice,recovery=setup_client("http://server","alice","laptop",root=a); ws=workspace(alice,"Personal"); state=connect(a/"remote/state.db"); eid=publish(alice,state,ws,conversation("rotate after lost response"),a); original=json.loads(next((a/"remote/outbox").iterdir()).read_text()); lost=[False]
+    def drop(cfg,body,auth=True):
+        result=direct(cfg,body,auth)
+        if body["op"]=="upload_many" and not lost[0]: lost[0]=True; raise ConnectionError("response lost")
+        return result
+    monkeypatch.setattr("ai_convos_remote.request",drop)
+    with pytest.raises(ConnectionError,match="response lost"): upload(alice,state,a)
+    monkeypatch.setattr("ai_convos_remote.request",direct); setup_client("http://server","alice","desktop",recovery,root=b); alice=load(a); upload(alice,state,a); stored=json.loads(server.execute("SELECT envelope FROM events WHERE event=?",(eid,)).fetchone()[0])
+    assert stored==original and state.execute("SELECT epoch FROM receipts WHERE event=?",(eid,)).fetchone()[0]==1 and not state.execute("SELECT 1 FROM outbox WHERE event=?",(eid,)).fetchone()

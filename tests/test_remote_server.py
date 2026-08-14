@@ -20,9 +20,9 @@ def history_ws(a,previous,user):
     members={**previous["members"],user:{**previous["members"][user],"history_from":1}}; return sign(a["device"],{**{k:v for k,v in previous.items() if k not in ("signature","author")},"revision":previous["revision"]+1,"prev":state_hash(previous),"members":members,"action":"history","approval":None,"approved_at":0})
 
 
-def test_relay_v1_database_is_rejected_instead_of_mutated(tmp_path):
+def test_incompatible_relay_database_is_rejected_instead_of_mutated(tmp_path):
     path=tmp_path/"server.db"; db=sqlite3.connect(path); db.execute("CREATE TABLE events(cursor INTEGER PRIMARY KEY)"); db.close()
-    with pytest.raises(ValueError,match="predates protocol v2"): connect(path)
+    with pytest.raises(ValueError,match="incompatible"): connect(path)
 
 
 def test_personal_workspace_idempotency_and_ciphertext_only(tmp_path):
@@ -74,11 +74,18 @@ def test_large_events_are_manifested_then_fetched(tmp_path):
 
 def test_personal_event_purge_is_idempotent_author_bound_and_blocks_resurrection(tmp_path):
     db=connect(tmp_path/"server.db"); a=account(db,"alice"); key=bytes([9])*32; personal="personal"; create_ws(db,a,personal,key,"personal"); env=seal_event(event(a["device"],1,"memory.canonical","memory:x",{"opaque":True},[],"2026-01-01T00:00:00Z"),personal,1,key); action(db,{"op":"upload","envelope":env},a["token"])
-    assert action(db,{"op":"purge","workspace":personal,"events":[env["event"]]},a["token"])=={"purged":1} and action(db,{"op":"purge","workspace":personal,"events":[env["event"]]},a["token"])=={"purged":1}; pulled=action(db,{"op":"pull","workspace":personal,"after":0},a["token"]); assert pulled["events"]==[{"cursor":pulled["tail"],"tombstone":True,"event":env["event"],"author":env["author"],"seq":env["seq"]}] and pulled["floor"]==pulled["tail"]
+    assert action(db,{"op":"purge","workspace":personal,"events":[env["event"]]},a["token"])=={"purged":1} and action(db,{"op":"purge","workspace":personal,"events":[env["event"]]},a["token"])=={"purged":1}; pulled=action(db,{"op":"pull","workspace":personal,"after":0},a["token"]); assert pulled["events"]==[{"cursor":pulled["tail"],"tombstone":True,"event":env["event"],"author":env["author"],"seq":env["seq"],"parents":[]}] and pulled["floor"]==pulled["tail"]
     with pytest.raises(ValueError,match="purged"): action(db,{"op":"upload","envelope":env},a["token"])
     with pytest.raises(PermissionError,match="denied"): action(db,{"op":"purge","workspace":personal,"events":["unknown"]},a["token"])
     team="team"; create_ws(db,a,team,key,"team"); team_env=seal_event(event(a["device"],2,"x","x",{},[],"2026-01-02T00:00:00Z"),team,1,key); action(db,{"op":"upload","envelope":team_env},a["token"])
     with pytest.raises(PermissionError,match="denied"): action(db,{"op":"purge","workspace":team,"events":[team_env["event"]]},a["token"])
+
+
+def test_tombstone_retains_parent_chain_and_blocks_sequence_reuse(tmp_path):
+    db=connect(tmp_path/"server.db"); a=account(db,"alice"); ws,key="personal",bytes([6])*32; create_ws(db,a,ws,key,"personal"); first=seal_event(event(a["device"],1,"x","one",{},[],"2026-01-01T00:00:00Z"),ws,1,key); one=action(db,{"op":"upload","envelope":first},a["token"]); second=seal_event(event(a["device"],2,"x","two",{},[first["event"]],"2026-01-01T00:00:01Z"),ws,1,key); action(db,{"op":"upload","envelope":second},a["token"]); action(db,{"op":"purge","workspace":ws,"events":[second["event"]]},a["token"]); pulled=action(db,{"op":"pull","workspace":ws,"after":one["cursor"]},a["token"])
+    assert pulled["events"][0]["parents"]==[first["event"]]
+    replacement=seal_event(event(a["device"],2,"x","fork",{},[first["event"]],"2026-01-01T00:00:02Z"),ws,1,key)
+    with pytest.raises(ValueError,match="sequence was purged"): action(db,{"op":"upload","envelope":replacement},a["token"])
 
 
 def test_restart_preserves_events_tokens_and_idempotency(tmp_path):
