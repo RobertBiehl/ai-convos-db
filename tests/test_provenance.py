@@ -29,6 +29,11 @@ def test_path_independent_repo_cross_repo_changeset_and_canonical_schema(tmp_pat
     columns={r[0] for r in db.execute("SELECT column_name FROM information_schema.columns WHERE table_schema='provenance'").fetchall()}; assert not columns&{"prompt","content","payload","workspace","author"}
 
 
+def test_core_schema_upgrade_adds_canonical_schemas_without_rewriting_archive(tmp_path):
+    db=duckdb.connect(str(tmp_path/"core.db")); init_schema(db); db.execute("INSERT INTO conversations VALUES ('keep','codex','preserved','2026-01-01','2026-01-01',NULL,NULL,NULL,NULL,'{}')"); db.execute("DROP SCHEMA provenance CASCADE"); db.execute("DROP SCHEMA remote CASCADE"); init_schema(db)
+    assert db.execute("SELECT title FROM conversations WHERE id='keep'").fetchone()[0]=="preserved" and db.execute("SELECT COUNT(*) FROM provenance.repositories").fetchone()[0]==db.execute("SELECT COUNT(*) FROM remote.row_origins").fetchone()[0]==0
+
+
 def test_git_checkpoint_exact_commit_link_and_unobserved_gap(tmp_path):
     root=repo(tmp_path/"repo",content="old\n"); (root/"x.py").write_text("new\n"); git(root,"add","x.py"); git(root,"commit","-qm","agent edit"); (root/"manual.py").write_text("outside capture\n")
     db=core(tmp_path/"core.db",root,[(root/"x.py","write","new\n",None)]); capture(db)

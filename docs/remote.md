@@ -323,9 +323,13 @@ Remote client state lives under `<root>/remote/` (by default,
 
 - `config.json`: mode `0600`, device private keys, token, encrypted-workspace
   keyring, and local workspace labels
-- `state.db`: signed event ledger, cursors, outbox, typed graph projection,
-  local checkout mappings, and deferred-event manifests
+- `state.db`: content-free receipts, cursors, heads, exact sequence metadata,
+  sharing policy, and working-file manifests
+- `outbox/`: unacknowledged encrypted envelopes; removed after acknowledgement
+- `backups/state-*/`: exact private state cutover bundles, retained until the
+  user deliberately removes them
 - `worker.log`, `last_error`: operational state
 
-Absolute checkout roots remain only in `state.db`. They are not placed in event
-payloads, server storage, repository fixtures, CI artifacts, or logs.
+Absolute checkout roots remain local in core checkout mappings or remote policy
+metadata. They are not placed in event payloads, server storage, repository
+fixtures, CI artifacts, or logs.
