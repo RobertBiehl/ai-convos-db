@@ -216,10 +216,8 @@ def upload_replicas(cfg,state,root,workspaces):
     for batch in _upload_batches(rows):
         prepared=[]
         for row in batch:
-            path=Path(row["path"]); env=json.loads(path.read_text()); current=cfg["workspaces"][row["workspace"]]["epoch"]
+            path=Path(row["path"]); env=json.loads(path.read_text())
             if (env["workspace"],env["replica"],env["epoch"],env["uploader"])!=(row["workspace"],row["replica"],row["epoch"],row["uploader"]) or path.is_symlink(): raise ValueError("invalid replica outbox")
-            if env["epoch"]!=current:
-                old_path=path; body=open_replica(env,key(cfg,row["workspace"],env["epoch"])); env=seal_replica(body["row"],body["proof"],row["workspace"],current,key(cfg,row["workspace"],current),cfg["device"]["id"]); path,size=encrypted_file(root,"replica-"+digest((row["workspace"],env["replica"],current,row["uploader"])),env); state.execute("DELETE FROM replica_outbox WHERE workspace=? AND replica=? AND epoch=? AND uploader=?",(row["workspace"],row["replica"],row["epoch"],row["uploader"])); state.execute("INSERT OR REPLACE INTO replica_outbox VALUES (?,?,?,?,?,?)",(row["workspace"],env["replica"],current,row["uploader"],str(path),size)); old_path.unlink(missing_ok=True)
             prepared.append((row,env,path))
         result=request(cfg,{"op":"replica_upload_many","envelopes":[p[1] for p in prepared]})["replicas"]
         if len(result)!=len(prepared): raise ValueError("relay replica acknowledgement mismatch")
@@ -327,14 +325,14 @@ def sync_once(root=None,force=False):
         if info["status"] in ("incompatible","invalid"): refresh(cfg,root); info["status"]=="incompatible" and rescue_bindings(cfg,state_path,root); cutover=cutover_state(state_path)
         state=connect(state_path)
         try:
-            drain_hooks(); refresh(cfg,root); ready={r[0] for r in state.execute("SELECT workspace FROM sync_states WHERE lifecycle='ready'").fetchall()}; upload(cfg,state,root,ready); prepare_archive(cfg,state,root); pull(cfg,state,root); reseed_origins(cfg,state,root); ready={r[0] for r in state.execute("SELECT workspace FROM sync_states WHERE lifecycle='ready'").fetchall()}; path=core_path(root); stamp=path.stat().st_mtime_ns if path.exists() else 0; active={w["id"] for w in cfg["server_state"]["workspaces"]}; scans=[(ws,meta) for ws,meta in cfg["workspaces"].items() if ws in ready and ws in active and f"{ws}:{meta['epoch']}" in cfg["keys"] and (force or stamp!=int((state.execute("SELECT value FROM meta WHERE key=?",(f"core_mtime:{ws}",)).fetchone() or ["0"])[0]))] if path.is_file() else []
+            drain_hooks(); refresh(cfg,root); ready={r[0] for r in state.execute("SELECT workspace FROM sync_states WHERE lifecycle='ready'").fetchall()}; upload(cfg,state,root,ready); prepare_archive(cfg,state,root); pull(cfg,state,root); ready={r[0] for r in state.execute("SELECT workspace FROM sync_states WHERE lifecycle='ready'").fetchall()}; path=core_path(root); stamp=path.stat().st_mtime_ns if path.exists() else 0; active={w["id"] for w in cfg["server_state"]["workspaces"]}; scans=[(ws,meta) for ws,meta in cfg["workspaces"].items() if ws in ready and ws in active and f"{ws}:{meta['epoch']}" in cfg["keys"] and (force or stamp!=int((state.execute("SELECT value FROM meta WHERE key=?",(f"core_mtime:{ws}",)).fetchone() or ["0"])[0]))] if path.is_file() else []
             if scans:
                 core=open_db(path,True); batches=[]
                 for ws,meta in scans:
                     pol=state.execute("SELECT kind,value FROM policies WHERE workspace=?",(ws,)).fetchall(); repos=[p[1] for p in pol if p[0]=="repository"]; roots=[cfg.get("bindings",{}).get(f"{ws}:{p[1]}") for p in pol if p[0]=="path" and cfg.get("bindings",{}).get(f"{ws}:{p[1]}")]; records=[safe for r in scan(core,state,meta["kind"],repos,roots) if (safe:=protect_record(r,root,ws) if meta["kind"]=="team" else r) is not None]; batches.append((ws,records))
                 core.close()
                 for ws,records in batches:
-                    origins={r[0] for r in state.execute("SELECT origin FROM origin_bindings WHERE workspace=?",(ws,)).fetchall()}; attest_rows(path,cfg,ws,records,origins); epoch=cfg["workspaces"][ws]["epoch"]; known={r[0] for r in state.execute("SELECT replica FROM replica_receipts WHERE workspace=? AND epoch=? UNION SELECT replica FROM replica_outbox WHERE workspace=? AND epoch=?",(ws,epoch,ws,epoch)).fetchall()}; reconcile_replicas(cfg,state,root,ws,row_replicas(path,cfg,ws,records,key(cfg,ws,epoch),known,origins)); heads={r[0]:r[1] for r in state.execute("SELECT entity,revision FROM publication_heads WHERE workspace=? AND owner=?",(ws,cfg["user"])).fetchall()}; [publish(cfg,state,ws,r,root,True,heads) for r in records if r["kind"] not in TABLES]
+                    bindings={r[0]:r[1] for r in state.execute("SELECT origin,epoch FROM origin_bindings WHERE workspace=?",(ws,)).fetchall()}; origins=set(bindings); attest_rows(path,cfg,ws,records,origins); keys={epoch:key(cfg,ws,epoch) for epoch in range(access_from(cfg,ws),cfg["workspaces"][ws]["epoch"]+1) if f"{ws}:{epoch}" in cfg["keys"]}; known={r[0] for r in state.execute("SELECT replica FROM replica_receipts WHERE workspace=? UNION SELECT replica FROM replica_outbox WHERE workspace=?",(ws,ws)).fetchall()}; reconcile_replicas(cfg,state,root,ws,row_replicas(path,cfg,ws,records,keys,known,origins,bindings)); heads={r[0]:r[1] for r in state.execute("SELECT entity,revision FROM publication_heads WHERE workspace=? AND owner=?",(ws,cfg["user"])).fetchall()}; [publish(cfg,state,ws,r,root,True,heads) for r in records if r["kind"] not in TABLES]
                 final=path.stat().st_mtime_ns; [state.execute("INSERT OR REPLACE INTO meta VALUES (?,?)",(f"core_mtime:{ws}",str(final))) for ws,meta in scans]
             [publish(cfg,state,ws,r,root,True,heads) for ws,meta in cfg["workspaces"].items() if ws in ready and ws in active and meta["kind"]=="personal" and f"{ws}:{meta['epoch']}" in cfg["keys"] for heads in [{r[0]:r[1] for r in state.execute("SELECT entity,revision FROM publication_heads WHERE workspace=? AND owner=?",(ws,cfg["user"])).fetchall()}] for r in bridge_records(root,state,ws,meta["kind"])]; state.commit(); upload(cfg,state,root,ready)
             for ws,meta in cfg["workspaces"].items():
@@ -347,9 +345,6 @@ def bind_origin(cfg,state,ws,origin,root=None):
     db=open_db(core_path(root),True); exists=db.execute("SELECT 1 FROM remote.row_proofs WHERE workspace_id=?",(origin,)).fetchone(); db.close()
     if origin==ws or not exists: raise ValueError("origin has no retained row proofs")
     env=seal_origin(controls,ws,current,key(cfg,ws,current),cfg["device"]["id"]); ack=request(cfg,{"op":"origin_upload","envelope":env}); isinstance(ack.get("cursor"),int) and not isinstance(ack["cursor"],bool) or (_ for _ in ()).throw(ValueError("origin upload acknowledgement mismatch")); state.execute("INSERT OR REPLACE INTO origin_bindings VALUES (?,?,?,?,?)",(ws,origin,env["origin"],current,ack["cursor"])); state.execute("DELETE FROM meta WHERE key=?",(f"core_mtime:{ws}",)); state.commit(); return len(controls)
-def reseed_origins(cfg,state,root=None):
-    for ws,origin,epoch in state.execute("SELECT workspace,origin,epoch FROM origin_bindings").fetchall():
-        if ws in cfg["workspaces"] and epoch!=cfg["workspaces"][ws]["epoch"]: bind_origin(cfg,state,ws,origin,root)
 def add_member(cfg,ws,user,remove=False,root=None):
     refresh(cfg,root); members={u:m["role"] for u,m in cfg["controls"][ws]["members"].items()}; devices=[]
     if remove:

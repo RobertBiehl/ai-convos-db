@@ -198,8 +198,8 @@ def store_event(db,actor,env):
     if (used:=db.execute("SELECT event FROM event_purges WHERE workspace=? AND author=? AND seq=?",(ws,env["author"],env["seq"])).fetchone()) and used[0]!=env["event"]: raise ValueError("event author sequence was purged")
     cursor=db.execute("INSERT INTO ledger_cursors DEFAULT VALUES").lastrowid; db.execute("INSERT INTO events VALUES (?,?,?,?,?,?,?,?,?)",(cursor,ws,env["event"],env["author"],env["epoch"],env["seq"],json.dumps(env),wire,time.time())); return {"cursor":cursor,"created":True}
 def store_replica(db,actor,env):
-    fields={"v","kind","workspace","replica","epoch","uploader","nonce","ciphertext"}; ws=env["workspace"]; device_member(db,ws,actor); current=db.execute("SELECT epoch FROM workspaces WHERE id=?",(ws,)).fetchone()[0]
-    if set(env)!=fields or env["v"]!=1 or env["kind"]!="row.replica" or env["uploader"]!=actor["id"] or env["epoch"]!=current or not isinstance(env["replica"],str) or len(env["replica"])!=64 or any(c not in "0123456789abcdef" for c in env["replica"]): raise PermissionError("row replica envelope rejected")
+    fields={"v","kind","workspace","replica","epoch","uploader","nonce","ciphertext"}; ws=env["workspace"]; member=device_member(db,ws,actor); current=db.execute("SELECT epoch FROM workspaces WHERE id=?",(ws,)).fetchone()[0]
+    if set(env)!=fields or env["v"]!=1 or env["kind"]!="row.replica" or env["uploader"]!=actor["id"] or not member["history_from"]<=env["epoch"]<=current or not db.execute("SELECT 1 FROM key_envelopes WHERE workspace=? AND epoch=? AND device=?",(ws,env["epoch"],actor["id"])).fetchone() or not isinstance(env["replica"],str) or len(env["replica"])!=64 or any(c not in "0123456789abcdef" for c in env["replica"]): raise PermissionError("row replica envelope rejected")
     key=(ws,env["replica"],env["epoch"],actor["id"]); wire=digest(env); old=db.execute("SELECT cursor,wire_hash,LENGTH(envelope) size FROM row_replicas WHERE workspace=? AND replica=? AND epoch=? AND uploader=?",key).fetchone(); now=time.time(); size=len(canon(env)); used=db.execute("SELECT COALESCE(SUM(LENGTH(envelope)),0) FROM row_replicas WHERE workspace=? AND uploader=?",(ws,actor["id"])).fetchone()[0]
     if used-(old["size"] if old else 0)+size>REPLICA_QUOTA: raise ValueError("row replica quota exceeded")
     if old: db.execute("UPDATE row_replicas SET envelope=?,wire_hash=?,updated=? WHERE workspace=? AND replica=? AND epoch=? AND uploader=?",(json.dumps(env),wire,now,*key)); return {"cursor":old["cursor"],"created":False,"replaced":old["wire_hash"]!=wire}
@@ -300,7 +300,7 @@ def action(db, req, token=None):
     if op == "replica_reconcile":
         ws=req["workspace"]; device_member(db,ws,actor); ids=req["replicas"]
         if not isinstance(ids,list) or not 1<=len(ids)<=500 or len(ids)!=len(set(ids)) or any(not isinstance(v,str) or len(v)!=64 for v in ids): raise ValueError("replica inventory is invalid")
-        found=rows(db,f"SELECT replica,MAX(cursor) cursor FROM row_replicas WHERE workspace=? AND epoch=(SELECT epoch FROM workspaces WHERE id=?) AND replica IN ({','.join('?'*len(ids))}) GROUP BY replica",(ws,ws,*ids)); return {"present":{r["replica"]:r["cursor"] for r in found}}
+        found=rows(db,f"SELECT replica,MAX(cursor) cursor FROM row_replicas WHERE workspace=? AND epoch>=? AND EXISTS(SELECT 1 FROM key_envelopes k WHERE k.workspace=row_replicas.workspace AND k.epoch=row_replicas.epoch AND k.device=?) AND replica IN ({','.join('?'*len(ids))}) GROUP BY replica",(ws,member(db,ws,actor["user_id"])["history_from"],actor["id"],*ids)); return {"present":{r["replica"]:r["cursor"] for r in found}}
     if op == "replica_pull":
         ws=req["workspace"]; m=device_member(db,ws,actor); after,limit=req.get("after",0),req.get("limit",500)
         if not isinstance(after,int) or isinstance(after,bool) or after<0 or not isinstance(limit,int) or isinstance(limit,bool) or not 1<=limit<=500: raise ValueError("replica page is invalid")

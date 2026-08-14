@@ -108,6 +108,10 @@ questions do not become invariants by implication.
 > demonstrated product need justifies their linear per-row and per-device
 > cryptographic and operational cost.
 
+> A repair replica remains encrypted under the earliest workspace epoch that
+> authorized its delivery. Rotation never silently moves old rows across a
+> future-only boundary; only an explicit all-history grant exposes old epochs.
+
 > Repository and local-path policies route complete conversations into a
 > workspace. A conversation matching multiple workspaces may be shared in each;
 > work that must remain within one audience uses a separate conversation.
