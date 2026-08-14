@@ -6,7 +6,7 @@ import pytest
 from ai_convos.cli import init_schema
 import ai_convos_remote.projection as projection_module
 from ai_convos_remote import publish
-from ai_convos_remote.projection import bridges, connect, cutover_state, inspect_state, project, project_many, scan, sequence
+from ai_convos_remote.projection import bridges, connect, cutover_state, foreign_id, inspect_state, project, project_many, scan, sequence
 from ai_convos_remote.protocol import b64, digest, event, identity
 
 
@@ -20,7 +20,7 @@ def test_personal_scan_strips_local_roots_and_projects_duckdb(tmp_path):
     repo,core=source(tmp_path); state=connect(tmp_path/"state.db"); records=scan(core,state); raw=json.dumps(records)
     assert str(repo) not in raw and len(records)>3
     remote=identity("remote"); events=[event(remote,i+1,r["kind"],r["entity"],r["payload"],[],f"2026-01-01T00:00:{i:02d}Z") for i,r in enumerate(records)]
-    for value in events: project(tmp_path/"target.db",state,value,"personal","other-device")
+    for value in events: project(tmp_path/"target.db",state,value,"personal","other-device",authors={remote["id"]:"remote-user"})
     target=duckdb.connect(str(tmp_path/"target.db"),read_only=True); assert target.execute("SELECT title,cwd FROM conversations").fetchone()==("title",None); assert target.execute("SELECT content FROM messages WHERE role='user'").fetchone()[0]=="change it"; assert target.execute("SELECT file_path FROM file_edits").fetchone()[0]=="a.py"; before=target.execute("SELECT COUNT(*) FROM provenance.file_edit_files").fetchone()[0]; assert target.execute("SELECT x.file_edit_id=fe.id FROM provenance.file_edit_files x JOIN file_edits fe ON fe.id=x.file_edit_id").fetchone()[0]; assert target.execute("SELECT COUNT(*) FROM remote.row_origins").fetchone()[0]==sum(e["kind"] in projection_module.TABLES for e in events); target.close()
     fresh=connect(tmp_path/"fresh-state.db"); imported=duckdb.connect(str(tmp_path/"target.db"),read_only=True); assert scan(imported,fresh)==[]; imported.close(); fresh.close()
     old={"raw_events","repositories","files","file_versions","changesets","edits","changeset_repositories","checkpoints","checkpoint_changesets","assertions","gaps","boundaries"}; assert not old&{r[0] for r in state.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
@@ -28,12 +28,12 @@ def test_personal_scan_strips_local_roots_and_projects_duckdb(tmp_path):
 
 
 def test_old_state_inspection_is_read_only_and_cutover_preserves_exact_backup(tmp_path):
-    path=tmp_path/"state.db"; db=__import__("sqlite3").connect(path); db.execute("CREATE TABLE meta(key TEXT PRIMARY KEY,value TEXT)"); db.execute("CREATE TABLE legacy_payload(value TEXT)"); db.execute("INSERT INTO meta VALUES ('state_schema','2')"); db.execute("INSERT INTO legacy_payload VALUES ('only in old state')"); db.commit(); db.close(); before=(path.read_bytes(),path.stat().st_mtime_ns,{p.name for p in tmp_path.iterdir()})
+    path=tmp_path/"state.db"; db=__import__("sqlite3").connect(path); db.execute("CREATE TABLE meta(key TEXT PRIMARY KEY,value TEXT)"); db.execute("CREATE TABLE legacy_payload(value TEXT)"); db.execute("INSERT INTO meta VALUES ('state_schema','3')"); db.execute("INSERT INTO legacy_payload VALUES ('only in old state')"); db.commit(); db.close(); before=(path.read_bytes(),path.stat().st_mtime_ns,{p.name for p in tmp_path.iterdir()})
     assert inspect_state(path)["status"]=="incompatible"
     with pytest.raises(ValueError,match="rebuild required"): connect(path)
     assert (path.read_bytes(),path.stat().st_mtime_ns,{p.name for p in tmp_path.iterdir()})==before
     report=cutover_state(path); backup=Path(report["backup"]); old=__import__("sqlite3").connect(backup/"state.db"); assert old.execute("SELECT value FROM legacy_payload").fetchone()[0]=="only in old state"; old.close()
-    state=connect(path); assert state.execute("SELECT value FROM meta WHERE key='state_schema'").fetchone()[0]=="3" and json.loads(state.execute("SELECT value FROM meta WHERE key='state_cutover'").fetchone()[0])["backup"]==str(backup); state.close(); assert inspect_state(path)["status"]=="current" and os.stat(backup).st_mode&0o777==0o700 and os.stat(backup/"state.db").st_mode&0o777==0o600
+    state=connect(path); assert state.execute("SELECT value FROM meta WHERE key='state_schema'").fetchone()[0]=="4" and json.loads(state.execute("SELECT value FROM meta WHERE key='state_cutover'").fetchone()[0])["backup"]==str(backup); state.close(); assert inspect_state(path)["status"]=="current" and os.stat(backup).st_mode&0o777==0o700 and os.stat(backup/"state.db").st_mode&0o777==0o600
 
 
 def test_cutover_recovers_corrupt_regular_state_but_refuses_symlink(tmp_path):
@@ -55,16 +55,16 @@ def test_cutover_install_failure_keeps_old_state_and_verified_backup(tmp_path,mo
 
 
 def test_unchanged_provenance_does_not_republish_but_file_change_does(tmp_path):
-    repo,core=source(tmp_path); state=connect(tmp_path/"state.db"); device=identity(); ws="personal"; cfg={"device":device,"workspaces":{ws:{"kind":"personal","epoch":1}},"keys":{f"{ws}:1":b64(bytes(range(32)))}}; known=set()
+    repo,core=source(tmp_path); state=connect(tmp_path/"state.db"); device=identity(); ws="personal"; cfg={"user":"user","device":device,"workspaces":{ws:{"kind":"personal","epoch":1}},"keys":{f"{ws}:1":b64(bytes(range(32)))}}; heads={}
     first=scan(core,state); timed=[r for r in first if r["kind"] in ("git.checkpoint","file.version","capture.gap")]; assert timed and all("observed_at" in r and "observed_at" not in r["payload"] for r in timed)
-    assert all(publish(cfg,state,ws,r,tmp_path/"client",True,known) for r in first); baseline=state.execute("SELECT COUNT(*) FROM outbox").fetchone()[0]
-    assert not any(publish(cfg,state,ws,r,tmp_path/"client",True,known) for r in scan(core,state)) and state.execute("SELECT COUNT(*) FROM outbox").fetchone()[0]==baseline
-    (repo/"a.py").write_text("changed\n"); emitted={r["kind"] for r in scan(core,state) if publish(cfg,state,ws,r,tmp_path/"client",True,known)}
+    assert all(publish(cfg,state,ws,r,tmp_path/"client",True,heads) for r in first); baseline=state.execute("SELECT COUNT(*) FROM outbox").fetchone()[0]
+    assert not any(publish(cfg,state,ws,r,tmp_path/"client",True,heads) for r in scan(core,state)) and state.execute("SELECT COUNT(*) FROM outbox").fetchone()[0]==baseline
+    (repo/"a.py").write_text("changed\n"); emitted={r["kind"] for r in scan(core,state) if publish(cfg,state,ws,r,tmp_path/"client",True,heads)}
     assert emitted=={"git.checkpoint","file.version"} and state.execute("SELECT COUNT(*) FROM outbox").fetchone()[0]==baseline+2
 
 
 def test_provenance_projection_uses_signed_event_timestamp(tmp_path):
-    state=connect(tmp_path/"state.db"); device=identity(); vid=digest({"file":"f","content":"h"}); payload={"id":vid,"file":"f","content_hash":"h"}; project(tmp_path/"db",state,event(device,1,"file.version",vid,payload,[],"2026-01-01T00:00:00Z"),"w")
+    state=connect(tmp_path/"state.db"); device=identity(); vid=digest({"file":"f","content":"h"}); payload={"id":vid,"file":"f","content_hash":"h"}; project(tmp_path/"db",state,event(device,1,"file.version",vid,payload,[],"2026-01-01T00:00:00Z"),"w",authors={device["id"]:"user"})
     db=duckdb.connect(str(tmp_path/"db"),read_only=True); assert str(db.execute("SELECT observed_at FROM provenance.file_versions WHERE id=?",(vid,)).fetchone()[0])=="2026-01-01 00:00:00"; db.close()
 
 
@@ -80,14 +80,14 @@ def test_out_of_order_revisions_converge_and_replay_deduplicates(tmp_path):
     state=connect(tmp_path/"state.db"); device=identity(); cols=["id","source","title","created_at","updated_at","model","cwd","git_branch","project_id","metadata"]
     old=event(device,1,"conversation.record","conversations:c",{"table":"conversations","columns":cols,"row":["c","codex","old","2026-01-01","2026-01-01",None,None,None,None,"{}"]},[],"2026-01-01T00:00:00Z")
     new=event(device,2,"conversation.record","conversations:c",{"table":"conversations","columns":cols,"row":["c","codex","new","2026-01-01","2026-01-02",None,None,None,None,"{}"]},[old["id"]],"2026-01-02T00:00:00Z")
-    assert project(tmp_path/"db",state,new,"w","different") and not project(tmp_path/"db",state,old,"w","different") and not project(tmp_path/"db",state,new,"w","different")
+    authors={device["id"]:"user"}; assert project(tmp_path/"db",state,new,"w","different",authors=authors) and not project(tmp_path/"db",state,old,"w","different",authors=authors) and not project(tmp_path/"db",state,new,"w","different",authors=authors)
     assert duckdb.connect(str(tmp_path/"db"),read_only=True).execute("SELECT title FROM conversations").fetchone()[0]=="new"
 
 
 def test_projection_batch_rolls_back_duckdb_and_state_together(tmp_path):
     state=connect(tmp_path/"state.db"); device=identity(); cols=["id","source","title","created_at","updated_at","model","cwd","git_branch","project_id","metadata"]; payload={"table":"conversations","columns":cols,"row":["c","codex","valid","2026-01-01","2026-01-01",None,None,None,None,"{}"]}
     good=event(device,1,"conversation.record","conversations:c",payload,[],"2026-01-01T00:00:00Z"); bad=event(device,2,"conversation.record","conversations:wrong",{**payload,"row":["bad",*payload["row"][1:]]},[good["id"]],"2026-01-01T00:00:01Z")
-    with pytest.raises(ValueError,match="schema"): project_many(tmp_path/"db",state,[("w",good),("w",bad)],"other")
+    with pytest.raises(ValueError,match="schema"): project_many(tmp_path/"db",state,[("w",good),("w",bad)],"other",authors={device["id"]:"user"})
     db=duckdb.connect(str(tmp_path/"db"),read_only=True); assert db.execute("SELECT COUNT(*) FROM conversations").fetchone()[0]==0 and db.execute("SELECT COUNT(*) FROM remote.row_origins").fetchone()[0]==0; db.close(); assert not state.execute("SELECT * FROM heads").fetchall()
 
 
@@ -98,6 +98,18 @@ def test_record_schema_is_fixed_and_same_origin_ids_from_authors_do_not_collide(
     bad=event(a,2,"conversation.record","conversations:x",{"table":"conversations","columns":["id); DROP TABLE conversations; --"],"row":["x"]},[],"2026-01-03T00:00:00Z")
     import pytest
     with pytest.raises(ValueError,match="schema"): project(tmp_path/"db",state,bad,"w","other")
+
+
+def test_same_user_source_identity_converges_across_devices_and_requires_verified_owner(tmp_path):
+    state=connect(tmp_path/"state.db"); a,b=identity("a"),identity("b"); cols=["id","source","title","created_at","updated_at","model","cwd","git_branch","project_id","metadata"]; authors={a["id"]:"user",b["id"]:"user"}
+    values=[event(device,1,"conversation.record","conversations:c",{"table":"conversations","columns":cols,"row":["c","codex",device["name"],"2026-01-01","2026-01-01",None,None,None,None,"{}"]},[],f"2026-01-0{i+1}T00:00:00Z") for i,device in enumerate((a,b))]
+    with pytest.raises(ValueError,match="verified author user"): project(tmp_path/"db",state,values[0],"w","other")
+    assert all(project(tmp_path/"db",state,value,"w","other",authors=authors) for value in values); db=duckdb.connect(str(tmp_path/"db"),read_only=True); origin=db.execute("SELECT physical_row_id,author_user_id,author_device_id FROM remote.row_origins").fetchone(); assert db.execute("SELECT COUNT(*),MAX(title) FROM conversations").fetchone()==(1,"b") and origin==(foreign_id("w","user","conversations","c"),"user",b["id"]); db.close(); assert tuple(state.execute("SELECT author_user,entity,event FROM heads").fetchone())==("user","conversations:c",values[1]["id"])
+
+
+def test_publication_head_allows_exact_reversion(tmp_path):
+    state=connect(tmp_path/"state.db"); device=identity(); ws="personal"; cfg={"user":"user","device":device,"workspaces":{ws:{"kind":"personal","epoch":1}},"keys":{f"{ws}:1":b64(bytes(range(32)))}}; record=lambda title:{"kind":"conversation.record","entity":"conversations:c","payload":{"table":"conversations","columns":["id","source","title","created_at","updated_at","model","cwd","git_branch","project_id","metadata"],"row":["c","codex",title,"2026-01-01","2026-01-01",None,None,None,None,"{}"]}}
+    first=publish(cfg,state,ws,record("a"),tmp_path,True); assert publish(cfg,state,ws,record("a"),tmp_path,True)==first; second=publish(cfg,state,ws,record("b"),tmp_path,True); reverted=publish(cfg,state,ws,record("a"),tmp_path,True); head=state.execute("SELECT owner,revision,event FROM publication_heads").fetchone(); assert len({first,second,reverted})==3 and state.execute("SELECT COUNT(*) FROM outbox").fetchone()[0]==3 and tuple(head)==("user",digest(record("a")["payload"]),reverted)
 
 
 def test_team_scope_includes_prompt_turn_and_linked_repo_only(tmp_path):
@@ -135,8 +147,8 @@ def test_per_workspace_device_chain_accepts_reorder_and_rejects_replay_or_bad_pa
 
 
 def test_attachment_chunk_conflicts_are_rejected(tmp_path):
-    state=connect(tmp_path/"state.db"); device=identity(); data="eA=="; payload={"attachment":"a","blob":"2d711642b726b04401627ca9fbac32f5da7e5c8530fb1903cc4db02258717921","index":0,"total":2,"sha256":"2d711642b726b04401627ca9fbac32f5da7e5c8530fb1903cc4db02258717921","size":2,"data":data}; one=event(device,1,"attachment.chunk",f"attachment:a:{payload['blob']}:0",payload,[],"2026-01-01T00:00:00Z"); assert project(tmp_path/"db",state,one,"w","other")
+    state=connect(tmp_path/"state.db"); device=identity(); authors={device["id"]:"user"}; data="eA=="; payload={"attachment":"a","blob":"2d711642b726b04401627ca9fbac32f5da7e5c8530fb1903cc4db02258717921","index":0,"total":2,"sha256":"2d711642b726b04401627ca9fbac32f5da7e5c8530fb1903cc4db02258717921","size":2,"data":data}; one=event(device,1,"attachment.chunk",f"attachment:a:{payload['blob']}:0",payload,[],"2026-01-01T00:00:00Z"); assert project(tmp_path/"db",state,one,"w","other",authors=authors)
     path=Path(state.execute("SELECT path FROM attachment_parts").fetchone()[0]); assert path.read_bytes()==b"x" and os.stat(path).st_mode&0o777==0o600 and "data" not in {r[1] for r in state.execute("PRAGMA table_info(attachment_parts)")}
     import pytest
     changed={**payload,"total":3}; conflict=event(device,2,"attachment.chunk",f"attachment:a:{payload['blob']}:0",changed,[one["id"]],"2026-01-01T00:00:01Z")
-    with pytest.raises(ValueError,match="conflict"): project(tmp_path/"db",state,conflict,"w","other")
+    with pytest.raises(ValueError,match="conflict"): project(tmp_path/"db",state,conflict,"w","other",authors=authors)
