@@ -73,6 +73,10 @@ they do not depend on relay or `state.db` history.
 > one peer cannot overwrite another peer's valid copy or amplify storage
 > without limit.
 
+> Clients evaluate uploader copies independently. One malformed delivery copy
+> cannot mask a later valid copy of the same semantic object; readiness blocks
+> only when every accessible copy fails decryption or verification.
+
 > Relay loss does not require automatic reconstruction of its former authority.
 > A personal owner may create a replacement workspace; a team may explicitly
 > re-found one and invite the members it currently trusts. The replacement uses
