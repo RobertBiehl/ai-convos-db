@@ -1,5 +1,5 @@
 """Client-side enrollment, E2EE keyring, automatic sync, membership, and local queries."""
-import fcntl, json, os, time, urllib.error, urllib.parse, urllib.request
+import fcntl, json, os, sqlite3, time, urllib.error, urllib.parse, urllib.request
 from contextlib import contextmanager
 from pathlib import Path; from typing import Optional
 
@@ -9,7 +9,7 @@ _pending=[]
 def register(app): _pending.append(app) if "remote" not in globals() else app.add_typer(remote,name="remote")
 from ai_convos.cli import PROJECT_ROOT, archive_state as core_archive_state, drain_hooks, init_schema, install_hooks, repository
 from .control import approved, electorate, proposal as device_proposal, record as control_record, sign as control_sign, state_hash, verify_proposal, verify_state, vote as device_vote
-from .projection import bridge_purges, bridge_records, connect, cutover_state, event_support, inspect_state, project, project_many, query as graph_query, read_state, reset_history, scan, sequence, verify_history
+from .projection import bridge_purges, bridge_records, connect, cutover_state, event_support, inspect_state, project, project_many, query as graph_query, read_state, relocate_attachments, reset_history, scan, sequence, verify_history
 from .protocol import (b64, certificate, digest, event, identity, material_event, open_event, open_key, public, public_id, purge_certificate, recover,
                        recovery_bundle, seal_event, seal_history, seal_key, sign_control, signer, unb64, verify_certificate, verify_purge)
 from .service import edit_hooks, enable
@@ -31,6 +31,15 @@ def load(root=None):
     return json.loads(path.read_text())
 def save(cfg,root=None):
     base,path,_=paths(root); base.mkdir(parents=True,exist_ok=True); os.chmod(base,0o700); tmp=path.with_name(f".{path.name}.{os.getpid()}"); tmp.write_text(json.dumps(cfg)); os.chmod(tmp,0o600); os.replace(tmp,path)
+def rescue_bindings(cfg,state_path,root=None):
+    db=sqlite3.connect(Path(state_path).resolve().as_uri()+"?mode=ro",uri=True)
+    try: columns={r[1] for r in db.execute("PRAGMA table_info(policies)").fetchall()}; rows=db.execute("SELECT workspace,value,local_root FROM policies WHERE kind='path' AND local_root IS NOT NULL").fetchall() if "local_root" in columns else []
+    finally: db.close()
+    for ws,value,path in rows:
+        if not isinstance(path,str) or not Path(path).is_absolute(): raise ValueError("legacy path binding is invalid")
+        cfg.setdefault("bindings",{})[f"{ws}:{value}"]=path
+    if rows: save(cfg,root)
+    return len(rows)
 def encrypted_file(root,event,value):
     path=paths(root)[0]/"outbox"/f"{event}.json"; path.parent.mkdir(parents=True,exist_ok=True)
     if path.parent.is_symlink() or path.is_symlink(): raise ValueError("encrypted outbox path must not be a symlink")
@@ -127,7 +136,7 @@ def setup_client(url,user,device="computer",recovery=None,root=None):
     dev=identity(device); uid=root_id["id"]
     if not recovery: recovery,bundle=recovery_bundle({"root":root_id,"keys":keys,"workspaces":workspaces})
     registered=request({"url":url},{"op":"register","user_name":user,"root_public":root_id["sign_public"],"certificate":certificate(root_id,uid,dev),**({"recovery":bundle} if not workspaces else {})},False)
-    cfg={"url":url,"user":uid,"token":registered["token"],"root":root_id,"device":dev,"recovery":recovery,"keys":keys,"workspaces":workspaces,"controls":controls,"server_state":{}}; save(cfg,root)
+    cfg={"url":url,"user":uid,"token":registered["token"],"root":root_id,"device":dev,"recovery":recovery,"keys":keys,"workspaces":workspaces,"controls":controls,"bindings":{},"server_state":{}}; save(cfg,root)
     if not workspaces: create(cfg,"Personal","personal",root)
     else:
         state=refresh(cfg,root)
@@ -261,14 +270,15 @@ def sync_once(root=None,force=False):
     root=local_root(root)
     with sync_lock(root):
         cfg=load(root); _,_,state_path=paths(root); info=inspect_state(state_path,force); cutover=None
-        if info["status"] in ("incompatible","invalid"): refresh(cfg,root); cutover=cutover_state(state_path)
+        relocate_attachments(core_path(root),paths(root)[0]/"attachments")
+        if info["status"] in ("incompatible","invalid"): refresh(cfg,root); info["status"]=="incompatible" and rescue_bindings(cfg,state_path,root); cutover=cutover_state(state_path)
         state=connect(state_path)
         try:
             drain_hooks(); refresh(cfg,root); ready={r[0] for r in state.execute("SELECT workspace FROM sync_states WHERE lifecycle='ready'").fetchall()}; upload(cfg,state,root,ready); prepare_archive(cfg,state,root); pull(cfg,state,root); ready={r[0] for r in state.execute("SELECT workspace FROM sync_states WHERE lifecycle='ready'").fetchall()}; flush_selected(cfg,state,root,ready); path=core_path(root); stamp=path.stat().st_mtime_ns if path.exists() else 0; active={w["id"] for w in cfg["server_state"]["workspaces"]}; scans=[(ws,meta) for ws,meta in cfg["workspaces"].items() if ws in ready and ws in active and f"{ws}:{meta['epoch']}" in cfg["keys"] and (force or stamp!=int((state.execute("SELECT value FROM meta WHERE key=?",(f"core_mtime:{ws}",)).fetchone() or ["0"])[0]))] if path.is_file() else []
             if scans:
                 core=duckdb.connect(str(path),read_only=True)
                 for ws,meta in scans:
-                    pol=state.execute("SELECT kind,value,local_root FROM policies WHERE workspace=?",(ws,)).fetchall(); repos=[p[1] for p in pol if p[0]=="repository"]; roots=[p[2] for p in pol if p[0]=="path" and p[2]]; heads={r[0]:r[1] for r in state.execute("SELECT entity,revision FROM publication_heads WHERE workspace=? AND owner=?",(ws,cfg["user"])).fetchall()}; [publish(cfg,state,ws,r,root,True,heads) for r in scan(core,state,meta["kind"],repos,roots)]
+                    pol=state.execute("SELECT kind,value FROM policies WHERE workspace=?",(ws,)).fetchall(); repos=[p[1] for p in pol if p[0]=="repository"]; roots=[cfg.get("bindings",{}).get(f"{ws}:{p[1]}") for p in pol if p[0]=="path" and cfg.get("bindings",{}).get(f"{ws}:{p[1]}")]; heads={r[0]:r[1] for r in state.execute("SELECT entity,revision FROM publication_heads WHERE workspace=? AND owner=?",(ws,cfg["user"])).fetchall()}; [publish(cfg,state,ws,r,root,True,heads) for r in scan(core,state,meta["kind"],repos,roots)]
                 core.close()
                 final=path.stat().st_mtime_ns; [state.execute("INSERT OR REPLACE INTO meta VALUES (?,?)",(f"core_mtime:{ws}",str(final))) for ws,meta in scans]
             [publish(cfg,state,ws,r,root,True,heads) for ws,meta in cfg["workspaces"].items() if ws in ready and ws in active and meta["kind"]=="personal" and f"{ws}:{meta['epoch']}" in cfg["keys"] for heads in [{r[0]:r[1] for r in state.execute("SELECT entity,revision FROM publication_heads WHERE workspace=? AND owner=?",(ws,cfg["user"])).fetchall()}] for r in bridge_records(root,state,ws,meta["kind"])]; state.commit(); upload(cfg,state,root,ready)
@@ -295,7 +305,7 @@ def grant_selected(cfg,state,ws,user,event_ids,root=None):
     found=request(cfg,{"op":"directory","user":user}); target=directory_user(found,user); refresh(cfg,root); previous=cfg["controls"][ws]; devices=[r["device"] for r in previous["devices"].values() if r["user"]==target["id"]]; values=selected_material(cfg,state,ws,event_ids,root)
     if not devices: raise ValueError("target has no authorized workspace devices")
     members={**previous["members"],target["id"]:{**previous["members"][target["id"]],"selected":sorted(set(previous["members"][target["id"]]["selected"])|set(event_ids))}}; records={d:{**r,"history":True} if r["user"]==target["id"] else r for d,r in previous["devices"].items()}; control=control_body(cfg,previous,key(cfg,ws,previous["epoch"]),"history",members,records); request(cfg,sign_control(cfg["device"],{"op":"grant_selected","workspace":ws,"control":control})); cfg["controls"][ws]=control; save(cfg,root)
-    [publish(cfg,state,ws,{"kind":"history.republish","entity":(entity:=f"history:{target['id']}:{eid}"),"payload":{"target":target["id"],"sealed":seal_history(value,devices,entity)}} ,root) for eid,value in values]; upload(cfg,state,root); return len(values)
+    flush_selected(cfg,state,root,{ws}); upload(cfg,state,root,{ws}); return len(values)
 def remove_device(cfg,ws,device_id,root=None):
     refresh(cfg,root); members={u:m["role"] for u,m in cfg["controls"][ws]["members"].items()}; return rotate(cfg,ws,members,[],[device_id],root)
 def request_device(cfg,ws,root=None,delay=3600):
@@ -319,15 +329,23 @@ def selected_material(cfg,state,ws,event_ids,root=None):
         if value is None or value["id"]!=eid: raise ValueError("approver cannot open selected history")
         values.append((eid,value))
     return values
-def queue_selected(state,ws,target,event_ids):
-    [state.execute("INSERT OR IGNORE INTO history_queue VALUES (?,?,?)",(ws,target,eid)) for eid in event_ids]; state.commit()
 def flush_selected(cfg,state,root=None,workspaces=None):
-    for ws,target,eid in state.execute("SELECT workspace,target,event FROM history_queue").fetchall():
-        if workspaces is not None and ws not in workspaces: continue
-        head=cfg["controls"].get(ws); record=head and head["devices"].get(target)
-        if record and eid not in head["members"][record["user"]]["selected"]: state.execute("DELETE FROM history_queue WHERE workspace=? AND target=? AND event=?",(ws,target,eid)); continue
-        if not record or not record["history"] or cfg["device"]["id"] not in head["devices"]: continue
-        value=selected_material(cfg,state,ws,[eid],root)[0][1]; entity=f"history:{record['user']}:{eid}:{target}"; publish(cfg,state,ws,{"kind":"history.republish","entity":entity,"payload":{"target":record["user"],"sealed":seal_history(value,[record["device"]],entity)}},root,True); state.execute("DELETE FROM history_queue WHERE workspace=? AND target=? AND event=?",(ws,target,eid))
+    values={}
+    for ws,head in cfg["controls"].items():
+        if workspaces is not None and ws not in workspaces or cfg["device"]["id"] not in head["devices"]: continue
+        for user,member in head["members"].items():
+            for target,record in head["devices"].items():
+                if record["user"]!=user or not record["history"]: continue
+                for eid in member["selected"]:
+                    entity=f"history:{user}:{eid}:{target}"
+                    if state.execute("SELECT 1 FROM receipts WHERE workspace=? AND kind='history.republish' AND entity=? UNION ALL SELECT 1 FROM outbox WHERE workspace=? AND kind='history.republish' AND entity=? LIMIT 1",(ws,entity,ws,entity)).fetchone(): continue
+                    try:
+                        if (cache:=(ws,eid)) not in values: values[cache]=selected_material(cfg,state,ws,[eid],root)[0][1]
+                        value=values[cache]
+                    except ValueError as e:
+                        if str(e)=="approver lacks selected history receipt": continue
+                        raise
+                    publish(cfg,state,ws,{"kind":"history.republish","entity":entity,"payload":{"target":user,"sealed":seal_history(value,[record["device"]],entity)}},root,True)
     state.commit()
 def approve_device(cfg,ws,device_id,approve=True,root=None):
     refresh(cfg,root); base,item=pending(cfg,ws,device_id,"device.proposal"); target=item["proposal"]["target"]; same=cfg["user"]==target["user"] and cfg["device"]["id"] in base["devices"]
@@ -339,7 +357,7 @@ def approve_device(cfg,ws,device_id,approve=True,root=None):
         yes=len({v["voter"] for v in item["votes"] if v["approve"]}); needed=len(electorate(base,target["user"]))//2+1
         if not approve or yes<needed: return {"approved":False,"votes":yes,"needed":needed}
         approved(base,item["proposal"],item["votes"])
-    new=os.urandom(32); epoch=base["epoch"]+1; boundary=next_boundary(cfg,ws,root); inherit=base["devices"][cfg["device"]["id"]]["history"] if same else False; queued=connect(paths(root)[2]); selected=selected_material(cfg,queued,ws,base["members"][target["user"]]["selected"],root) if inherit else []; queue_selected(queued,ws,device_id,[e for e,v in selected]); queued.close(); entry={**target,"history":inherit}; records={**base["devices"],device_id:entry}; action="self_approve" if same else "quorum_approve"; proof={"proposal":item["proposal"],"votes":item["votes"]}; control=control_body(cfg,base,new,action,devices=records,approval=proof,boundary=boundary); envs={d:seal_key(new,r["device"]["box_public"],f"workspace:{ws}:epoch:{epoch}") for d,r in records.items()}; start=base["members"][target["user"]]["history_from"]; history={name.rsplit(":",1)[1]:seal_key(unb64(value),entry["device"]["box_public"],f"workspace:{ws}:epoch:{name.rsplit(':',1)[1]}") for name,value in cfg["keys"].items() if inherit and name.startswith(ws+":") and int(name.rsplit(":",1)[1])>=start}
+    new=os.urandom(32); epoch=base["epoch"]+1; boundary=next_boundary(cfg,ws,root); inherit=base["devices"][cfg["device"]["id"]]["history"] if same else False; queued=connect(paths(root)[2]); selected=selected_material(cfg,queued,ws,base["members"][target["user"]]["selected"],root) if inherit else []; queued.close(); entry={**target,"history":inherit}; records={**base["devices"],device_id:entry}; action="self_approve" if same else "quorum_approve"; proof={"proposal":item["proposal"],"votes":item["votes"]}; control=control_body(cfg,base,new,action,devices=records,approval=proof,boundary=boundary); envs={d:seal_key(new,r["device"]["box_public"],f"workspace:{ws}:epoch:{epoch}") for d,r in records.items()}; start=base["members"][target["user"]]["history_from"]; history={name.rsplit(":",1)[1]:seal_key(unb64(value),entry["device"]["box_public"],f"workspace:{ws}:epoch:{name.rsplit(':',1)[1]}") for name,value in cfg["keys"].items() if inherit and name.startswith(ws+":") and int(name.rsplit(":",1)[1])>=start}
     body={"op":"rotate","workspace":ws,"control":control,"envelopes":envs}; history and body.update(history_envelopes={device_id:history})
     request(cfg,sign_control(cfg["device"],body)); cfg["keys"][f"{ws}:{epoch}"]=b64(new); cfg["workspaces"][ws]["epoch"]=epoch; cfg["controls"][ws]=control; update_recovery(cfg,root); state=connect(paths(root)[2]); flush_selected(cfg,state,root); state.close(); control_event(cfg,ws,action,device_id,root); return {"approved":True,"epoch":epoch,"history":len(history),"selected":len(selected)}
 def request_history(cfg,ws,root=None,delay=3600):
@@ -349,7 +367,7 @@ def request_history(cfg,ws,root=None,delay=3600):
 def approve_history(cfg,ws,device_id,approve=True,root=None):
     refresh(cfg,root); base,item=pending(cfg,ws,device_id,"history.proposal"); target=item["proposal"]["target"]; request(cfg,{"op":"vote","vote":device_vote(cfg["device"],cfg["user"],item["proposal"],approve)}); item=next(p for p in proposals(cfg,ws) if state_hash(p["proposal"])==state_hash(item["proposal"])); yes=len({v["voter"] for v in item["votes"] if v["approve"]}); needed=len(electorate(base,target["user"]))//2+1
     if not approve or yes<needed: return {"approved":False,"votes":yes,"needed":needed}
-    approved(base,item["proposal"],item["votes"],kind="history.proposal"); queued=connect(paths(root)[2]); selected=selected_material(cfg,queued,ws,base["members"][target["user"]]["selected"],root); device=target["device"]["id"]; queue_selected(queued,ws,device,[e for e,v in selected]); queued.close(); records={**base["devices"],device:{**base["devices"][device],"history":True}}; proof={"proposal":item["proposal"],"votes":item["votes"]}; control=control_body(cfg,base,key(cfg,ws,base["epoch"]),"history_activate",devices=records,approval=proof); start=base["members"][target["user"]]["history_from"]; envs={str(epoch):seal_key(key(cfg,ws,epoch),target["device"]["box_public"],f"workspace:{ws}:epoch:{epoch}") for epoch in range(start,base["epoch"]+1)}
+    approved(base,item["proposal"],item["votes"],kind="history.proposal"); queued=connect(paths(root)[2]); selected=selected_material(cfg,queued,ws,base["members"][target["user"]]["selected"],root); device=target["device"]["id"]; queued.close(); records={**base["devices"],device:{**base["devices"][device],"history":True}}; proof={"proposal":item["proposal"],"votes":item["votes"]}; control=control_body(cfg,base,key(cfg,ws,base["epoch"]),"history_activate",devices=records,approval=proof); start=base["members"][target["user"]]["history_from"]; envs={str(epoch):seal_key(key(cfg,ws,epoch),target["device"]["box_public"],f"workspace:{ws}:epoch:{epoch}") for epoch in range(start,base["epoch"]+1)}
     request(cfg,sign_control(cfg["device"],{"op":"history_activate","workspace":ws,"control":control,"envelopes":envs})); cfg["controls"][ws]=control; save(cfg,root); state=connect(paths(root)[2]); flush_selected(cfg,state,root); state.close(); control_event(cfg,ws,"history_activate",device,root); return {"approved":True,"history":len(envs),"selected":len(selected)}
 
 @remote.command("setup")
@@ -380,7 +398,7 @@ def request_history_cmd(space:str): cfg=load(); value=request_history(cfg,worksp
 def approve_history_cmd(space:str,device_id:str,reject:bool=typer.Option(False,"--reject")): cfg=load(); typer.echo(json.dumps(approve_history(cfg,workspace(cfg,space),device_id,not reject)))
 @remote.command("link")
 def link_cmd(path:Path,space:str):
-    cfg=load(); ws=workspace(cfg,space); state=connect(paths()[2]); repo=repository(path.resolve()); kind,value=("repository",repo["id"]) if repo else ("path",digest(os.urandom(32))[:32]); state.execute("INSERT OR REPLACE INTO policies VALUES (?,?,?,?)",(ws,kind,value,str(path.resolve()))); state.execute("DELETE FROM meta WHERE key LIKE 'core_mtime:%'"); state.commit()
+    cfg=load(); ws=workspace(cfg,space); state=connect(paths()[2]); resolved=path.resolve(); repo=repository(resolved); kind,value=("repository",repo["id"]) if repo else ("path",digest(os.urandom(32))[:32]); state.execute("INSERT OR REPLACE INTO policies VALUES (?,?,?)",(ws,kind,value)); state.execute("DELETE FROM meta WHERE key LIKE 'core_mtime:%'"); state.commit(); kind=="path" and cfg.setdefault("bindings",{}).update({f"{ws}:{value}":str(resolved)}); save(cfg)
     publish(cfg,state,ws,{"kind":"workspace.policy","entity":f"policy:{kind}:{value}","payload":{"kind":kind,"value":value}}); upload(cfg,state); typer.echo(f"{kind} {value} -> {cfg['workspaces'][ws]['name']}")
 @remote.command("sync")
 def sync_cmd(): result=sync_once(force=True); typer.echo("Remote synchronized"+(f"; previous state preserved at {result['backup']}" if result else ""))

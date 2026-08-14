@@ -8,8 +8,8 @@ import ai_convos_remote as remote_client
 import ai_convos_remote.projection as projection_module
 from cryptography.exceptions import InvalidSignature
 from ai_convos.cli import ARCHIVE_COLUMNS, archive_state, capture_provenance, init_schema, project_archive_row
-from ai_convos_remote import (_upload_batches, add_member, approve_device, approve_history, connect, control_body, create, doctor_status, fetch_lazy, grant_all, grant_selected, key, load, pull, publish, refresh, remove_device,
-                              request_device, request_history, setup_client, sync_once, upload, workspace)
+from ai_convos_remote import (_upload_batches, add_member, approve_device, approve_history, connect, control_body, create, doctor_status, fetch_lazy, flush_selected, grant_all, grant_selected, key, load, pull, publish, refresh, remove_device,
+                              request_device, request_history, rescue_bindings, setup_client, sync_once, upload, workspace)
 from ai_convos_remote.control import sign as control_sign, vote as device_vote
 from ai_convos_remote.projection import inspect_state, scan
 from ai_convos_remote.protocol import certificate, event, identity, seal_event, seal_history, seal_key, sign_control, unb64
@@ -184,6 +184,18 @@ def test_team_default_selected_complete_history_and_removal(tmp_path,monkeypatch
     with pytest.raises(ValueError,match="outside"): action(server,sign_control(alice["device"],future),alice["token"])
     assert grant_all(alice,team,"bob",a)>=2; bob=load(b); pull(bob,sb,b); assert any(name.endswith(":1") for name in load(b)["keys"])
     add_member(alice,team,"bob",True,root=a); bob=load(b); pull(bob,sb,b); assert team not in {w["id"] for w in load(b)["server_state"]["workspaces"]} and f"{team}:3" not in load(b)["keys"]
+
+
+def test_selected_delivery_is_derived_after_crash_and_state_loss(tmp_path,monkeypatch):
+    server=server_connect(tmp_path/"server.db"); monkeypatch.setattr("ai_convos_remote.request",transport(server)); a,b=tmp_path/"a",tmp_path/"b"; alice,_=setup_client("http://server","alice",root=a); setup_client("http://server","bob",root=b); team=create(alice,"Team","team",a); state=connect(a/"remote/state.db"); old=publish(alice,state,team,conversation("durable selected"),a); upload(alice,state,a); add_member(alice,team,"bob",root=a); real=remote_client.flush_selected; monkeypatch.setattr(remote_client,"flush_selected",lambda *args:(_ for _ in ()).throw(ConnectionError("after signed grant")))
+    with pytest.raises(ConnectionError,match="signed grant"): grant_selected(alice,state,team,"bob",[old],a)
+    assert old in load(a)["controls"][team]["members"][load(b)["user"]]["selected"]; state.close(); [Path(str(a/"remote/state.db")+suffix).unlink(missing_ok=True) for suffix in ("","-wal","-shm")]; monkeypatch.setattr(remote_client,"flush_selected",real); rebuilt=connect(a/"remote/state.db"); pull(load(a),rebuilt,a); flush_selected(load(a),rebuilt,a,{team}); upload(load(a),rebuilt,a,{team}); pull(load(b),connect(b/"remote/state.db"),b)
+    assert duckdb.connect(str(b/"data/convos.db"),read_only=True).execute("SELECT title FROM conversations").fetchone()[0]=="durable selected" and not rebuilt.execute("SELECT 1 FROM sqlite_master WHERE name='history_queue'").fetchone()
+
+
+def test_path_bindings_are_rescued_to_config_before_state_cutover(tmp_path):
+    path=tmp_path/"state.db"; db=sqlite3.connect(path); db.execute("CREATE TABLE policies(workspace TEXT,kind TEXT,value TEXT,local_root TEXT)"); db.execute("INSERT INTO policies VALUES ('w','path','token','/local/worktree'),('w','repository','repo','/ignored')"); db.commit(); db.close(); cfg={"bindings":{}}
+    assert rescue_bindings(cfg,path,tmp_path)==1 and cfg["bindings"]=={"w:token":"/local/worktree"} and json.loads((tmp_path/"remote/config.json").read_text())["bindings"]==cfg["bindings"]
 
 
 def test_unknown_required_event_blocks_ready_without_storing_content(tmp_path,monkeypatch):

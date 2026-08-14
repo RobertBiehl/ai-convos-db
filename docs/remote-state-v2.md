@@ -25,7 +25,9 @@ overlapping authority:
 
 The client and relay advance together. There is no compatibility layer,
 negotiation, or fallback for the old relay protocol. Core DuckDB upgrades are
-additive and automatic. Remote state is replaced and rebaselined, not migrated.
+additive and automatic. Rebuildable remote state is replaced and rebaselined,
+not migrated; the cutover first rescues only non-rebuildable local path bindings
+and completed attachment bodies into their owning configuration/archive stores.
 
 ## Responsibilities
 
@@ -57,8 +59,11 @@ with the content transaction.
 
 ### Device config
 
-`config.json` owns device keys, workspace keys, pinned signed controls, and the
-last archive ID/generation that completed an entire sync. The archive proof is
+`config.json` owns device keys, workspace keys, pinned signed controls,
+machine-local non-Git path bindings, and the last archive ID/generation that
+completed an entire sync. Repository policies use core's stable repository ID;
+its one-to-many checkout map resolves clones and worktrees without a remote path
+binding. The archive proof is
 kept here, rather than only in rebuildable `state.db`, so deleting `state.db`
 cannot erase rollback detection. A content-free copy in `state.db` provides a
 second safety anchor against a stale config write. Neither copy contains archive
@@ -89,7 +94,8 @@ Long-lived `state.db` rows contain only:
   retained only in event receipts and DuckDB origin attribution;
 - exact `(workspace, author, sequence) -> event_id` sequence identity;
 - compact parent data only for unresolved out-of-order gaps;
-- selected-history event IDs and content-free original-to-carrier mappings;
+- content-free selected-history original-to-carrier mappings; missing delivery
+  work is derived from signed grants and acknowledged carrier receipts;
 - lazy/deferred event manifests, policies, retries, and last failure;
 - content-free acknowledged event receipts.
 
@@ -263,11 +269,17 @@ the signed history boundary.
 
 Selected-history grants fetch exact envelopes from the relay, decrypt and
 verify them in memory, reseal them for authorized devices, upload, and discard
-the material.
+the material. The signed append-only grant is the authority. Every refresh
+derives missing per-device carriers from signed selections minus acknowledged
+or pending carrier events, so deleting `state.db` or crashing after the control
+commit cannot forget delivery.
 
 Attachment chunks remain encrypted until streamed to a mode-0600 temporary
-file. Hash and size validation precede atomic rename to the final attachment
-path. SQLite stores only the manifest and completion metadata.
+file under remote working storage. Hash and size validation precede atomic
+rename to archive-owned `data/attachments/<sha256>`. SQLite stores only the
+incomplete manifest and content-free completion lookup. A local cutover copies,
+validates, commits new DuckDB paths, and only then removes legacy completed
+bodies from `remote/attachments`.
 
 ## Exact sequence storage
 
@@ -397,4 +409,10 @@ contains merge commits or fixup commits.
 - Explicit sync reaches the advertised tail in one invocation.
 - Settled state contains no synthetic plaintext.
 - State growth after acknowledgement is independent of payload size.
+- Signed selected-history grants recreate missing per-device delivery after a
+  crash or complete `state.db` loss.
+- Completed personal attachment bodies remain available under archive-owned
+  storage after `state.db` and remote working storage are removed.
+- Team repository/path routing publishes structurally complete conversations;
+  protected fields remain explicit typed redactions rather than silent holes.
 - Existing local archive queries remain offline and network-independent.

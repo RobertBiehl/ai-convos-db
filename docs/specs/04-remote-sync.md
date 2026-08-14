@@ -175,9 +175,10 @@ with another provider origin or active projection survives, with the deleted
 remote origin redacted to hash and link metadata. This preserves conflicts
 instead of treating deletion as last-writer-wins.
 
-Large event bodies and attachments use encrypted blobs. Pull returns manifests;
-clients fetch bodies eagerly only when required for the active local projection
-and fetch attachments on demand.
+Large event bodies and personal attachments use encrypted lazy events. Pull
+fetches bodies required for the active local projection and atomically assembles
+personal attachment chunks in archive-owned storage. Team workspaces publish an
+explicit attachment placeholder but never read or upload the binary body.
 
 ## Membership, devices, and recovery
 
@@ -220,13 +221,13 @@ Personal policy is `all`: every captured conversation record and provenance
 event is encrypted to the personal workspace without path or repository
 allowlists. Users can opt out with local exclusions, but never need to opt in.
 
-Team policy is based on repositories and path roots, not manual conversation
-sharing. Each turn and tool/edit event is independently associated with zero or
-more repositories. A conversation and changeset may span any number of them.
-When a changeset touches several repositories selected by one workspace, it is
-published as one changeset. When it crosses access boundaries, each workspace
-receives an encrypted projection containing its allowed nodes and an opaque
-boundary edge, never private paths or content.
+Team policy routes whole conversations by stable repository identity or an
+opaque machine-local path binding. A match by conversation working directory or
+any captured edit selects the conversation atomically: every turn, tool, edit,
+artifact, and provenance fact belonging to it is published. Policies never
+slice a turn or materialize a conversation with silent holes. Textual secret
+redactions and unsafe binary attachment omissions remain explicit typed markers,
+so the receiver can distinguish protected content from absent data.
 
 ## Git and file evidence
 

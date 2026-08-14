@@ -56,11 +56,12 @@ cannot be used for offline guessing or cross-record secret correlation.
 Redaction happens before payload revision hashing, event signing, and
 encryption. Repeated scans therefore converge on the same projected record.
 
-Team attachment metadata and binary bodies are omitted entirely. A binary
-format can hide or split credentials in ways a dependency-free text scanner
-cannot prove safe, including across chunks. Personal workspaces retain
-attachments unchanged. The team policy also avoids reading attachment bodies
-while building its projection.
+Team binary bodies are omitted because a binary format can hide or split
+credentials in ways a dependency-free text scanner cannot prove safe, including
+across chunks. The attachment row remains as an explicit
+`[REDACTED:attachment]` placeholder with sensitive metadata cleared, so a shared
+conversation never acquires an invisible structural hole. Personal workspaces
+retain attachments unchanged. Team projection does not read attachment bodies.
 
 ## Exact boundary and limitations
 
