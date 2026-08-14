@@ -75,7 +75,7 @@ def test_personal_sync_automatically_bridges_encrypted_memory_between_devices(tm
     sync_once(b,True); db=sqlite3.connect(b/"memory/state.db"); assert db.execute("SELECT content FROM canonicals").fetchall()==[("relay cannot read this",)]; db.close()
     large="second device-safe revision\n"+"x"*70000; memory_module.remember_data(large,"global",created["id"]); sync_once(a,True); sync_once(b,True); count=server.execute("SELECT COUNT(*) FROM events").fetchone()[0]; sync_once(a,True); sync_once(b,True)
     db=sqlite3.connect(b/"memory/state.db"); assert db.execute("SELECT content FROM canonicals").fetchall()==[(large,)] and db.execute("SELECT COUNT(*) FROM remote_parts").fetchone()[0]==0; db.close(); state=connect(b/"remote/state.db"); assert state.execute("SELECT COUNT(*) FROM lazy_events").fetchone()[0]==0; state.close(); assert server.execute("SELECT COUNT(*) FROM events").fetchone()[0]==count and "second device-safe revision" not in "".join(r[0] for r in server.execute("SELECT envelope FROM events").fetchall())
-    state=connect(a/"remote/state.db"); old=[r[0] for r in state.execute("SELECT event FROM receipts WHERE kind='memory.canonical' AND status='active'").fetchall()]; state.close(); memory_module.forget_data(created["id"],"global"); sync_once(a,True); assert server.execute(f"SELECT COUNT(*) FROM events WHERE event IN ({','.join('?'*len(old))})",old).fetchone()[0]==0 and server.execute(f"SELECT COUNT(*) FROM event_tombstones WHERE event IN ({','.join('?'*len(old))})",old).fetchone()[0]==len(old)
+    state=connect(a/"remote/state.db"); old=[r[0] for r in state.execute("SELECT event FROM receipts WHERE kind='memory.canonical' AND status='active'").fetchall()]; state.close(); memory_module.forget_data(created["id"],"global"); sync_once(a,True); assert server.execute(f"SELECT COUNT(*) FROM events WHERE event IN ({','.join('?'*len(old))})",old).fetchone()[0]==0 and server.execute(f"SELECT COUNT(*) FROM event_purges WHERE event IN ({','.join('?'*len(old))})",old).fetchone()[0]==len(old)
     sync_once(b,True); db=sqlite3.connect(b/"memory/state.db"); assert db.execute("SELECT COUNT(*) FROM canonicals").fetchone()[0]==db.execute("SELECT COUNT(*) FROM sources").fetchone()[0]==0; db.close(); state=connect(b/"remote/state.db"); rows=[tuple(r) for r in state.execute("SELECT status FROM receipts WHERE kind='memory.canonical'").fetchall()]; state.close(); assert rows==[("deleted",)] and b"second device-safe revision" not in (b/"remote/state.db").read_bytes()
     recreated=memory_module.remember_data(large,"global"); assert recreated["id"]!=created["id"]; sync_once(a,True); sync_once(b,True); db=sqlite3.connect(b/"memory/state.db"); assert db.execute("SELECT content FROM canonicals").fetchall()==[(large,)]; db.close()
 
@@ -88,8 +88,28 @@ def test_lost_purge_response_retries_without_resurrecting_forgotten_memory(tmp_p
         return result
     monkeypatch.setattr("ai_convos_remote.request",request_lost)
     with pytest.raises(ConnectionError,match="response lost"): sync_once(a,True)
-    state=connect(a/"remote/state.db"); assert state.execute(f"SELECT COUNT(*) FROM receipts WHERE event IN ({','.join('?'*len(old))})",old).fetchone()[0]==len(old); state.close(); assert server.execute(f"SELECT COUNT(*) FROM event_tombstones WHERE event IN ({','.join('?'*len(old))})",old).fetchone()[0]==len(old)
+    state=connect(a/"remote/state.db"); assert state.execute(f"SELECT COUNT(*) FROM receipts WHERE event IN ({','.join('?'*len(old))})",old).fetchone()[0]==len(old); state.close(); assert server.execute(f"SELECT COUNT(*) FROM event_purges WHERE event IN ({','.join('?'*len(old))})",old).fetchone()[0]==len(old)
     monkeypatch.setattr("ai_convos_remote.request",direct); sync_once(a,True); state=connect(a/"remote/state.db"); assert state.execute(f"SELECT COUNT(*) FROM receipts WHERE event IN ({','.join('?'*len(old))})",old).fetchone()[0]==0; state.close()
+
+
+def test_relay_cannot_fabricate_purge_history_or_mutate_client_state(tmp_path,monkeypatch):
+    server=server_connect(tmp_path/"server.db"); direct=transport(server); monkeypatch.setattr("ai_convos_remote.request",direct); monkeypatch.setattr("ai_convos_remote.drain_hooks",lambda:None); a,b=tmp_path/"a",tmp_path/"b"; _,recovery=setup_client("http://server","alice","laptop",root=a); setup_client("http://server","alice","desktop",recovery,root=b); monkeypatch.delenv("CONVOS_MEMORY_DB",raising=False); monkeypatch.setenv("CONVOS_PROJECT_ROOT",str(a)); created=memory_module.remember_data("relay forgery target","global"); sync_once(a,True); sync_once(b,True); memory_module.forget_data(created["id"],"global"); sync_once(a,True); state=connect(b/"remote/state.db"); ws=workspace(load(b),"Personal"); before=state.execute("SELECT cursor FROM cursors WHERE workspace=?",(ws,)).fetchone()[0]; active=state.execute("SELECT COUNT(*) FROM receipts WHERE kind='memory.canonical' AND status='active'").fetchone()[0]; state.close()
+    def forged(cfg,body,auth=True):
+        result=copy.deepcopy(direct(cfg,body,auth))
+        if body["op"]=="pull":
+            for item in result["events"]:
+                if "purge" in item: item["purge"]["event"]="0"*64
+        return result
+    monkeypatch.setattr("ai_convos_remote.request",forged)
+    state=connect(b/"remote/state.db")
+    with pytest.raises(ValueError,match="purge certificate"): pull(load(b),state,b)
+    state.close()
+    state=connect(b/"remote/state.db"); assert state.execute("SELECT cursor FROM cursors WHERE workspace=?",(ws,)).fetchone()[0]==before and state.execute("SELECT COUNT(*) FROM receipts WHERE kind='memory.canonical' AND status='active'").fetchone()[0]==active and state.execute("SELECT lifecycle FROM sync_states WHERE workspace=?",(ws,)).fetchone()[0]=="blocked"; state.close()
+    monkeypatch.setattr("ai_convos_remote.request",direct); state=connect(b/"remote/state.db"); pull(load(b),state,b); assert not state.execute("SELECT 1 FROM receipts WHERE kind='memory.canonical' AND status='active'").fetchone(); state.close()
+
+
+def test_fresh_remote_state_recovers_signed_purge_without_ciphertext(tmp_path,monkeypatch):
+    server=server_connect(tmp_path/"server.db"); monkeypatch.setattr("ai_convos_remote.request",transport(server)); monkeypatch.setattr("ai_convos_remote.drain_hooks",lambda:None); a,c=tmp_path/"a",tmp_path/"c"; _,recovery=setup_client("http://server","alice","laptop",root=a); monkeypatch.delenv("CONVOS_MEMORY_DB",raising=False); monkeypatch.setenv("CONVOS_PROJECT_ROOT",str(a)); created=memory_module.remember_data("recover deleted history","global"); sync_once(a,True); memory_module.forget_data(created["id"],"global"); sync_once(a,True); setup_client("http://server","alice","fresh",recovery,root=c); monkeypatch.setenv("CONVOS_PROJECT_ROOT",str(c)); sync_once(c,True); state=connect(c/"remote/state.db"); ws=workspace(load(c),"Personal"); assert state.execute("SELECT lifecycle FROM sync_states WHERE workspace=?",(ws,)).fetchone()[0]=="ready" and not state.execute("SELECT 1 FROM sequence_gaps").fetchone() and not state.execute("SELECT 1 FROM receipts WHERE kind='memory.canonical' AND status='active'").fetchone() and state.execute("SELECT 1 FROM receipts WHERE kind='memory.canonical' AND status='deleted'").fetchone(); state.close()
 
 
 def test_device_certificates_reject_relay_key_substitution_without_auto_certifying(tmp_path,monkeypatch):

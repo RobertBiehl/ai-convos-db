@@ -28,8 +28,9 @@ CREATE TABLE IF NOT EXISTS workspace_device_exclusions(workspace TEXT,device TEX
 CREATE TABLE IF NOT EXISTS ledger_cursors(cursor INTEGER PRIMARY KEY AUTOINCREMENT);
 CREATE TABLE IF NOT EXISTS events(cursor INTEGER PRIMARY KEY AUTOINCREMENT,workspace TEXT,event TEXT,author TEXT,epoch INT,seq INT,envelope TEXT,wire_hash TEXT,created REAL,UNIQUE(workspace,event));
 CREATE UNIQUE INDEX IF NOT EXISTS event_author_sequence ON events(workspace,author,seq);
-CREATE TABLE IF NOT EXISTS event_tombstones(workspace TEXT,event TEXT,author TEXT,epoch INT,seq INT,parents TEXT,cursor INT,deleted REAL,PRIMARY KEY(workspace,event));
-CREATE UNIQUE INDEX IF NOT EXISTS tombstone_author_sequence ON event_tombstones(workspace,author,seq);
+CREATE TABLE IF NOT EXISTS event_purges(workspace TEXT,event TEXT,author TEXT,epoch INT,seq INT,superseded_by TEXT,certificate TEXT,cursor INT,deleted REAL,PRIMARY KEY(workspace,event));
+CREATE UNIQUE INDEX IF NOT EXISTS purge_author_sequence ON event_purges(workspace,author,seq);
+CREATE INDEX IF NOT EXISTS purge_anchor ON event_purges(workspace,superseded_by);
 CREATE TABLE IF NOT EXISTS workspace_controls(workspace TEXT,revision INT,state_hash TEXT UNIQUE,state TEXT,PRIMARY KEY(workspace,revision));
 CREATE TABLE IF NOT EXISTS device_proposals(id TEXT PRIMARY KEY,workspace TEXT,base TEXT,target_user TEXT,target_device TEXT,proposal TEXT,not_before REAL,expires REAL,active INT);
 CREATE TABLE IF NOT EXISTS device_votes(proposal TEXT,voter_user TEXT,voter_device TEXT,approve INT,vote TEXT,PRIMARY KEY(proposal,voter_user));
@@ -37,8 +38,8 @@ CREATE TABLE IF NOT EXISTS device_votes(proposal TEXT,voter_user TEXT,voter_devi
 
 def connect(path):
     existed=Path(path).exists() and Path(path).stat().st_size>0; db=sqlite3.connect(path); db.row_factory=sqlite3.Row; old=existed and db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='events'").fetchone()
-    if old and db.execute("PRAGMA user_version").fetchone()[0]!=4: db.close(); raise ValueError("relay database is incompatible; create a fresh relay")
-    db.executescript("PRAGMA journal_mode=WAL;PRAGMA foreign_keys=ON;PRAGMA busy_timeout=30000;"+SCHEMA+"PRAGMA user_version=4;"); return db
+    if old and db.execute("PRAGMA user_version").fetchone()[0]!=5: db.close(); raise ValueError("relay database is incompatible; create a fresh relay")
+    db.executescript("PRAGMA journal_mode=WAL;PRAGMA foreign_keys=ON;PRAGMA secure_delete=ON;PRAGMA busy_timeout=30000;"+SCHEMA+"PRAGMA user_version=5;"); return db
 def token_hash(token): return hashlib.sha256(token.encode()).hexdigest()
 def auth(db, token):
     row = db.execute("SELECT * FROM devices WHERE token_hash=? AND active=1", (token_hash(token or ""),)).fetchone()
@@ -62,13 +63,18 @@ def certify(db,actor,req):
 def rows(db, sql, args=()): return [dict(r) for r in db.execute(sql, args).fetchall()]
 def verify_signed(value,sign_public):
     signature=unb64(value["signature"]); body={k:v for k,v in value.items() if k!="signature"}; Ed25519PublicKey.from_public_bytes(unb64(sign_public)).verify(signature,canon(body)); return value
+PURGE_FIELDS={"v","kind","workspace","event","author","epoch","seq","parents","event_kind","payload_v","superseded_by","signature"}
+def verify_purge(value,actor):
+    if not isinstance(value,dict) or set(value)!=PURGE_FIELDS or value["v"]!=V or value["kind"]!="event.purge" or value["event_kind"]!="memory.canonical" or value["payload_v"]!=1 or value["author"]!=actor["id"] or not isinstance(value["workspace"],str) or any(not isinstance(value[k],str) or len(value[k])!=64 for k in ("event","superseded_by")) or any(not isinstance(value[k],int) or isinstance(value[k],bool) or value[k]<1 for k in ("epoch","seq")) or not isinstance(value["parents"],list) or len(value["parents"])!=(value["seq"]>1) or any(not isinstance(p,str) or len(p)!=64 for p in value["parents"]): raise ValueError("invalid purge certificate")
+    try: return verify_signed(value,actor["sign_public"])
+    except (InvalidSignature,KeyError,TypeError,ValueError) as e: raise PermissionError("invalid purge certificate signature") from e
 def verify_record(value):
     body=verify_certificate(value["certificate"],value["root_public"]); device=value["device"]
     if public_id(value["root_public"])!=value["user"] or public_id(device["sign_public"])!=device["id"] or body["user"]!=value["user"] or body["device"]!=device: raise ValueError("device record mismatch")
     return value
 def control_hash(value): return digest(value)
 def ledger_state(db,ws):
-    values=rows(db,"SELECT cursor,event,author,seq FROM events WHERE workspace=? UNION ALL SELECT cursor,event,author,seq FROM event_tombstones WHERE workspace=?",(ws,ws)); heads={author:{"seq":row["seq"],"event":row["event"]} for author in {r["author"] for r in values} for row in [max((r for r in values if r["author"]==author),key=lambda r:r["seq"])]}; return {"tail":max((r["cursor"] for r in values),default=0),"heads":heads}
+    values=rows(db,"SELECT cursor,event,author,seq FROM events WHERE workspace=? UNION ALL SELECT cursor,event,author,seq FROM event_purges WHERE workspace=?",(ws,ws)); heads={author:{"seq":row["seq"],"event":row["event"]} for author in {r["author"] for r in values} for row in [max((r for r in values if r["author"]==author),key=lambda r:r["seq"])]}; return {"tail":max((r["cursor"] for r in values),default=0),"heads":heads}
 def current_control(db,ws):
     row=db.execute("SELECT state FROM workspace_controls WHERE workspace=? ORDER BY revision DESC LIMIT 1",(ws,)).fetchone(); return json.loads(row[0]) if row else None
 def electorate(state,target): return sorted({d["user"] for d in state["devices"].values() if d["user"]!=target})
@@ -96,7 +102,7 @@ def verify_window(db,request,now):
 def verify_control(db,actor,value,previous=None):
     if value["v"]!=V or value["kind"]!="workspace.state": raise ValueError("unsupported workspace state")
     boundary=value["boundary"]; heads=boundary["heads"]
-    if value["scope"] not in ("personal","team") or len(value["key_commitment"])!=64 or set(boundary)!={"epoch","tail","heads"} or boundary["epoch"]!=value["epoch"] or not isinstance(boundary["tail"],int) or isinstance(boundary["tail"],bool) or boundary["tail"]<0 or not isinstance(heads,dict) or any(set(h)!={"seq","event"} or not isinstance(h["seq"],int) or isinstance(h["seq"],bool) or h["seq"]<1 or not isinstance(h["event"],str) or len(h["event"])!=64 for h in heads.values()) or any(m["role"] not in ("admin","member") for m in value["members"].values()) or any(d["user"] not in value["members"] for d in value["devices"].values()) or set(value["devices"])&set(value["removed"]): raise ValueError("invalid workspace state")
+    if value["scope"] not in ("personal","team") or len(value["key_commitment"])!=64 or set(boundary)!={"epoch","tail","heads"} or boundary["epoch"]!=value["epoch"] or not isinstance(boundary["tail"],int) or isinstance(boundary["tail"],bool) or boundary["tail"]<0 or not isinstance(heads,dict) or any(set(h)!={"seq","event"} or not isinstance(h["seq"],int) or isinstance(h["seq"],bool) or h["seq"]<1 or not isinstance(h["event"],str) or len(h["event"])!=64 for h in heads.values()) or any(m["role"] not in ("admin","member") or not isinstance(m["selected"],list) or len(set(m["selected"]))!=len(m["selected"]) or any(not isinstance(e,str) or len(e)!=64 for e in m["selected"]) for m in value["members"].values()) or any(d["user"] not in value["members"] for d in value["devices"].values()) or set(value["devices"])&set(value["removed"]): raise ValueError("invalid workspace state")
     author=(value["devices"] if previous is None else previous["devices"]).get(value["author"])
     if value["action"]=="personal_recover" and previous is not None: author=value["devices"].get(value["author"])
     if not author or actor["id"]!=value["author"]: raise PermissionError("state author is not authorized")
@@ -123,7 +129,7 @@ def verify_control(db,actor,value,previous=None):
         if action=="quorum_approve": verify_approval(previous,value["approval"],now)
         if action=="personal_recover" and (previous.get("scope")!="personal" or target["user"] not in previous["members"]): raise PermissionError("personal recovery mismatch")
     elif action=="history":
-        if set(value["devices"])!=set(previous["devices"]) or any({k:v for k,v in d.items() if k!="history"}!={k:v for k,v in previous["devices"][i].items() if k!="history"} or previous["devices"][i]["history"] and not d["history"] for i,d in value["devices"].items()) or value["removed"]!=previous["removed"] or value["epoch"]!=previous["epoch"] or value["key_commitment"]!=previous["key_commitment"] or set(value["members"])!=set(previous["members"]) or any((m["role"],m["joined"])!=(previous["members"][u]["role"],previous["members"][u]["joined"]) for u,m in value["members"].items()): raise ValueError("invalid history transition")
+        if set(value["devices"])!=set(previous["devices"]) or any({k:v for k,v in d.items() if k!="history"}!={k:v for k,v in previous["devices"][i].items() if k!="history"} or previous["devices"][i]["history"] and not d["history"] for i,d in value["devices"].items()) or value["removed"]!=previous["removed"] or value["epoch"]!=previous["epoch"] or value["key_commitment"]!=previous["key_commitment"] or set(value["members"])!=set(previous["members"]) or any((m["role"],m["joined"])!=(previous["members"][u]["role"],previous["members"][u]["joined"]) or not set(previous["members"][u]["selected"])<=set(m["selected"]) for u,m in value["members"].items()): raise ValueError("invalid history transition")
     elif action=="history_activate":
         now=time.time()
         if abs(float(value["approved_at"])-now)>CLOCK_SKEW: raise ValueError("approval clock mismatch")
@@ -186,9 +192,34 @@ def store_event(db,actor,env):
         if old["wire_hash"]!=wire: raise ValueError("event id already has different ciphertext")
         return {"cursor":old["cursor"],"created":False}
     if env["epoch"]!=epoch: raise PermissionError("event epoch rejected")
-    if db.execute("SELECT 1 FROM event_tombstones WHERE workspace=? AND event=?",(ws,env["event"])).fetchone(): raise ValueError("event was purged")
-    if (used:=db.execute("SELECT event FROM event_tombstones WHERE workspace=? AND author=? AND seq=?",(ws,env["author"],env["seq"])).fetchone()) and used[0]!=env["event"]: raise ValueError("event author sequence was purged")
+    if db.execute("SELECT 1 FROM event_purges WHERE workspace=? AND event=?",(ws,env["event"])).fetchone(): raise ValueError("event was purged")
+    if (used:=db.execute("SELECT event FROM event_purges WHERE workspace=? AND author=? AND seq=?",(ws,env["author"],env["seq"])).fetchone()) and used[0]!=env["event"]: raise ValueError("event author sequence was purged")
     cursor=db.execute("INSERT INTO ledger_cursors DEFAULT VALUES").lastrowid; db.execute("INSERT INTO events VALUES (?,?,?,?,?,?,?,?,?)",(cursor,ws,env["event"],env["author"],env["epoch"],env["seq"],json.dumps(env),wire,time.time())); return {"cursor":cursor,"created":True}
+def purge_events(db,actor,req):
+    certs=req.get("certificates"); ws=req.get("workspace")
+    if not isinstance(certs,list) or not certs or len(certs)>500: raise ValueError("purge requires 1 to 500 certificates")
+    certs=[verify_purge(value,actor) for value in certs]
+    if any(value["workspace"]!=ws for value in certs) or len({value["event"] for value in certs})!=len(certs) or len({value["seq"] for value in certs})!=len(certs): raise ValueError("purge certificate batch mismatch")
+    device_member(db,ws,actor); targets={value["event"] for value in certs}
+    try:
+        db.execute("BEGIN IMMEDIATE"); selected={event for member_ in current_control(db,ws)["members"].values() for event in member_["selected"]}
+        if db.execute("SELECT kind FROM workspaces WHERE id=?",(ws,)).fetchone()[0]!="personal" or targets&selected or targets&{value["superseded_by"] for value in certs} or any(db.execute("SELECT 1 FROM event_purges WHERE workspace=? AND superseded_by=?",(ws,event)).fetchone() for event in targets): raise PermissionError("event purge denied")
+        fresh=[]
+        for value in certs:
+            encoded=canon(value).decode(); old=db.execute("SELECT certificate FROM event_purges WHERE workspace=? AND event=?",(ws,value["event"])).fetchone()
+            if old:
+                if old[0]!=encoded: raise ValueError("purge certificate conflicts with existing proof")
+                continue
+            row=db.execute("SELECT envelope FROM events WHERE workspace=? AND event=?",(ws,value["event"])).fetchone(); anchor=db.execute("SELECT author,seq FROM events WHERE workspace=? AND event=?",(ws,value["superseded_by"])).fetchone()
+            if not row or not anchor or anchor["author"]!=value["author"] or anchor["seq"]<=value["seq"]: raise PermissionError("event purge denied")
+            env=json.loads(row["envelope"])
+            if {k:env[k] for k in ("workspace","event","author","epoch","seq","parents")}!={k:value[k] for k in ("workspace","event","author","epoch","seq","parents")}: raise ValueError("purge certificate does not match event envelope")
+            fresh.append((value,encoded))
+        for value,encoded in fresh:
+            cursor=db.execute("INSERT INTO ledger_cursors DEFAULT VALUES").lastrowid; db.execute("INSERT INTO event_purges VALUES (?,?,?,?,?,?,?,?,?)",(ws,value["event"],value["author"],value["epoch"],value["seq"],value["superseded_by"],encoded,cursor,time.time()))
+        if fresh: db.execute(f"DELETE FROM events WHERE workspace=? AND event IN ({','.join('?'*len(fresh))})",(ws,*(value["event"] for value,encoded in fresh)))
+        db.commit(); return {"purged":len(certs)}
+    except BaseException: db.rollback(); raise
 
 def action(db, req, token=None):
     op = req["op"]
@@ -244,20 +275,14 @@ def action(db, req, token=None):
     if op == "upload_many":
         if len(req["envelopes"])>500: raise ValueError("upload batch limit is 500")
         result=[store_event(db,actor,env) for env in req["envelopes"]]; db.commit(); return {"events":result}
-    if op == "purge":
-        ids=req.get("events"); ws=req.get("workspace")
-        if not isinstance(ids,list) or not ids or len(ids)>500 or len(set(ids))!=len(ids) or any(not isinstance(e,str) for e in ids): raise ValueError("purge requires 1 to 500 unique event ids")
-        device_member(db,ws,actor); kind=db.execute("SELECT kind FROM workspaces WHERE id=?",(ws,)).fetchone()[0]; found={r["event"]:r|{"parents":json.loads(r["envelope"])["parents"]} for r in rows(db,f"SELECT event,author,epoch,seq,cursor,envelope FROM events WHERE workspace=? AND event IN ({','.join('?'*len(ids))})",(ws,*ids))}|{r["event"]:r|{"parents":json.loads(r["parents"])} for r in rows(db,f"SELECT event,author,epoch,seq,cursor,parents FROM event_tombstones WHERE workspace=? AND event IN ({','.join('?'*len(ids))})",(ws,*ids))}
-        selected={event for member_ in current_control(db,ws)["members"].values() for event in member_["selected"]}
-        if kind!="personal" or set(ids)&selected or any(not (r:=found.get(e)) or r["author"]!=actor["id"] for e in ids): raise PermissionError("event purge denied")
-        [db.execute("INSERT OR IGNORE INTO event_tombstones VALUES (?,?,?,?,?,?,?,?)",(ws,e,found[e]["author"],found[e]["epoch"],found[e]["seq"],json.dumps(found[e]["parents"]),db.execute("INSERT INTO ledger_cursors DEFAULT VALUES").lastrowid,time.time())) for e in ids if not db.execute("SELECT 1 FROM event_tombstones WHERE workspace=? AND event=?",(ws,e)).fetchone()]; db.execute(f"DELETE FROM events WHERE workspace=? AND event IN ({','.join('?'*len(ids))})",(ws,*ids)); db.commit(); return {"purged":len(ids)}
+    if op == "purge": return purge_events(db,actor,req)
     if op == "pull":
         ws=req["workspace"]; m=device_member(db,ws,actor); limit=req.get("limit",500)
         if not isinstance(limit,int) or isinstance(limit,bool) or not 1<=limit<=500: raise ValueError("pull limit must be 1 to 500")
         access="workspace=? AND epoch>=? AND EXISTS(SELECT 1 FROM key_envelopes k WHERE k.workspace=x.workspace AND k.epoch=x.epoch AND k.device=?)"; args=(ws,m["history_from"],actor["id"])
-        bounds=db.execute(f"SELECT MIN(cursor),MAX(cursor) FROM (SELECT cursor,workspace,epoch FROM events x WHERE {access} UNION ALL SELECT cursor,workspace,epoch FROM event_tombstones x WHERE {access})",args+args).fetchone(); floor,tail=(bounds[0] or 0),(bounds[1] or 0)
-        out=rows(db,f"SELECT * FROM (SELECT cursor,event,author,seq,NULL parents,envelope,LENGTH(envelope) size,0 tombstone FROM events x WHERE {access} AND cursor>? UNION ALL SELECT cursor,event,author,seq,parents,NULL envelope,0 size,1 tombstone FROM event_tombstones x WHERE {access} AND cursor>?) ORDER BY cursor LIMIT ?",args+(req.get("after",0),)+args+(req.get("after",0),limit))
-        return {"floor":floor,"tail":tail,"events":[{"cursor":r["cursor"],**({"tombstone":True,"event":r["event"],"author":r["author"],"seq":r["seq"],"parents":json.loads(r["parents"])} if r["tombstone"] else {"lazy":True,"event":r["event"],"size":r["size"]} if r["size"]>65536 else {"envelope":json.loads(r["envelope"])})} for r in out]}
+        bounds=db.execute(f"SELECT MIN(cursor),MAX(cursor) FROM (SELECT cursor,workspace,epoch FROM events x WHERE {access} UNION ALL SELECT cursor,workspace,epoch FROM event_purges x WHERE {access})",args+args).fetchone(); floor,tail=(bounds[0] or 0),(bounds[1] or 0)
+        out=rows(db,f"SELECT * FROM (SELECT cursor,event,envelope,LENGTH(envelope) size,NULL certificate FROM events x WHERE {access} AND cursor>? UNION ALL SELECT cursor,event,NULL envelope,0 size,certificate FROM event_purges x WHERE {access} AND cursor>?) ORDER BY cursor LIMIT ?",args+(req.get("after",0),)+args+(req.get("after",0),limit))
+        return {"floor":floor,"tail":tail,"events":[{"cursor":r["cursor"],**({"purge":json.loads(r["certificate"])} if r["certificate"] else {"lazy":True,"event":r["event"],"size":r["size"]} if r["size"]>65536 else {"envelope":json.loads(r["envelope"])})} for r in out]}
     if op == "fetch":
         m=device_member(db,req["workspace"],actor); row=db.execute("SELECT cursor,envelope FROM events WHERE workspace=? AND event=? AND epoch>=? AND EXISTS(SELECT 1 FROM key_envelopes k WHERE k.workspace=events.workspace AND k.epoch=events.epoch AND k.device=?)",(req["workspace"],req["event"],m["history_from"],actor["id"])).fetchone()
         if not row: raise ValueError("event not found")
@@ -287,9 +312,9 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args): pass
     def send(self, status, value):
         body = canon(value); self.send_response(status); self.send_header("Content-Type","application/json"); self.send_header("Content-Length",str(len(body))); self.end_headers(); self.wfile.write(body)
-    def do_GET(self): self.send(200,{"ok":True,"version":2}) if self.path == "/v2/health" else self.send(404,{"error":"not found"})
+    def do_GET(self): self.send(200,{"ok":True,"version":3}) if self.path == "/v3/health" else self.send(404,{"error":"not found"})
     def do_POST(self):
-        if self.path!="/v2": self.send(404,{"error":"protocol v2 endpoint required"}); return
+        if self.path!="/v3": self.send(404,{"error":"protocol v3 endpoint required"}); return
         try:
             length=int(self.headers.get("Content-Length","0"))
             if length>64*1024*1024: raise ValueError("request exceeds 64 MiB")

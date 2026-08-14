@@ -10,10 +10,10 @@ from ai_convos.cli import ARCHIVE_COLUMNS as COLUMNS, PROVENANCE_KINDS as PROVEN
 from ai_convos_changegraph.provenance import query as graph_query
 from .protocol import digest
 
-STATE_VERSION="6"
+STATE_VERSION="7"
 STATE = """
-CREATE TABLE IF NOT EXISTS outbox(workspace TEXT,event TEXT,entity TEXT,revision TEXT,author TEXT,seq INT,epoch INT,kind TEXT,status TEXT,path TEXT,size INT,PRIMARY KEY(workspace,event)) WITHOUT ROWID;
-CREATE TABLE IF NOT EXISTS receipts(workspace TEXT,event TEXT,cursor INT,author TEXT,seq INT,epoch INT,kind TEXT,entity TEXT,revision TEXT,status TEXT,PRIMARY KEY(workspace,event)) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS outbox(workspace TEXT,event TEXT,entity TEXT,revision TEXT,author TEXT,seq INT,epoch INT,kind TEXT,payload_v INT,status TEXT,path TEXT,size INT,PRIMARY KEY(workspace,event)) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS receipts(workspace TEXT,event TEXT,cursor INT,author TEXT,seq INT,epoch INT,kind TEXT,payload_v INT,entity TEXT,revision TEXT,status TEXT,PRIMARY KEY(workspace,event)) WITHOUT ROWID;
 CREATE INDEX IF NOT EXISTS receipt_cursor ON receipts(workspace,cursor);
 CREATE TABLE IF NOT EXISTS history_sources(workspace TEXT,event TEXT,carrier TEXT,PRIMARY KEY(workspace,event)) WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS history_queue(workspace TEXT,target TEXT,event TEXT,PRIMARY KEY(workspace,target,event)) WITHOUT ROWID;
@@ -91,7 +91,7 @@ def connect(path):
 @lru_cache(maxsize=1)
 def bridges():
     result=[entry.load()() for entry in entry_points(group="convos.remote")]
-    if any(set(b)!={"v","events","records","project","purges"} or b["v"]!=3 or isinstance(b["v"],bool) or any(not callable(b[k]) for k in ("records","project","purges")) or any(not isinstance(e,tuple) or len(e)!=2 or not isinstance(e[0],str) or not isinstance(e[1],int) or isinstance(e[1],bool) or e[1]<1 for e in b["events"]) for b in result): raise ValueError("Unsupported remote bridge")
+    if any(set(b)!={"v","events","records","project","purges"} or b["v"]!=4 or isinstance(b["v"],bool) or any(not callable(b[k]) for k in ("records","project","purges")) or any(not isinstance(e,tuple) or len(e)!=2 or not isinstance(e[0],str) or not isinstance(e[1],int) or isinstance(e[1],bool) or e[1]<1 for e in b["events"]) for b in result): raise ValueError("Unsupported remote bridge")
     return result
 def event_support(value):
     kind,version=value["kind"],value["payload_v"]
@@ -99,7 +99,10 @@ def event_support(value):
     installed={event for bridge in bridges() for event in bridge["events"]}
     return "supported" if (kind,version) in CORE_EVENTS or (kind,version) in installed else "optional" if kind in AUXILIARY_EVENTS and not any(event[0]==kind for event in installed) else "required"
 def bridge_records(root,state,workspace,kind): return [record for bridge in bridges() for record in bridge["records"](root,state,workspace,kind)]
-def bridge_purges(root,state,workspace,kind): return sorted({event for bridge in bridges() for event in bridge["purges"](root,state,workspace,kind)})
+def bridge_purges(root,state,workspace,kind):
+    values=[value for bridge in bridges() for value in bridge["purges"](root,state,workspace,kind)]
+    if any(not isinstance(v,dict) or set(v)!={"event","superseded_by"} or any(not isinstance(v[k],str) or len(v[k])!=64 for k in v) or v["event"]==v["superseded_by"] for v in values): raise ValueError("invalid remote purge intent")
+    return [dict(event=e,superseded_by=s) for e,s in sorted({(v["event"],v["superseded_by"]) for v in values})]
 def clean(v):
     if isinstance(v,(datetime,date)): return v.isoformat()
     if isinstance(v,dict): return {k:clean(x) for k,x in v.items()}

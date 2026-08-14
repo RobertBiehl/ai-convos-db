@@ -106,9 +106,10 @@ The relay owns durable opaque envelopes and encrypted blobs. It reports:
 - the earliest retained cursor available to the requesting device;
 - event envelopes or lazy manifests after a cursor;
 - exact envelope fetch by event ID;
-- opaque replay-denial tombstones where projection-producing bodies were
-  removed. Their author sequence participates in the next signed ledger
-  boundary; the tombstone itself is not a client signature.
+- self-contained author-signed purge certificates where eligible personal
+  memory bodies were removed. Each certificate binds the original envelope
+  header to a retained later signed deletion event, closes the original author
+  sequence only after client verification, and permanently denies replay.
 
 The relay never interprets payloads. Server database and blob storage are one
 backup unit.
@@ -325,7 +326,7 @@ idempotent schema initializer, which adds provenance, origins, and
 tables. This is the frictionless user-data migration path and is covered by a
 preservation test.
 
-Remote state schema 6 has no compatibility transform in this pre-stability
+Remote state schema 7 has no compatibility transform in this pre-stability
 release.
 Inspection and doctor are side-effect-free. An absent state is initialized as
 empty metadata. A mutating sync handles an incompatible or damaged regular
@@ -348,8 +349,8 @@ Historical canonical facts stranded in a legacy state remain recoverable from
 that bundle; this cutover does not make Remote or Changegraph parse the old
 schema.
 
-The relay protocol itself is not migrated. Client and server v2, backed by a
-fresh relay database at SQLite `user_version=4`, are deployed together after
+The relay protocol itself is not migrated. Client and server v3, backed by a
+fresh relay database at SQLite `user_version=5`, are deployed together after
 old workers are stopped.
 
 ## Product behavior

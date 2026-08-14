@@ -5,8 +5,8 @@ from cryptography.exceptions import InvalidSignature, InvalidTag
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
 from ai_convos_remote.protocol import (b64, certificate, digest, event, fingerprint, identity, open_event, open_key,
-                                       material_event, public, recover, recovery_bundle, seal_event, seal_history, seal_key, verify_certificate,
-                                       verify_event)
+                                       material_event, public, purge_certificate, recover, recovery_bundle, seal_event, seal_history, seal_key,
+                                       verify_certificate, verify_event, verify_purge)
 
 def fixed_identity():
     sign, box = Ed25519PrivateKey.from_private_bytes(bytes(range(32))), X25519PrivateKey.from_private_bytes(bytes(range(32, 64)))
@@ -49,6 +49,14 @@ def test_replay_under_another_identity_and_payload_mutation_rejected():
     with pytest.raises((InvalidSignature, ValueError)): verify_event(forged, a["sign_public"])
     changed = copy.deepcopy(value); changed["payload"]["unknown"] = False
     with pytest.raises((InvalidSignature, ValueError)): verify_event(changed, a["sign_public"])
+
+
+def test_purge_certificate_is_deterministic_and_every_field_is_signed():
+    device=identity("author"); target={"event":"a"*64,"author":device["id"],"epoch":2,"seq":3,"kind":"memory.canonical","payload_v":1}; anchor={"event":"b"*64}; proof=purge_certificate(device,"workspace",target,["c"*64],anchor)
+    assert proof==purge_certificate(device,"workspace",target,["c"*64],anchor) and verify_purge(proof,device["sign_public"])==proof
+    changes={"workspace":"other","event":"d"*64,"author":"e"*32,"epoch":3,"seq":4,"parents":["f"*64],"event_kind":"message.record","payload_v":2,"superseded_by":"0"*64}
+    for field,value in changes.items():
+        with pytest.raises(ValueError,match="purge certificate"): verify_purge({**proof,field:value},device["sign_public"])
 
 
 def test_nested_history_verifies_self_certifying_authors():
