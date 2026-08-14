@@ -307,6 +307,12 @@ events, and last successful synchronization.
 
 ## Backup and restore
 
+Relay backups are optional recovery acceleration and preservation of the old
+workspace authority, not canonical archive backups. Surviving authorized peers
+can rebuild current rows, proofs, and blobs on a fresh relay. Until the memory
+semantic-proof cutover, a backup is still required to preserve the exact legacy
+memory event and purge ledger across total relay loss.
+
 Back up a consistent server snapshot while it is running:
 
 ```bash
@@ -318,10 +324,10 @@ convos-server backup \
 Restore by stopping the relay, replacing its database with the snapshot, and
 starting it again. The backup contains ciphertext, ACL metadata, key envelopes,
 and delivery cursors, but no workspace key. Clients can safely retry uploads and
-pulls after rollback because event insertion and local projection are
+pulls after rollback because replica insertion and local projection are
 idempotent. Signed history checkpoints detect a restored relay that is missing
-an already-bound prefix; without gossip, a newest suffix after the latest signed
-boundary can still be withheld.
+an already-bound auxiliary-event prefix; without gossip, a newest suffix after
+the latest signed boundary can still be withheld.
 
 A backup taken before a memory forget operation still contains the older
 encrypted events and predates their signed purge certificates. Treat relay-backup

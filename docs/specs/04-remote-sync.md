@@ -25,23 +25,26 @@ owner or boundary of a conversation, changeset, repository, or file lineage.
 ## Architecture and trust boundary
 
 ```text
-provider transcripts -> canonical convos DuckDB -> event projector -> encrypted outbox
-                               |                                |              |
-                       typed graph views                    HTTPS relay
-                                                                  |
-                                                          opaque event store
-                                                                  |
-             canonical convos DuckDB <- event projector <- encrypted inbox
+provider transcripts -> canonical convos DuckDB -> proof/replica encoder -> encrypted outbox
+                               |                                  |              |
+                       typed graph views                       HTTPS relay
+                                                                    |
+                                                        opaque delivery cache
+                                                                    |
+             canonical convos DuckDB <- verified projector <- encrypted replicas
 ```
 
 - DuckDB is the canonical local archive and typed provenance store, not a wire
   format.
 - Changegraph is a read-only typed view over DuckDB; there is no second graph
   database.
-- Signed events are durable evidence, except for the narrow personal-memory
-  privacy purge defined below.
+- Logical-row origin proofs are durable peer-held evidence. Workspace controls
+  and the current memory adapter still use signed events; memory purge
+  certificates are transitional relay-held evidence.
 - The server stores ciphertext, public device records, workspace ACLs, key
   envelopes, opaque event headers, cursors, invitation state, and quotas.
+- The server accelerates delivery and recovery but is not canonical archive
+  storage. Authorized peers can rebuild retained rows, proofs, and blobs.
 - Semantic search, embeddings, Git inspection, and graph queries execute only
   on authorized clients.
 
@@ -278,9 +281,12 @@ CLI.
 - Hooks enqueue only local identifiers and return without network or Git work.
 - Background workers scan, enrich, encrypt, upload, pull, verify, and project.
 - Retrieval never waits for the network.
-- Explicit sync reconciles the full local archive with the event ledger.
-- Server database and blob directory are backed up together from a consistent
-  snapshot and restored without decryption.
+- Explicit sync inventories retained row proofs and blobs against the relay;
+  auxiliary controls and memory records still reconcile through the event
+  ledger.
+- Server database and blob directory may be backed up together from a
+  consistent snapshot for fast restoration, but are not canonical row
+  authority.
 - Forget does not rewrite historical client or relay backups. Operators must
   choose and enforce backup retention appropriate to their deletion policy.
 - Real archives and evaluation datasets remain local and untracked.
