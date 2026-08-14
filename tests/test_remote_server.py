@@ -152,7 +152,9 @@ def test_registration_rejects_public_key_identity_mismatch(tmp_path):
 
 
 def test_registration_requires_fresh_device_key_proof_and_consumes_challenge(tmp_path):
-    db=connect(tmp_path/"server.db"); root,device,attacker=identity("root"),identity("device"),identity("attacker"); cert=certificate(root,root["id"],device); base={"root_public":root["sign_public"],"certificate":cert}; challenge=action(db,{"op":"register_challenge",**base})["challenge"]; proof=registration_proof(device,challenge,root["sign_public"],cert); forged={**registration_proof(attacker,challenge,root["sign_public"],cert),"device":device["id"]}; request={"op":"register","user_name":"alice",**base,"challenge":challenge}
+    path=tmp_path/"server.db"; db=connect(path); root,device,attacker=identity("root"),identity("device"),identity("attacker"); cert=certificate(root,root["id"],device); base={"root_public":root["sign_public"],"certificate":cert}; challenge=action(db,{"op":"register_challenge",**base})["challenge"]; proof=registration_proof(device,challenge,root["sign_public"],cert); forged={**registration_proof(attacker,challenge,root["sign_public"],cert),"device":device["id"]}; request={"op":"register","user_name":"alice",**base,"challenge":challenge}
     with pytest.raises(PermissionError,match="registration proof"): action(db,{**request,"proof":forged})
+    db.close(); db=connect(path)
     assert action(db,{**request,"proof":proof})["device"]==device["id"]
+    db.close(); db=connect(path)
     with pytest.raises(PermissionError,match="already used"): action(db,{**request,"proof":proof})

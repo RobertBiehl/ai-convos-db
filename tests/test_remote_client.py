@@ -421,6 +421,32 @@ def test_relay_clock_enforces_proposal_delay(tmp_path,monkeypatch):
     with pytest.raises(ValueError,match="active"): approve_device(load(b),team,recovered["device"]["id"],root=b)
 
 
+@pytest.mark.parametrize("kind,direction,when",[(kind,direction,when) for kind in ("row","blob") for direction in ("upload","pull") for when in ("before","after")])
+def test_replication_boundary_crash_matrix_converges_after_restart(tmp_path,monkeypatch,kind,direction,when):
+    server=server_connect(tmp_path/"server.db"); direct=transport(server); monkeypatch.setattr("ai_convos_remote.request",direct); monkeypatch.setattr("ai_convos_remote.drain_hooks",lambda:None); a,b=tmp_path/"a",tmp_path/"b"; alice,recovery=setup_client("http://server","alice",root=a); data=a/"data"; data.mkdir(); db=duckdb.connect(str(data/"convos.db")); init_schema(db); db.execute("INSERT INTO conversations VALUES ('c','codex','crash matrix','2026-01-01','2026-01-01',NULL,NULL,NULL,NULL,'{}')")
+    payload=b"restart-safe attachment"
+    if kind=="blob":
+        source=tmp_path/"attachment.bin"; source.write_bytes(payload); db.execute("INSERT INTO messages VALUES ('m','c','user','attached',NULL,'2026-01-01',NULL,'{}',NULL,NULL)"); db.execute("INSERT INTO attachments VALUES ('a','m','attachment.bin','application/octet-stream',?,?,NULL,'2026-01-01')",(len(payload),str(source))); index_attachment_body(db,"a",source,len(payload))
+    db.close(); fired=[False]
+    if direction=="upload":
+        op="replica_upload_many" if kind=="row" else "blob_upload"
+        def cut(cfg,body,auth=True):
+            if body["op"]==op and not fired[0]: fired[0]=True; when=="before" and (_ for _ in ()).throw(ConnectionError("boundary crash")); direct(cfg,body,auth); raise ConnectionError("boundary crash")
+            return direct(cfg,body,auth)
+        monkeypatch.setattr("ai_convos_remote.request",cut)
+        with pytest.raises(ConnectionError,match="boundary crash"): sync_once(a,True)
+        monkeypatch.setattr("ai_convos_remote.request",direct); sync_once(a,True)
+    else:
+        sync_once(a,True); desktop,_=setup_client("http://server","alice","desktop",recovery,root=b); name="apply_row_replicas" if kind=="row" else "project_attachment_body"; real=getattr(remote_client,name)
+        def cut(*args,**kwargs):
+            if not fired[0]: fired[0]=True; when=="before" and (_ for _ in ()).throw(ConnectionError("boundary crash")); real(*args,**kwargs); raise ConnectionError("boundary crash")
+            return real(*args,**kwargs)
+        monkeypatch.setattr(remote_client,name,cut)
+        with pytest.raises(ConnectionError,match="boundary crash"): sync_once(b,True)
+        monkeypatch.setattr(remote_client,name,real); sync_once(b,True); db=duckdb.connect(str(b/"data/convos.db"),read_only=True); assert db.execute("SELECT title FROM conversations").fetchone()[0]=="crash matrix"; path=db.execute("SELECT path FROM attachments").fetchone()[0] if kind=="blob" else None; db.close(); assert path is None or Path(path).read_bytes()==payload
+    assert fired[0] and server.execute("SELECT COUNT(*) FROM row_replicas").fetchone()[0]==(1 if kind=="row" else 3) and server.execute("SELECT COUNT(*) FROM blob_replicas").fetchone()[0]==(kind=="blob")
+
+
 def test_lost_upload_response_and_interrupted_pull_recover_idempotently(tmp_path,monkeypatch):
     server=server_connect(tmp_path/"server.db"); direct=transport(server); monkeypatch.setattr("ai_convos_remote.request",direct); a,b=tmp_path/"a",tmp_path/"b"; alice,recovery=setup_client("http://server","alice",root=a); desktop,_=setup_client("http://server","alice","desktop",recovery,root=b); alice=load(a); ws=workspace(alice,"Personal"); state_a,state_b=connect(a/"remote/state.db"),connect(b/"remote/state.db"); baseline=server.execute("SELECT COUNT(*) FROM events").fetchone()[0]; publish(alice,state_a,ws,policy("crash safe"),a)
     def lost(cfg,body,auth=True):
