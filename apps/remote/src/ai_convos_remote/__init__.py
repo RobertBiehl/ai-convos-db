@@ -256,25 +256,31 @@ def pull_origins(cfg,state,root,ws):
     except BaseException: core.execute("ROLLBACK"); state.rollback(); raise
     finally: core.close()
 def pull_row_replicas(cfg,state,root,ws,recover=None,origins=()):
-    sid=ws["id"]; stamp=bridge_stamp(root); saved=(state.execute("SELECT value FROM meta WHERE key=?",(f"replica_projection:{sid}",)).fetchone() or [None])[0]; reset=saved!=stamp; after=0 if reset else int((state.execute("SELECT value FROM meta WHERE key=?",(f"replica_cursor:{sid}",)).fetchone() or [0])[0]); cursor,total=after,0; dependencies={r[0] for r in state.execute("SELECT origin FROM control_dependencies WHERE workspace=?",(sid,)).fetchall()}; controls=ws["controls"]+stored_controls(core_path(root),set(origins)|dependencies); known=set() if reset else {(r[0],r[1]) for r in state.execute("SELECT replica,epoch FROM replica_receipts WHERE workspace=?",(sid,)).fetchall()}; checked=recover is None or not known
+    sid=ws["id"]; stamp=bridge_stamp(root); saved=(state.execute("SELECT value FROM meta WHERE key=?",(f"replica_projection:{sid}",)).fetchone() or [None])[0]; reset=saved!=stamp; after=0 if reset else int((state.execute("SELECT value FROM meta WHERE key=?",(f"replica_cursor:{sid}",)).fetchone() or [0])[0]); cursor,total=after,0; dependencies={r[0] for r in state.execute("SELECT origin FROM control_dependencies WHERE workspace=?",(sid,)).fetchall()}; controls=ws["controls"]+stored_controls(core_path(root),set(origins)|dependencies); known=set() if reset else {(r[0],r[1]) for r in state.execute("SELECT replica,epoch FROM replica_receipts WHERE workspace=?",(sid,)).fetchall()}; valid=set(known); invalid={}; checked=recover is None or not known
     while True:
         result=request(cfg,{"op":"replica_pull","workspace":sid,"after":cursor,"limit":500}); floor,tail=result["floor"],result["tail"]
         if not all(isinstance(v,int) and not isinstance(v,bool) and v>=0 for v in (floor,tail)) or floor>tail and tail: raise ValueError("relay replica cursor window is invalid")
-        if cursor>tail: cursor=after=0; known=set(); state.execute("DELETE FROM meta WHERE key=?",(f"replica_cursor:{sid}",)); state.execute("INSERT OR REPLACE INTO meta VALUES (?,?)",(f"replica_repair:{sid}","1")); state.commit(); continue
+        if cursor>tail: cursor=after=0; known=set(); valid=set(); invalid={}; state.execute("DELETE FROM meta WHERE key=?",(f"replica_cursor:{sid}",)); state.execute("INSERT OR REPLACE INTO meta VALUES (?,?)",(f"replica_repair:{sid}","1")); state.commit(); continue
         if not checked and result["replicas"]:
-            fields=("workspace","authorization_workspace","row_kind","row_id","encoding_v","content_hash","revision","previous_revision","state","author_user_id","author_device_id","authorization_epoch","signature"); core=open_db(core_path(root),True); proofs=[{"v":1,"kind":"row.proof",**dict(zip(fields,r))} for r in core.execute("SELECT workspace_id,authorization_workspace_id,row_kind,source_row_id,encoding_v,content_hash,revision,previous_revision,state,author_user_id,author_device_id,authorization_epoch,signature FROM remote.row_proofs").fetchall()]; core.close(); epochs={r[1] for r in known}; known&={(fingerprint(key(cfg,sid,epoch),digest(proof)),epoch) for proof in proofs for epoch in epochs}; checked=True
+            fields=("workspace","authorization_workspace","row_kind","row_id","encoding_v","content_hash","revision","previous_revision","state","author_user_id","author_device_id","authorization_epoch","signature"); core=open_db(core_path(root),True); proofs=[{"v":1,"kind":"row.proof",**dict(zip(fields,r))} for r in core.execute("SELECT workspace_id,authorization_workspace_id,row_kind,source_row_id,encoding_v,content_hash,revision,previous_revision,state,author_user_id,author_device_id,authorization_epoch,signature FROM remote.row_proofs").fetchall()]; core.close(); epochs={r[1] for r in known}; known&={(fingerprint(key(cfg,sid,epoch),digest(proof)),epoch) for proof in proofs for epoch in epochs}; valid=set(known); checked=True
         opened=[]; received=[]
         for item in result["replicas"]:
             env=item["envelope"]
             if not isinstance(item["cursor"],int) or isinstance(item["cursor"],bool) or not cursor<item["cursor"]<=tail or env["workspace"]!=sid or not access_from(cfg,sid)<=env["epoch"]<=cfg["controls"][sid]["epoch"]: raise ValueError("row replica envelope response mismatch")
-            cursor=item["cursor"]; received.append(item)
-            if (env["replica"],env["epoch"]) not in known: opened.append((item,open_replica(env,key(cfg,sid,env["epoch"]))))
+            cursor=item["cursor"]; received.append(item); identity=(env["replica"],env["epoch"])
+            if identity not in valid:
+                try: body=open_replica(env,key(cfg,sid,env["epoch"]))
+                except ValueError: invalid.setdefault(identity,item["cursor"])
+                else: opened.append((item,body)); valid.add(identity); invalid.pop(identity,None)
         accepted=apply_row_replicas(core_path(root),[body for item,body in opened],sid,controls,recover,cfg["user"],root=root); accepted_keys={(item["envelope"]["replica"],item["envelope"]["epoch"]) for (item,body),ok in zip(opened,accepted) if body["proof"]["kind"]=="row.proof" or ok}
+        known|=accepted_keys
         for item in received:
             env=item["envelope"]
             if (env["replica"],env["epoch"]) in known|accepted_keys: state.execute("INSERT OR REPLACE INTO replica_receipts VALUES (?,?,?,?)",(sid,env["replica"],env["epoch"],item["cursor"]))
-        after=cursor; total+=len(received); state.execute("INSERT OR REPLACE INTO meta VALUES (?,?),(?,?)",(f"replica_cursor:{sid}",str(after),f"replica_projection:{sid}",stamp)); state.commit()
-        if cursor>=tail: return total
+        after=min(invalid.values())-1 if invalid else cursor; total+=len(received); state.execute("INSERT OR REPLACE INTO meta VALUES (?,?),(?,?)",(f"replica_cursor:{sid}",str(after),f"replica_projection:{sid}",stamp)); state.commit()
+        if cursor>=tail:
+            if invalid: raise ValueError(f"invalid row replica: no valid delivery copy for {len(invalid)} object(s)")
+            return total
         if not result["replicas"]: raise ValueError("relay replica tail cannot be reached")
 def pull_blobs(cfg,state,root,ws,recover=None):
     sid=ws["id"]; after=int((state.execute("SELECT value FROM meta WHERE key=?",(f"blob_cursor:{sid}",)).fetchone() or [0])[0]); total=0; known={(r[0],r[1]) for r in state.execute("SELECT blob,epoch FROM blob_receipts WHERE workspace=?",(sid,)).fetchall()}; checked=recover is None or not known

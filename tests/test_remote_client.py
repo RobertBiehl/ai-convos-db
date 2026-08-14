@@ -11,7 +11,7 @@ from ai_convos_remote import (_upload_batches, add_member, approve_device, appro
                               request_device, request_history, rescue_bindings, setup_client, sync_once, upload, workspace)
 from ai_convos_remote.control import sign as control_sign, vote as device_vote
 from ai_convos_remote.projection import inspect_state, scan
-from ai_convos_remote.protocol import certificate, event, identity, logical_row, seal_event, seal_key, sign_control, unb64
+from ai_convos_remote.protocol import certificate, event, identity, logical_row, open_replica, seal_event, seal_key, seal_replica, sign_control, unb64
 from ai_convos_remote_server import action, connect as server_connect
 
 
@@ -187,6 +187,15 @@ def test_relay_cannot_fabricate_semantic_replica_or_mutate_memory(tmp_path,monke
     state.close()
     state=connect(b/"remote/state.db"); assert state.execute("SELECT lifecycle FROM sync_states WHERE workspace=?",(ws,)).fetchone()[0]=="blocked"; state.close(); db=sqlite3.connect(b/"memory/state.db"); assert not db.execute("SELECT 1 FROM canonicals").fetchone() and not db.execute("SELECT 1 FROM remote_semantics").fetchone(); db.close()
     monkeypatch.setattr("ai_convos_remote.request",direct); state=connect(b/"remote/state.db"); pull(load(b),state,b); state.close(); assert sqlite3.connect(b/"memory/state.db").execute("SELECT content FROM canonicals").fetchone()==("relay forgery target",)
+
+
+def test_later_uploader_copy_heals_poisoned_replica_across_pages(tmp_path,monkeypatch):
+    server=server_connect(tmp_path/"server.db"); direct=transport(server); monkeypatch.setattr("ai_convos_remote.request",direct); monkeypatch.setattr("ai_convos_remote.drain_hooks",lambda:None); a,b=tmp_path/"a",tmp_path/"b"; _,recovery=setup_client("http://server","alice","laptop",root=a); setup_client("http://server","alice","desktop",recovery,root=b); monkeypatch.delenv("CONVOS_MEMORY_DB",raising=False); monkeypatch.setenv("CONVOS_PROJECT_ROOT",str(a)); memory_module.remember_data("healed delivery copy","global"); sync_once(a,True); cfg=load(b); ws=workspace(cfg,"Personal"); poison_cursor,raw=server.execute("SELECT cursor,envelope FROM row_replicas ORDER BY cursor").fetchone(); original=json.loads(raw); body=open_replica(original,key(cfg,ws,original["epoch"])); repaired=seal_replica(body["row"],body["proof"],ws,original["epoch"],key(cfg,ws,original["epoch"]),cfg["device"]["id"]); original["ciphertext"]=("A" if original["ciphertext"][0]!="A" else "B")+original["ciphertext"][1:]; server.execute("UPDATE row_replicas SET envelope=?",(json.dumps(original),)); server.commit()
+    def paged(cfg,request_,auth=True): return direct(cfg,request_|({"limit":1} if request_["op"]=="replica_pull" else {}),auth)
+    monkeypatch.setattr("ai_convos_remote.request",paged); state=connect(b/"remote/state.db")
+    with pytest.raises(ValueError,match="no valid delivery copy"): pull(cfg,state,b)
+    assert state.execute("SELECT value FROM meta WHERE key=?",(f"replica_cursor:{ws}",)).fetchone()[0]==str(poison_cursor-1) and state.execute("SELECT lifecycle FROM sync_states WHERE workspace=?",(ws,)).fetchone()[0]=="blocked" and not state.execute("SELECT 1 FROM replica_receipts").fetchone(); action(server,{"op":"replica_upload_many","envelopes":[repaired]},cfg["token"]); pull(cfg,state,b); tail=server.execute("SELECT MAX(cursor) FROM row_replicas").fetchone()[0]
+    assert state.execute("SELECT value FROM meta WHERE key=?",(f"replica_cursor:{ws}",)).fetchone()[0]==str(tail) and state.execute("SELECT COUNT(*) FROM replica_receipts").fetchone()[0]==1 and state.execute("SELECT lifecycle FROM sync_states WHERE workspace=?",(ws,)).fetchone()[0]=="ready"; pull(cfg,state,b); state.close(); db=sqlite3.connect(b/"memory/state.db"); assert db.execute("SELECT content FROM canonicals").fetchall()==[("healed delivery copy",)] and db.execute("SELECT COUNT(*) FROM remote_semantics").fetchone()[0]==1; db.close()
 
 
 def test_fresh_remote_and_memory_state_recovers_signed_tombstone_without_content(tmp_path,monkeypatch):
