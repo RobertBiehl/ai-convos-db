@@ -14,7 +14,7 @@ never receives conversation plaintext, file paths, repository names, embeddings,
 attachments, or workspace keys. Search and graph queries remain local.
 
 The next storage and recovery architecture is specified in
-[Remote state v2](remote-state-v2.md). It makes canonical provenance part of
+[Remote state v1](remote-state-v1.md). It makes canonical provenance part of
 DuckDB, limits settled SQLite state to rebuildable sync metadata, and advances
 the client and relay together without an old-protocol compatibility layer.
 

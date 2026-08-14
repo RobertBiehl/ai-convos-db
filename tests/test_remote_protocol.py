@@ -49,7 +49,7 @@ def test_logical_provenance_fact_signs_semantics_not_checkout_observation():
 
 def test_row_proof_binds_origin_revision_predecessor_and_deletion():
     root,device=identity("root"),fixed_identity(); user=public_id(root["sign_public"]); cert=certificate(root,user,device); active=logical_row("messages",["id","conversation_id","role","content","thinking","created_at","model","metadata","parent_id"],["m","c","user","hello",None,datetime(2026,1,1),None,"{}",None]); first=row_proof(device,user,"origin",2,active)
-    assert first["previous_revision"] is None and set(first)=={"v","kind","workspace","authorization_workspace","row_kind","row_id","encoding_v","content_hash","revision","previous_revision","state","author_user_id","author_device_id","authorization_epoch","signature"} and verify_row_proof(first,active,cert,root["sign_public"])==first
+    assert first==row_proof(device,user,"origin",2,active,content_hash=digest(active)) and first["previous_revision"] is None and set(first)=={"v","kind","workspace","authorization_workspace","row_kind","row_id","encoding_v","content_hash","revision","previous_revision","state","author_user_id","author_device_id","authorization_epoch","signature"} and verify_row_proof(first,active,cert,root["sign_public"])==first
     deleted=logical_row("messages",identity="m",state="deleted"); tombstone=row_proof(device,user,"origin",3,deleted,first["revision"]); restored=row_proof(device,user,"origin",4,active,tombstone["revision"]); assert tombstone["revision"]!=first["revision"] and tombstone["previous_revision"]==first["revision"] and restored["content_hash"]==first["content_hash"] and restored["revision"]!=first["revision"] and verify_row_proof(tombstone,deleted,cert,root["sign_public"])
     for changed in ({**first,"workspace":"other"},{**first,"authorization_workspace":"other"},{**first,"previous_revision":"f"*64},{**first,"author_user_id":"0"*32},{**first,"authorization_epoch":3}):
         with pytest.raises(ValueError,match="row proof"): verify_row_proof(changed,active,cert,root["sign_public"])
@@ -66,10 +66,12 @@ def test_delivery_replica_separates_origin_author_from_uploader():
     root,author,uploader=identity("root"),fixed_identity(),identity("peer"); user=public_id(root["sign_public"]); cert=certificate(root,user,author); row=logical_row("messages",identity="m",state="deleted"); proof=row_proof(author,user,"origin",2,row,"a"*64); key=bytes(range(32)); env=seal_replica(row,proof,"replacement",1,key,uploader["id"]); opened=open_replica(env,key)
     assert env["uploader"]==uploader["id"]!=proof["author_device_id"] and env["replica"]!=proof["revision"] and verify_row_proof(opened["proof"],opened["row"],cert,root["sign_public"])
     with pytest.raises(ValueError,match="replica"): open_replica({**env,"replica":"0"*64},key)
+    with pytest.raises(ValueError,match="proof mismatch"): seal_replica(row,proof,"replacement",1,key,uploader["id"],"0"*64)
+    assert open_replica(seal_replica(row,proof,"replacement",1,key,uploader["id"],digest(row)),key)["row"]==row
 
 
 def test_origin_bundle_is_encrypted_once_and_bound_to_destination_epoch():
-    key=bytes(range(32)); controls=[{"workspace":"origin-workspace","revision":1}]; env=seal_origin(controls,"replacement",3,key,"peer"); assert open_origin(env,key)==controls and env["workspace"]=="replacement" and "origin-workspace" not in json.dumps({k:v for k,v in env.items() if k!="ciphertext"})
+    key=bytes(range(32)); controls=[{"workspace":"origin-workspace","revision":1}]; env=seal_origin(controls,"replacement",3,key,"peer",False); assert open_origin(env,key)=={"controls":controls,"rows":False} and env["workspace"]=="replacement" and "origin-workspace" not in json.dumps({k:v for k,v in env.items() if k!="ciphertext"})
     with pytest.raises(ValueError,match="origin bundle"): open_origin({**env,"epoch":4},key)
 
 

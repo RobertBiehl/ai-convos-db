@@ -429,7 +429,7 @@ class TestDeduplication:
     def test_upsert_updates_existing(self, tmp_path):
         """Upserting same conversation updates rather than duplicates."""
         import duckdb
-        from ai_convos.cli import init_schema, upsert, ParseResult, gen_id
+        from ai_convos.cli import archive_state, init_schema, upsert, ParseResult, gen_id
 
         db = duckdb.connect(str(tmp_path / "test.db"))
         init_schema(db)
@@ -451,8 +451,8 @@ class TestDeduplication:
                             project_id=None, metadata="{}"))
         r2.msgs.append(dict(id=gen_id("claude", f"{cid}:1"), conversation_id=cid, role="assistant",
                            content="Hi there", thinking=None, created_at=None, model=None, metadata="{}", parent_id=None))
-        second = upsert(db, r2); assert second[5:7] == (0, 1) and len(second[7]) == 1
-        third = upsert(db, r2); assert third[5:7] == (0, 0) and not third[7]
+        second = upsert(db, r2); assert second[5:7] == (0, 1) and len(second[7]) == 1; generation=archive_state(db)[1]
+        third = upsert(db, r2); assert third[5:7] == (0, 0) and not third[7] and archive_state(db)[1]==generation
 
         # Verify: 1 conversation, 2 messages, title updated
         conv_count = db.execute("SELECT COUNT(*) FROM conversations").fetchone()[0]

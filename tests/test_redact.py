@@ -1,4 +1,4 @@
-import json, os, tomllib
+import hashlib, json, tomllib
 from pathlib import Path
 
 import duckdb, pytest, typer
@@ -6,9 +6,6 @@ from typer.testing import CliRunner
 
 from ai_convos import cli
 import ai_convos_redact as redact
-from ai_convos_remote import publish
-from ai_convos_remote.projection import connect
-from ai_convos_remote.protocol import b64, identity, open_event
 
 
 def app():
@@ -65,28 +62,25 @@ def test_unchanged_database_cache_is_exact_and_value_free(tmp_path,monkeypatch):
     assert not first["cached"] and second["cached"] and first["findings"]==second["findings"] and secret.encode() not in (tmp_path/"redact/scan.json").read_bytes()
 
 
-def config():
-    device=identity("device"); team,personal="team","personal"; keys={team:os.urandom(32),personal:os.urandom(32)}
-    return {"user":"user","device":device,"workspaces":{team:{"kind":"team","epoch":1},personal:{"kind":"personal","epoch":1}},"keys":{f"{ws}:1":b64(key) for ws,key in keys.items()}},keys
-
-
 def message(content,mid="m"):
     return {"kind":"message.record","entity":f"messages:{mid}","payload":{"table":"messages","columns":["id","conversation_id","role","content","thinking","created_at","model","metadata","parent_id"],"row":[mid,"c","user",content,None,"2026-01-01",None,"{}",None]}}
 
 
-def test_every_team_publish_is_scrubbed_before_encryption_and_personal_is_lossless(tmp_path):
-    cfg,keys=config(); state=connect(tmp_path/"remote/state.db"); secret="ghp_"+"A"*36
-    publish(cfg,state,"team",message(secret),tmp_path); publish(cfg,state,"personal",message(secret,"p"),tmp_path)
-    team_path=Path(state.execute("SELECT path FROM outbox WHERE workspace='team'").fetchone()[0]); personal_path=Path(state.execute("SELECT path FROM outbox WHERE workspace='personal'").fetchone()[0]); team=open_event(json.loads(team_path.read_text()),keys["team"],cfg["device"]["sign_public"]); personal=open_event(json.loads(personal_path.read_text()),keys["personal"],cfg["device"]["sign_public"])
-    assert secret not in json.dumps(team) and team["payload"]["row"][3]=="[REDACTED:github_token]" and personal["payload"]["row"][3]==secret and secret.encode() not in (tmp_path/"remote/state.db").read_bytes()
+def test_every_team_record_is_scrubbed_and_personal_source_is_unchanged(tmp_path):
+    secret="ghp_"+"A"*36; source=message(secret); team=redact.protect_all([source],tmp_path,"team")[0]
+    assert secret not in json.dumps(team) and team["payload"]["row"][3]=="[REDACTED:github_token]" and source["payload"]["row"][3]==secret
     audit=redact.audit_data(tmp_path); assert audit["status"]=="redacted" and audit["total"]==1 and secret not in json.dumps(audit) and not secret.encode() in (tmp_path/"redact/audit.db").read_bytes()
 
 
 def test_team_attachment_is_explicit_placeholder_without_body(tmp_path):
-    cfg,keys=config(); state=connect(tmp_path/"remote/state.db"); columns=cli.ARCHIVE_COLUMNS["attachments"]+["body_hash"]; record={"kind":"attachment.record","entity":"attachments:a","payload":{"table":"attachments","columns":columns,"row":["a","m","secret.bin","application/octet-stream",6,None,"https://secret",None,"a"*64]}}
-    assert publish(cfg,state,"team",record,tmp_path) and publish(cfg,state,"team",{"kind":"attachment.chunk","entity":"attachment:a:x:0","payload":{"body":"secret"}},tmp_path) is None
-    path=Path(state.execute("SELECT path FROM outbox WHERE workspace='team'").fetchone()[0]); value=open_event(json.loads(path.read_text()),keys["team"],cfg["device"]["sign_public"]); row=dict(zip(columns,value["payload"]["row"])); assert row["id"]=="a" and row["filename"]=="[REDACTED:attachment]" and all(row[k] is None for k in ("mime_type","size","path","url","body_hash"))
+    columns=cli.ARCHIVE_COLUMNS["attachments"]+["body_hash"]; record={"kind":"attachment.record","entity":"attachments:a","payload":{"table":"attachments","columns":columns,"row":["a","m","secret.bin","application/octet-stream",6,None,"https://secret",None,"a"*64]}}; value=redact.protect(record,tmp_path); assert redact.protect({"kind":"attachment.chunk","entity":"attachment:a:x:0","payload":{"body":"secret"}},tmp_path) is None
+    row=dict(zip(columns,value["payload"]["row"])); assert row["id"]=="a" and row["filename"]=="[REDACTED:attachment]" and all(row[k] is None for k in ("mime_type","size","path","url","body_hash"))
     assert redact.audit_data(tmp_path)["by_kind"]=={"attachment_redacted":2}
+
+
+def test_team_tombstone_and_secret_derived_provenance_are_safe(tmp_path):
+    tomb={"kind":"attachment.record","entity":"attachments:a","payload":{"table":"attachments","state":"deleted","id":"a"}}; assert redact.protect(tomb,tmp_path)==tomb; secret="ghp_"+"A"*36; columns=cli.ARCHIVE_COLUMNS["file_edits"]; edit={"kind":"file_edit.record","entity":"file_edits:e","payload":{"table":"file_edits","columns":columns,"row":["e","m","a.py","write",secret,"2026-01-01",secret]}}; observed={"kind":"edit.observed","entity":"e","payload":{"id":"e","file":"f","repository":"r","old_content_hash":hashlib.sha256(secret.encode()).hexdigest(),"new_content_hash":hashlib.sha256(secret.encode()).hexdigest()}}; derived=[{"kind":"file.version","entity":"v","payload":{"id":"v","file":"f"}},{"kind":"git.checkpoint","entity":"g","payload":{"id":"g","repository":"r"}},{"kind":"checkpoint.link","entity":"l","payload":{"id":"l","edit":"e"}},{"kind":"repository.observed","entity":"r","payload":{"id":"r","lineage":"secret-hash","roots":["secret-root"],"head":"secret-head"}}]; safe=redact.protect_all([edit,observed,*derived],tmp_path); raw=json.dumps(safe)
+    assert secret not in raw and not {"file.version","git.checkpoint","checkpoint.link"}&{r["kind"] for r in safe}; fact=next(r for r in safe if r["kind"]=="edit.observed"); redacted="[REDACTED:github_token]"; assert fact["payload"]["old_content_hash"]==fact["payload"]["new_content_hash"]==hashlib.sha256(redacted.encode()).hexdigest(); repo=next(r for r in safe if r["kind"]=="repository.observed")["payload"]; assert (repo["lineage"],repo["roots"],repo["head"])==(None,[],None)
 
 
 def test_cli_json_never_prints_detected_value(tmp_path,monkeypatch):

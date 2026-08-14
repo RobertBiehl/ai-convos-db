@@ -1,10 +1,10 @@
-import copy, json, sqlite3
+import copy, json, sqlite3, threading
 
 import pytest
 import ai_convos_remote_server as server_module
 from ai_convos_remote.control import CONTROL_V, record, sign, state_hash
 from ai_convos_remote.protocol import certificate, digest, event, identity, logical_row, open_blob, purge_certificate, row_proof, seal_blob, seal_event, seal_key, seal_replica, sign_control
-from ai_convos_remote_server import action, connect, ledger_state
+from ai_convos_remote_server import action, bounded, connect, ledger_state
 
 
 def account(db, name):
@@ -44,10 +44,27 @@ def test_repairable_replica_is_uploader_bounded_and_replaceable(tmp_path,monkeyp
     db=connect(tmp_path/"server.db"); a,b=account(db,"alice"),account(db,"bob"); ws,key="team",bytes([3])*32; state=create_ws(db,a,ws,key,"team"); rotate_ws(db,a,state,bytes([4])*32,((a,"admin"),(b,"member"))); key=bytes([4])*32; row=logical_row("messages",identity="m",state="deleted"); proof=row_proof(a["device"],a["user"],ws,2,row,"a"*64); env=seal_replica(row,proof,ws,2,key,b["device"]["id"])
     first=action(db,{"op":"replica_upload_many","envelopes":[env]},b["token"])["replicas"][0]; same=action(db,{"op":"replica_upload_many","envelopes":[env]},b["token"])["replicas"][0]; replacement=seal_replica(row,proof,ws,2,key,b["device"]["id"]); changed=action(db,{"op":"replica_upload_many","envelopes":[replacement]},b["token"])["replicas"][0]; page=action(db,{"op":"replica_pull","workspace":ws,"after":0},a["token"])
     present=action(db,{"op":"replica_reconcile","workspace":ws,"replicas":[env["replica"]]},a["token"]); missing=action(db,{"op":"replica_reconcile","workspace":ws,"replicas":["f"*64]},a["token"])
-    assert first["created"] and not same["created"] and not same["replaced"] and changed["replaced"] and first["cursor"]==same["cursor"]==changed["cursor"] and page["replicas"]==[{"cursor":first["cursor"],"envelope":replacement}] and present=={"present":{env["replica"]:first["cursor"]}} and missing=={"present":{}} and db.execute("SELECT COUNT(*) FROM row_replicas").fetchone()[0]==1
+    assert first["created"] and not same["created"] and not same["replaced"] and changed["replaced"] and first["cursor"]==same["cursor"]==changed["cursor"] and page["replicas"]==[{"cursor":first["cursor"],"envelope":replacement}] and present=={"present":{env["replica"]:first["cursor"]}} and missing=={"present":{}} and db.execute("SELECT COUNT(*) FROM row_replicas").fetchone()[0]==1 and db.execute("SELECT bytes FROM replica_usage").fetchone()[0]==len(server_module.canon(replacement))
     with pytest.raises(PermissionError,match="rejected"): action(db,{"op":"replica_upload_many","envelopes":[{**replacement,"uploader":a["device"]["id"]}]},b["token"])
     monkeypatch.setattr(server_module,"REPLICA_QUOTA",1)
     with pytest.raises(ValueError,match="quota"): action(db,{"op":"replica_upload_many","envelopes":[replacement]},b["token"])
+
+
+def test_replica_quota_is_atomic_across_connections(tmp_path,monkeypatch):
+    path=tmp_path/"server.db"; db=connect(path); a=account(db,"alice"); ws,key="personal",bytes([3])*32; create_ws(db,a,ws,key,"personal"); rows=[logical_row("messages",identity=str(i),state="deleted") for i in range(2)]; envs=[seal_replica(row,row_proof(a["device"],a["user"],ws,1,row),ws,1,key,a["device"]["id"]) for row in rows]; monkeypatch.setattr(server_module,"REPLICA_QUOTA",len(server_module.canon(envs[0]))+10); db.close(); barrier=threading.Barrier(2); results=[]
+    def upload(env):
+        conn=connect(path); barrier.wait()
+        try: action(conn,{"op":"replica_upload_many","envelopes":[env]},a["token"]); results.append("ok")
+        except ValueError as error: results.append(str(error))
+        finally: conn.close()
+    threads=[threading.Thread(target=upload,args=(env,)) for env in envs]; [thread.start() for thread in threads]; [thread.join() for thread in threads]; db=connect(path); assert results.count("ok")==1 and sum("quota" in result for result in results)==1 and db.execute("SELECT COUNT(*) FROM row_replicas").fetchone()[0]==1
+
+
+def test_response_byte_bound_stops_before_materializing_rest():
+    seen=[]
+    def values():
+        for value in ("aaa","bbb","should-not-be-read"): seen.append(value); yield value
+    assert bounded(values(),len,5)==["aaa"] and seen==["aaa","bbb"]
 
 
 def test_blob_replica_is_raw_bounded_repairable_and_history_scoped(tmp_path,monkeypatch):

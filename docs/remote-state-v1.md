@@ -7,11 +7,11 @@ read_when:
   - Reviewing remote correctness, performance, or storage
 ---
 
-# Remote state v2
+# Remote state v1
 
 ## Outcome
 
-Remote state v2 keeps the existing DuckDB plus SQLite design, but removes
+Remote state v1 keeps the existing DuckDB plus SQLite design, but removes
 overlapping authority:
 
 - DuckDB is the canonical archive, including canonical provenance facts.
@@ -263,9 +263,9 @@ Incoming plaintext exists in memory only until DuckDB projection commits.
 Canonical archive rows and provenance facts use the same lifecycle with a
 repairable replica envelope keyed by an epoch-keyed opaque proof identity and uploader. After state loss, a peer
 advertises these identities in flat pages; the relay returns those already
-present, and only missing bodies are encrypted and uploaded. The SQLite outbox
-retains only its encrypted-file path, size, and tuple; acknowledgement leaves
-only a cursor. An imported row or provenance fact is reconstructed from its
+present, and only missing bodies are encrypted and uploaded directly in bounded
+pages. A lost response is reconciled idempotently on retry; SQLite retains only
+the acknowledged cursor. An imported row or provenance fact is reconstructed from its
 canonical DuckDB projection and retained origin proof, so any authorized holder
 can repair it without the author's key. Remote scanning never observes Git or
 writes provenance; core ingestion and hooks capture those facts before Remote
@@ -319,16 +319,22 @@ and remains outside this release.
 - DuckDB uses staging tables and set-based upserts rather than per-event
   commits.
 - SQLite uses transactions and `executemany`.
-- The fast path consumes changed local identifiers; a full deterministic
-  reconciliation remains the repair path.
+- Core writes a content-free latest-generation index for changed local
+  identities. Remote keeps only a per-workspace generation cursor; new team
+  scope expands once from a content-free conversation-ID set. A missing cursor
+  selects the full deterministic repair path.
+- Replica upload first reconciles deterministic IDs, so a lost acknowledgement
+  does not force body re-encryption. Pull skips locally acknowledged bodies
+  unless archive recovery is active; peer bodies remain verified and projected
+  in bounded batches.
 - Hooks continue to perform no Git or network work and retain p95 below 100 ms.
 - Background work may obey time and byte budgets; explicit sync converges in
   one invocation.
 
 The fixed local projector release gate is at least 500 verified and projected
-events per second on the reference machine with a deterministic 100,000-event
-fixture. CI uses a relative regression threshold. A real-archive benchmark is
-local-only and publishes no content.
+objects per second on the reference machine. CI uses a relative regression
+threshold. The local-only [Remote v1 benchmark](remote-benchmark-v1.md) records
+the real-archive release evidence without publishing content.
 
 If exact replay remains too slow, a later client may upload a signed encrypted
 per-device metadata checkpoint. A checkpoint is verified and followed by exact

@@ -17,8 +17,9 @@ prompts, conversations, and edits from the existing archive tables. Remote
 submits verified facts through the core projector. Transport cursors and
 device/workspace activity remain in `<root>/remote/state.db`; durable imported
 row authorship and compact signed proofs live in the `remote` DuckDB schema. The main-schema
-`archive_state` row gives the file a stable identity and monotonic generation
-for rollback-safe remote recovery.
+`archive_state` gives the file a stable identity and monotonic generation;
+`archive_changes` keeps only each logical row's latest generation so normal
+replication reads changed identifiers without retaining content history.
 
 ## Tables
 
@@ -174,9 +175,14 @@ ancestor is ignored, and an incomparable signed body is retained in
 | generation | UBIGINT | Monotonic archive/provenance write generation |
 
 The row is added automatically to existing DuckDB archives. Generation changes
-in the same transaction as core projection, provenance capture, attachment-path
-materialization, or ingestion, so a failed transaction cannot advance the
-proof. It is a rollback detector, not a content revision or remote cursor.
+in the same transaction as core projection, provenance capture, retained
+attachment-body indexing, or ingestion, so a failed transaction cannot advance
+the proof. It is a rollback detector, not a content revision or remote cursor.
+`archive_changes(kind, entity, generation)` is a compact current-generation
+index: one content-free row per touched logical identity, overwritten on later
+changes. Missing marked rows produce tombstones. Losing Remote state resets its
+cursor and causes a deterministic full scan; no canonical data depends on this
+index.
 
 Existing core archives migrate automatically. Before schema N first mutates an
 archive, Convos checkpoints and validates a mode-0600
