@@ -16,7 +16,9 @@ repository, file, hash, checkpoint, assertion, and gap facts while joining
 prompts, conversations, and edits from the existing archive tables. Remote
 submits verified facts through the core projector. Transport cursors and
 device/workspace activity remain in `<root>/remote/state.db`; durable imported
-row authorship lives in `remote.row_origins` in DuckDB.
+row authorship lives in `remote.row_origins` in DuckDB. The main-schema
+`archive_state` row gives the file a stable identity and monotonic generation
+for rollback-safe remote recovery.
 
 ## Tables
 
@@ -140,6 +142,19 @@ deleting synchronization state cannot change authorship or make a foreign row
 publishable. Imported physical IDs use the verified author user plus workspace,
 table, and exact source row; the signing device remains separate provenance and
 does not change semantic row identity after device recovery.
+
+### archive_state
+
+| Column | Type | Description |
+|--------|------|-------------|
+| singleton | BOOLEAN PK | Enforces exactly one archive identity row |
+| archive_id | UUID | Stable identity created when this DuckDB is initialized |
+| generation | UBIGINT | Monotonic archive/provenance write generation |
+
+The row is added automatically to existing DuckDB archives. Generation changes
+in the same transaction as core projection, provenance capture, attachment-path
+materialization, or ingestion, so a failed transaction cannot advance the
+proof. It is a rollback detector, not a content revision or remote cursor.
 
 ## Full-Text Search
 

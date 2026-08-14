@@ -41,15 +41,17 @@ def approved(base,request,votes,now=None,kind="device.proposal"):
 def _same(a,b,*keys): return all(a[k]==b[k] for k in keys)
 def verify_state(value,previous=None):
     if value["v"]!=V or value["kind"]!="workspace.state": raise ValueError("unsupported workspace state")
-    if value["scope"] not in ("personal","team") or len(value["key_commitment"])!=64 or any(m["role"] not in ("admin","member") for m in value["members"].values()) or any(d["user"] not in value["members"] for d in value["devices"].values()) or set(value["devices"])&set(value["removed"]): raise ValueError("invalid workspace state")
+    boundary=value["boundary"]; heads=boundary["heads"]
+    if value["scope"] not in ("personal","team") or len(value["key_commitment"])!=64 or set(boundary)!={"epoch","tail","heads"} or boundary["epoch"]!=value["epoch"] or not isinstance(boundary["tail"],int) or isinstance(boundary["tail"],bool) or boundary["tail"]<0 or not isinstance(heads,dict) or any(set(h)!={"seq","event"} or not isinstance(h["seq"],int) or isinstance(h["seq"],bool) or h["seq"]<1 or not isinstance(h["event"],str) or len(h["event"])!=64 for h in heads.values()) or any(m["role"] not in ("admin","member") for m in value["members"].values()) or any(d["user"] not in value["members"] for d in value["devices"].values()) or set(value["devices"])&set(value["removed"]): raise ValueError("invalid workspace state")
     author=(value["devices"] if previous is None else previous["devices"]).get(value["author"])
     if previous is not None and value["action"]=="personal_recover": author=value["devices"].get(value["author"])
     if not author: raise ValueError("state author is not authorized")
     verify(value,verify_record(author)["device"]["sign_public"]); [verify_record(d) for d in value["devices"].values()]
     if previous is None:
-        if value["revision"]!=1 or value["prev"] is not None or value["epoch"]!=1 or value["author"] not in value["devices"] or value["action"]!="create" or value["members"][author["user"]]["role"]!="admin" or set(value["members"])!={author["user"]} or set(value["devices"])!={value["author"]} or value["removed"]: raise ValueError("invalid genesis state")
+        if value["revision"]!=1 or value["prev"] is not None or value["epoch"]!=1 or boundary!={"epoch":1,"tail":0,"heads":{}} or value["author"] not in value["devices"] or value["action"]!="create" or value["members"][author["user"]]["role"]!="admin" or set(value["members"])!={author["user"]} or set(value["devices"])!={value["author"]} or value["removed"]: raise ValueError("invalid genesis state")
         return value
     if not _same(value,previous,"workspace","scope") or value["revision"]!=previous["revision"]+1 or value["prev"]!=state_hash(previous): raise ValueError("workspace state chain mismatch")
+    if value["epoch"]==previous["epoch"] and boundary!=previous["boundary"] or value["epoch"]>previous["epoch"] and (boundary["tail"]<previous["boundary"]["tail"] or any(author not in heads or heads[author]["seq"]<head["seq"] or heads[author]["seq"]==head["seq"] and heads[author]["event"]!=head["event"] for author,head in previous["boundary"]["heads"].items())): raise ValueError("workspace history boundary mismatch")
     action=value["action"]; admin=previous["members"][author["user"]]["role"]=="admin"
     if action in ("membership","remove") and not admin: raise ValueError("admin control required")
     if action in ("self_approve","quorum_approve","personal_recover"):

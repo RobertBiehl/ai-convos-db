@@ -3,7 +3,7 @@ import json, subprocess
 import duckdb
 import pytest
 import ai_convos.cli as core_module
-from ai_convos.cli import capture_provenance as capture, init_schema, project_provenance as project, provenance_digest as digest, repository
+from ai_convos.cli import ARCHIVE_COLUMNS, archive_state, capture_provenance as capture, init_schema, project_archive_row, project_provenance as project, provenance_digest as digest, repository
 from ai_convos_changegraph.provenance import query
 from ai_convos_remote.protocol import event, identity
 
@@ -30,8 +30,13 @@ def test_path_independent_repo_cross_repo_changeset_and_canonical_schema(tmp_pat
 
 
 def test_core_schema_upgrade_adds_canonical_schemas_without_rewriting_archive(tmp_path):
-    db=duckdb.connect(str(tmp_path/"core.db")); init_schema(db); db.execute("INSERT INTO conversations VALUES ('keep','codex','preserved','2026-01-01','2026-01-01',NULL,NULL,NULL,NULL,'{}')"); db.execute("DROP SCHEMA provenance CASCADE"); db.execute("DROP SCHEMA remote CASCADE"); init_schema(db)
-    assert db.execute("SELECT title FROM conversations WHERE id='keep'").fetchone()[0]=="preserved" and db.execute("SELECT COUNT(*) FROM provenance.repositories").fetchone()[0]==db.execute("SELECT COUNT(*) FROM remote.row_origins").fetchone()[0]==0
+    db=duckdb.connect(str(tmp_path/"core.db")); init_schema(db); identity=archive_state(db)[0]; db.execute("INSERT INTO conversations VALUES ('keep','codex','preserved','2026-01-01','2026-01-01',NULL,NULL,NULL,NULL,'{}')"); db.execute("DROP SCHEMA provenance CASCADE"); db.execute("DROP SCHEMA remote CASCADE"); init_schema(db)
+    assert db.execute("SELECT title FROM conversations WHERE id='keep'").fetchone()[0]=="preserved" and db.execute("SELECT COUNT(*) FROM provenance.repositories").fetchone()[0]==db.execute("SELECT COUNT(*) FROM remote.row_origins").fetchone()[0]==0 and archive_state(db)[0]==identity
+
+
+def test_archive_generation_is_transactional_and_counts_only_owned_rows(tmp_path):
+    db=duckdb.connect(str(tmp_path/"core.db")); init_schema(db); initial=archive_state(db); row=["c","codex","one","2026-01-01","2026-01-01",None,None,None,None,"{}"]
+    db.execute("BEGIN"); project_archive_row(db,"conversations",ARCHIVE_COLUMNS["conversations"],row); assert archive_state(db)[1:]==(initial[1]+1,1); db.execute("ROLLBACK"); assert archive_state(db)==initial
 
 
 def test_git_checkpoint_exact_commit_link_and_unobserved_gap(tmp_path):
@@ -42,13 +47,13 @@ def test_git_checkpoint_exact_commit_link_and_unobserved_gap(tmp_path):
 
 
 def test_provenance_failure_rolls_back_only_enrichment(tmp_path,monkeypatch):
-    root=repo(tmp_path/"repo"); db=core(tmp_path/"core.db",root,[(root/"x.py","write","one\n",None)]); write=core_module.project_provenance
+    root=repo(tmp_path/"repo"); db=core(tmp_path/"core.db",root,[(root/"x.py","write","one\n",None)]); write=core_module.project_provenance; generation=archive_state(db)[1]
     def fail(conn,value,*args):
         if value["kind"]=="file.observed": raise OSError("git evidence failed")
         return write(conn,value,*args)
     monkeypatch.setattr(core_module,"project_provenance",fail)
     with pytest.raises(OSError,match="evidence"): capture(db)
-    assert db.execute("SELECT COUNT(*) FROM file_edits").fetchone()[0]==1 and db.execute("SELECT COUNT(*) FROM provenance.repositories").fetchone()[0]==0 and db.execute("SELECT COUNT(*) FROM provenance.repository_checkouts").fetchone()[0]==0
+    assert db.execute("SELECT COUNT(*) FROM file_edits").fetchone()[0]==1 and db.execute("SELECT COUNT(*) FROM provenance.repositories").fetchone()[0]==0 and db.execute("SELECT COUNT(*) FROM provenance.repository_checkouts").fetchone()[0]==0 and archive_state(db)[1]==generation
 
 
 def test_inferred_assertions_remain_typed_and_reversible(tmp_path):

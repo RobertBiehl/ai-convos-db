@@ -37,8 +37,8 @@ CREATE TABLE IF NOT EXISTS device_votes(proposal TEXT,voter_user TEXT,voter_devi
 
 def connect(path):
     existed=Path(path).exists() and Path(path).stat().st_size>0; db=sqlite3.connect(path); db.row_factory=sqlite3.Row; old=existed and db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='events'").fetchone()
-    if old and db.execute("PRAGMA user_version").fetchone()[0]!=3: db.close(); raise ValueError("relay database is incompatible; create a fresh relay")
-    db.executescript("PRAGMA journal_mode=WAL;PRAGMA foreign_keys=ON;PRAGMA busy_timeout=30000;"+SCHEMA+"PRAGMA user_version=3;"); return db
+    if old and db.execute("PRAGMA user_version").fetchone()[0]!=4: db.close(); raise ValueError("relay database is incompatible; create a fresh relay")
+    db.executescript("PRAGMA journal_mode=WAL;PRAGMA foreign_keys=ON;PRAGMA busy_timeout=30000;"+SCHEMA+"PRAGMA user_version=4;"); return db
 def token_hash(token): return hashlib.sha256(token.encode()).hexdigest()
 def auth(db, token):
     row = db.execute("SELECT * FROM devices WHERE token_hash=? AND active=1", (token_hash(token or ""),)).fetchone()
@@ -67,6 +67,8 @@ def verify_record(value):
     if public_id(value["root_public"])!=value["user"] or public_id(device["sign_public"])!=device["id"] or body["user"]!=value["user"] or body["device"]!=device: raise ValueError("device record mismatch")
     return value
 def control_hash(value): return digest(value)
+def ledger_state(db,ws):
+    values=rows(db,"SELECT cursor,event,author,seq FROM events WHERE workspace=? UNION ALL SELECT cursor,event,author,seq FROM event_tombstones WHERE workspace=?",(ws,ws)); heads={author:{"seq":row["seq"],"event":row["event"]} for author in {r["author"] for r in values} for row in [max((r for r in values if r["author"]==author),key=lambda r:r["seq"])]}; return {"tail":max((r["cursor"] for r in values),default=0),"heads":heads}
 def current_control(db,ws):
     row=db.execute("SELECT state FROM workspace_controls WHERE workspace=? ORDER BY revision DESC LIMIT 1",(ws,)).fetchone(); return json.loads(row[0]) if row else None
 def electorate(state,target): return sorted({d["user"] for d in state["devices"].values() if d["user"]!=target})
@@ -93,15 +95,17 @@ def verify_window(db,request,now):
     if not row or not row["active"] or not row["not_before"]<=now<row["expires"]: raise ValueError("proposal is not active by relay clock")
 def verify_control(db,actor,value,previous=None):
     if value["v"]!=V or value["kind"]!="workspace.state": raise ValueError("unsupported workspace state")
-    if value["scope"] not in ("personal","team") or len(value["key_commitment"])!=64 or any(m["role"] not in ("admin","member") for m in value["members"].values()) or any(d["user"] not in value["members"] for d in value["devices"].values()) or set(value["devices"])&set(value["removed"]): raise ValueError("invalid workspace state")
+    boundary=value["boundary"]; heads=boundary["heads"]
+    if value["scope"] not in ("personal","team") or len(value["key_commitment"])!=64 or set(boundary)!={"epoch","tail","heads"} or boundary["epoch"]!=value["epoch"] or not isinstance(boundary["tail"],int) or isinstance(boundary["tail"],bool) or boundary["tail"]<0 or not isinstance(heads,dict) or any(set(h)!={"seq","event"} or not isinstance(h["seq"],int) or isinstance(h["seq"],bool) or h["seq"]<1 or not isinstance(h["event"],str) or len(h["event"])!=64 for h in heads.values()) or any(m["role"] not in ("admin","member") for m in value["members"].values()) or any(d["user"] not in value["members"] for d in value["devices"].values()) or set(value["devices"])&set(value["removed"]): raise ValueError("invalid workspace state")
     author=(value["devices"] if previous is None else previous["devices"]).get(value["author"])
     if value["action"]=="personal_recover" and previous is not None: author=value["devices"].get(value["author"])
     if not author or actor["id"]!=value["author"]: raise PermissionError("state author is not authorized")
     verify_signed(value,verify_record(author)["device"]["sign_public"]); [verify_record(d) for d in value["devices"].values()]
     if previous is None:
-        if value["revision"]!=1 or value["prev"] is not None or value["epoch"]!=1 or value["author"] not in value["devices"] or value["action"]!="create" or value["members"][author["user"]]["role"]!="admin" or set(value["members"])!={author["user"]} or set(value["devices"])!={value["author"]} or value["removed"]: raise ValueError("invalid genesis state")
+        if value["revision"]!=1 or value["prev"] is not None or value["epoch"]!=1 or boundary!={"epoch":1,"tail":0,"heads":{}} or value["author"] not in value["devices"] or value["action"]!="create" or value["members"][author["user"]]["role"]!="admin" or set(value["members"])!={author["user"]} or set(value["devices"])!={value["author"]} or value["removed"]: raise ValueError("invalid genesis state")
         return value
     if (value["workspace"],value["scope"])!=(previous["workspace"],previous["scope"]) or value["revision"]!=previous["revision"]+1 or value["prev"]!=control_hash(previous): raise ValueError("workspace state chain mismatch")
+    if value["epoch"]==previous["epoch"] and boundary!=previous["boundary"] or value["epoch"]>previous["epoch"] and boundary!={"epoch":value["epoch"],**ledger_state(db,value["workspace"])}: raise ValueError("workspace history boundary mismatch")
     action=value["action"]; previous_author=previous["devices"].get(value["author"]); admin=bool(previous_author and previous["members"][previous_author["user"]]["role"]=="admin")
     if action in ("membership","remove","history") and not admin: raise PermissionError("admin control required")
     if action in ("self_approve","quorum_approve","personal_recover"):
@@ -157,6 +161,7 @@ def register(db, req):
     db.commit(); return dict(user=user, device=dev["id"], token=token)
 
 def rotate(db, actor, req):
+    db.execute("BEGIN IMMEDIATE")
     previous=current_control(db,req["workspace"])
     if not previous: raise ValueError("workspace control state is not initialized")
     if actor["id"] not in previous["devices"] and req.get("control",{}).get("action")!="personal_recover": raise PermissionError("device is not authorized for current workspace epoch")
@@ -199,7 +204,9 @@ def action(db, req, token=None):
         ws,control=req["workspace"],req["control"]; verify_control(db,actor,control)
         if (control["workspace"],control["scope"])!=(ws,req["kind"]): raise ValueError("workspace create scope mismatch")
         db.execute("INSERT INTO workspaces VALUES (?,?,?,?,?)",(ws,req["kind"],1,actor["user_id"],time.time())); result=apply_control(db,control,req["envelopes"]); db.commit(); return result
-    if op == "rotate": return rotate(db, actor, req)
+    if op == "rotate":
+        try: return rotate(db,actor,req)
+        except BaseException: db.rollback(); raise
     if op == "propose":
         request=req["proposal"]; previous=current_control(db,request["workspace"]); target=verify_record(request["target"]); verify_signed(request,target["device"]["sign_public"])
         pending=request["kind"]=="device.proposal" and target["history"] is False and actor["id"] not in previous["devices"] and actor["id"] not in previous["removed"]
@@ -231,6 +238,7 @@ def action(db, req, token=None):
         for w in memberships:
             w["keys"] = rows(db, "SELECT epoch,envelope FROM key_envelopes WHERE workspace=? AND device=? ORDER BY epoch", (w["id"],actor["id"])); w["devices"] = rows(db, "SELECT DISTINCT d.id,d.user_id,d.name,d.sign_public,d.box_public,d.active,c.certificate,u.root_public,NOT EXISTS(SELECT 1 FROM workspace_device_exclusions x WHERE x.workspace=? AND x.device=d.id) allowed,EXISTS(SELECT 1 FROM key_envelopes k WHERE k.workspace=? AND k.epoch=? AND k.device=d.id) authorized FROM devices d JOIN users u ON u.id=d.user_id LEFT JOIN device_certificates c ON c.device=d.id JOIN members m ON d.user_id=m.user_id WHERE m.workspace=?", (w["id"],w["id"],w["epoch"],w["id"])); w["members"] = rows(db,"SELECT user_id,role,active,joined_epoch,history_from FROM members WHERE workspace=?",(w["id"],)); w["device_authorized"]=bool(db.execute("SELECT 1 FROM key_envelopes WHERE workspace=? AND epoch=? AND device=?",(w["id"],w["epoch"],actor["id"])).fetchone()) and not bool(db.execute("SELECT 1 FROM workspace_device_exclusions WHERE workspace=? AND device=?",(w["id"],actor["id"])).fetchone()); w["controls"]=[json.loads(r[0]) for r in db.execute("SELECT state FROM workspace_controls WHERE workspace=? ORDER BY revision",(w["id"],)).fetchall()]
         return {"user":actor["user_id"],"device":actor["id"],"workspaces":memberships}
+    if op == "ledger": member(db,req["workspace"],actor["user_id"]); return ledger_state(db,req["workspace"])
     if op == "upload":
         result=store_event(db,actor,req["envelope"]); db.commit(); return result
     if op == "upload_many":

@@ -3,7 +3,7 @@ import copy, json, sqlite3
 import pytest
 from ai_convos_remote.control import record, sign, state_hash
 from ai_convos_remote.protocol import certificate, digest, event, identity, seal_event, seal_key, sign_control
-from ai_convos_remote_server import action, connect
+from ai_convos_remote_server import action, connect, ledger_state
 
 
 def account(db, name):
@@ -12,10 +12,10 @@ def account(db, name):
     return {"root":root,"device":dev,"user":user,"token":result["token"]}
 def device_record(a): return record(a["user"],a["root"]["sign_public"],a["device"],certificate(a["root"],a["user"],a["device"]))
 def create_ws(db,a,ws,key,kind):
-    state=sign(a["device"],{"v":1,"kind":"workspace.state","workspace":ws,"scope":kind,"revision":1,"prev":None,"epoch":1,"key_commitment":digest(key),"members":{a["user"]:{"role":"admin","joined":1,"history_from":1,"selected":[]}},"devices":{a["device"]["id"]:device_record(a)},"removed":[],"action":"create","approval":None,"approved_at":0})
+    state=sign(a["device"],{"v":1,"kind":"workspace.state","workspace":ws,"scope":kind,"revision":1,"prev":None,"epoch":1,"boundary":{"epoch":1,"tail":0,"heads":{}},"key_commitment":digest(key),"members":{a["user"]:{"role":"admin","joined":1,"history_from":1,"selected":[]}},"devices":{a["device"]["id"]:device_record(a)},"removed":[],"action":"create","approval":None,"approved_at":0})
     action(db,sign_control(a["device"],{"op":"create","workspace":ws,"kind":kind,"control":state,"envelopes":{a["device"]["id"]:seal_key(key,a["device"]["box_public"],f"workspace:{ws}:epoch:1")}}),a["token"]); return state
-def rotate_ws(db,a,previous,key,people):
-    epoch=previous["epoch"]+1; members={p["user"]:{"role":role,"joined":previous["members"].get(p["user"],{"joined":epoch})["joined"],"history_from":previous["members"].get(p["user"],{"history_from":epoch})["history_from"],"selected":[]} for p,role in people}; devices={p["device"]["id"]:previous["devices"].get(p["device"]["id"],device_record(p)) for p,_ in people}; state=sign(a["device"],{"v":1,"kind":"workspace.state","workspace":previous["workspace"],"scope":previous["scope"],"revision":previous["revision"]+1,"prev":state_hash(previous),"epoch":epoch,"key_commitment":digest(key),"members":members,"devices":devices,"removed":sorted(set(previous["removed"])|set(previous["devices"])-set(devices)),"action":"membership","approval":None,"approved_at":0}); envs={p["device"]["id"]:seal_key(key,p["device"]["box_public"],f"workspace:{previous['workspace']}:epoch:{epoch}") for p,_ in people}; action(db,sign_control(a["device"],{"op":"rotate","workspace":previous["workspace"],"control":state,"envelopes":envs}),a["token"]); return state
+def rotate_ws(db,a,previous,key,people,boundary=None):
+    epoch=previous["epoch"]+1; members={p["user"]:{"role":role,"joined":previous["members"].get(p["user"],{"joined":epoch})["joined"],"history_from":previous["members"].get(p["user"],{"history_from":epoch})["history_from"],"selected":[]} for p,role in people}; devices={p["device"]["id"]:previous["devices"].get(p["device"]["id"],device_record(p)) for p,_ in people}; state=sign(a["device"],{"v":1,"kind":"workspace.state","workspace":previous["workspace"],"scope":previous["scope"],"revision":previous["revision"]+1,"prev":state_hash(previous),"epoch":epoch,"boundary":boundary or {"epoch":epoch,**ledger_state(db,previous["workspace"])},"key_commitment":digest(key),"members":members,"devices":devices,"removed":sorted(set(previous["removed"])|set(previous["devices"])-set(devices)),"action":"membership","approval":None,"approved_at":0}); envs={p["device"]["id"]:seal_key(key,p["device"]["box_public"],f"workspace:{previous['workspace']}:epoch:{epoch}") for p,_ in people}; action(db,sign_control(a["device"],{"op":"rotate","workspace":previous["workspace"],"control":state,"envelopes":envs}),a["token"]); return state
 def history_ws(a,previous,user):
     members={**previous["members"],user:{**previous["members"][user],"history_from":1}}; return sign(a["device"],{**{k:v for k,v in previous.items() if k not in ("signature","author")},"revision":previous["revision"]+1,"prev":state_hash(previous),"members":members,"action":"history","approval":None,"approved_at":0})
 
@@ -52,6 +52,11 @@ def test_team_add_default_history_grant_remove_and_rotation(tmp_path):
     assert len(action(db,{"op":"pull","workspace":ws,"after":0},b["token"])["events"]) == 2
     rotate_ws(db,a,state,k3,((a,"admin"),))
     with pytest.raises(PermissionError): action(db,{"op":"pull","workspace":ws,"after":0},b["token"])
+
+
+def test_rotation_rejects_a_stale_or_invented_signed_history_boundary(tmp_path):
+    db=connect(tmp_path/"server.db"); a,b=account(db,"alice"),account(db,"bob"); ws,key="team",bytes([1])*32; state=create_ws(db,a,ws,key,"team"); env=seal_event(event(a["device"],1,"x","x",{},[]),ws,1,key); action(db,{"op":"upload","envelope":env},a["token"])
+    with pytest.raises(ValueError,match="history boundary"): rotate_ws(db,a,state,bytes([2])*32,((a,"admin"),(b,"member")),{"epoch":2,"tail":0,"heads":{}})
 
 
 def test_device_certificate_recovery_and_author_acl(tmp_path):
