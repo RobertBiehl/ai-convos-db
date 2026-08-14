@@ -19,7 +19,9 @@ overlapping authority:
   device config pins the last generation that completed remote convergence.
 - `state.db` is a rebuildable synchronization index. Pending ciphertext lives
   in mode-0600 outbox files referenced by metadata rows.
-- The relay is the durable encrypted signed-event ledger.
+- The relay is a disposable encrypted delivery store for repairable row and
+  blob replicas. Its remaining signed-event ledger is auxiliary protocol state,
+  not canonical archive authority.
 - Losing `state.db` never turns imported rows into local rows and never permits
   publication until relay metadata has been rebuilt to the advertised tail.
 
@@ -103,7 +105,10 @@ derived content are forbidden.
 
 ### Relay
 
-The relay owns durable opaque envelopes and encrypted blobs. It reports:
+The relay stores opaque delivery envelopes and encrypted blobs for availability
+and fast restore. Canonical rows and their proofs remain on authorized peers and
+can rebuild it. The relay also currently retains auxiliary signed-event
+envelopes and personal-memory purge certificates. It reports:
 
 - the exact workspace tail;
 - the earliest retained cursor available to the requesting device;
@@ -115,7 +120,11 @@ The relay owns durable opaque envelopes and encrypted blobs. It reports:
   sequence only after client verification, and permanently denies replay.
 
 The relay never interprets payloads. Server database and blob storage are one
-backup unit.
+optional operational backup unit, not the only copy of repairable archive data.
+The current `memory.canonical` adapter is the exception: its event and purge
+history is not yet independently repairable after simultaneous relay and
+`state.db` loss. Semantic-proof cutover must remove that exception before the
+disposable-relay recovery claim applies to memory.
 
 ## Canonical provenance schema
 

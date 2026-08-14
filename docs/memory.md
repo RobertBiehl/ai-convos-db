@@ -251,6 +251,14 @@ canonical deletion and remains visible for review. Existing private memory or
 relay backups are historical copies and are not rewritten; expire pre-forget
 backups according to the desired retention policy.
 
+This memory remote adapter is the current exception to disposable relay state.
+Its deletion proof is a purge certificate retained by the relay and derived
+through remote sync state, rather than a proof retained with the semantic memory
+object. Simultaneous loss of the relay and `state.db` therefore cannot yet
+repair that evidence from the memory ledger alone. The planned semantic-proof
+cutover replaces this special event/purge path; this limitation is not part of
+the intended permanent contract.
+
 `history MEMORY` renders source or canonical identity plus every chronological
 revision as readable Markdown. Canonicals accept the same scoped human
 selector; low-level source histories still use a source ID.

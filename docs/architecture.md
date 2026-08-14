@@ -47,6 +47,10 @@ relay to remove only the same device author's prior personal canonical event
 IDs. The relay keeps an opaque replay-denial tombstone; recipients erase their
 decrypted event copies and purge a canonical only when it remains remote-only
 and unchanged.
+This event/purge adapter is transitional. Unlike archive row proofs, its
+deletion evidence cannot yet be rebuilt from surviving semantic replicas after
+simultaneous relay and remote-state loss; the normative target is documented in
+[Product invariants](invariants.md).
 
 ```
 ┌─────────────────┐     ┌─────────────────┐     ┌─────────────────┐
