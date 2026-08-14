@@ -6,7 +6,7 @@ import pytest
 from ai_convos.cli import init_schema
 import ai_convos_remote.projection as projection_module
 from ai_convos_remote import publish
-from ai_convos_remote.projection import bridges, connect, project, rebuild, scan, sequence
+from ai_convos_remote.projection import bridges, connect, project, project_many, rebuild, scan, sequence
 from ai_convos_remote.protocol import b64, event, identity, seal_history
 
 
@@ -53,6 +53,13 @@ def test_out_of_order_revisions_converge_and_replay_deduplicates(tmp_path):
     new=event(device,2,"conversation.record","conversations:c",{"table":"conversations","columns":cols,"row":["c","codex","new","2026-01-01","2026-01-02",None,None,None,None,"{}"]},[old["id"]],"2026-01-02T00:00:00Z")
     assert project(tmp_path/"db",state,new,"w","different") and not project(tmp_path/"db",state,old,"w","different") and not project(tmp_path/"db",state,new,"w","different")
     assert duckdb.connect(str(tmp_path/"db"),read_only=True).execute("SELECT title FROM conversations").fetchone()[0]=="new"
+
+
+def test_projection_batch_rolls_back_duckdb_and_state_together(tmp_path):
+    state=connect(tmp_path/"state.db"); device=identity(); cols=["id","source","title","created_at","updated_at","model","cwd","git_branch","project_id","metadata"]; payload={"table":"conversations","columns":cols,"row":["c","codex","valid","2026-01-01","2026-01-01",None,None,None,None,"{}"]}
+    good=event(device,1,"conversation.record","conversations:c",payload,[],"2026-01-01T00:00:00Z"); bad=event(device,2,"conversation.record","conversations:wrong",{**payload,"row":["bad",*payload["row"][1:]]},[good["id"]],"2026-01-01T00:00:01Z")
+    with pytest.raises(ValueError,match="schema"): project_many(tmp_path/"db",state,[("w",good),("w",bad)],"other")
+    db=duckdb.connect(str(tmp_path/"db"),read_only=True); assert db.execute("SELECT COUNT(*) FROM conversations").fetchone()[0]==0; db.close(); assert not state.execute("SELECT * FROM heads").fetchall() and not state.execute("SELECT * FROM imported_rows").fetchall()
 
 
 def test_rebuild_unwraps_republished_history(tmp_path):
