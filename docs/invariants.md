@@ -92,6 +92,11 @@ they do not depend on relay or `state.db` history.
 > re-founding, a valid successor may retain the old origin and predecessor while
 > using the fresh workspace as its authorization context.
 
+> A retained current-row replica carries the exact signed proof-header chain
+> back to its root, but no superseded row bodies. Receivers verify every
+> signature and direct predecessor link before using that chain to reject a
+> stale ancestor or identify a true fork.
+
 > A replacement relay rebuilds from the union of surviving authorized replicas.
 > Peers advertise flat, paginated logical identities, revisions, deletion
 > states, proofs, and blob hashes; the relay requests what it lacks. Repair is

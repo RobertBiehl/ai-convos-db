@@ -246,12 +246,21 @@ def upload_blobs(cfg,state,root,workspaces):
 def pull_origins(cfg,state,root,ws):
     sid=ws["id"]; values=request(cfg,{"op":"origin_pull","workspace":sid})["origins"]
     if not values: return {r[0] for r in state.execute("SELECT origin FROM origin_bindings WHERE workspace=?",(sid,)).fetchall()}
+    valid={}; invalid={}
+    for item in values:
+        env=item["envelope"]; identity=(env["origin"],env["epoch"])
+        if env["workspace"]!=sid or not isinstance(item["cursor"],int) or isinstance(item["cursor"],bool) or not access_from(cfg,sid)<=env["epoch"]<=cfg["controls"][sid]["epoch"]: raise ValueError("origin bundle response mismatch")
+        if identity in valid: continue
+        try: body=open_origin(env,key(cfg,sid,env["epoch"])); controls=control_chain(body["controls"]); origin=controls[0]["workspace"]
+        except ValueError: invalid[identity]=item["cursor"]
+        else:
+            if origin==sid: raise ValueError("origin bundle response mismatch")
+            valid[identity]=(item,body,controls,origin); invalid.pop(identity,None)
+    if invalid: raise ValueError(f"invalid origin bundle: no valid delivery copy for {len(invalid)} object(s)")
     core=open_db(core_path(root)); init_schema(core); core.execute("BEGIN")
     try:
-        for item in values:
-            env=item["envelope"]; body=open_origin(env,key(cfg,sid,env["epoch"])); controls=control_chain(body["controls"]); origin=controls[0]["workspace"]
-            if env["workspace"]!=sid or not isinstance(item["cursor"],int) or isinstance(item["cursor"],bool) or not access_from(cfg,sid)<=env["epoch"]<=cfg["controls"][sid]["epoch"] or origin==sid: raise ValueError("origin bundle response mismatch")
-            project_workspace_controls(core,controls); state.execute(f"INSERT OR REPLACE INTO {'origin_bindings' if body['rows'] else 'control_dependencies'} VALUES (?,?,?,?,?)",(sid,origin,env["origin"],env["epoch"],item["cursor"]))
+        for item,body,controls,origin in valid.values():
+            env=item["envelope"]; project_workspace_controls(core,controls); state.execute(f"INSERT OR REPLACE INTO {'origin_bindings' if body['rows'] else 'control_dependencies'} VALUES (?,?,?,?,?)",(sid,origin,env["origin"],env["epoch"],item["cursor"]))
         state.commit(); core.execute("COMMIT"); return {r[0] for r in state.execute("SELECT origin FROM origin_bindings WHERE workspace=?",(sid,)).fetchall()}
     except BaseException: core.execute("ROLLBACK"); state.rollback(); raise
     finally: core.close()
@@ -283,21 +292,29 @@ def pull_row_replicas(cfg,state,root,ws,recover=None,origins=()):
             return total
         if not result["replicas"]: raise ValueError("relay replica tail cannot be reached")
 def pull_blobs(cfg,state,root,ws,recover=None):
-    sid=ws["id"]; after=int((state.execute("SELECT value FROM meta WHERE key=?",(f"blob_cursor:{sid}",)).fetchone() or [0])[0]); total=0; known={(r[0],r[1]) for r in state.execute("SELECT blob,epoch FROM blob_receipts WHERE workspace=?",(sid,)).fetchall()}; checked=recover is None or not known
+    sid=ws["id"]; after=int((state.execute("SELECT value FROM meta WHERE key=?",(f"blob_cursor:{sid}",)).fetchone() or [0])[0]); cursor,total=after,0; known={(r[0],r[1]) for r in state.execute("SELECT blob,epoch FROM blob_receipts WHERE workspace=?",(sid,)).fetchall()}; valid=set(known); invalid={}; checked=recover is None or not known
     while True:
-        result=request(cfg,{"op":"blob_pull","workspace":sid,"after":after,"limit":20}); floor,tail=result["floor"],result["tail"]
+        result=request(cfg,{"op":"blob_pull","workspace":sid,"after":cursor,"limit":20}); floor,tail=result["floor"],result["tail"]
         if not all(isinstance(v,int) and not isinstance(v,bool) and v>=0 for v in (floor,tail)) or floor>tail and tail: raise ValueError("relay blob cursor window is invalid")
-        if after>tail: after=0; state.execute("DELETE FROM meta WHERE key=?",(f"blob_cursor:{sid}",)); state.execute("INSERT OR REPLACE INTO meta VALUES (?,?)",(f"replica_repair:{sid}","1")); state.commit(); continue
+        if cursor>tail: cursor=after=0; known=set(); valid=set(); invalid={}; state.execute("DELETE FROM meta WHERE key=?",(f"blob_cursor:{sid}",)); state.execute("INSERT OR REPLACE INTO meta VALUES (?,?)",(f"replica_repair:{sid}","1")); state.commit(); continue
         if not checked and result["blobs"]:
-            core=open_db(core_path(root),True); hashes=[r[0] for r in core.execute("SELECT content_hash FROM attachment_bodies").fetchall()]; core.close(); epochs={r[1] for r in known}; known&={(fingerprint(key(cfg,sid,epoch),body_hash),epoch) for body_hash in hashes for epoch in epochs}; checked=True
-        cursor=after
+            core=open_db(core_path(root),True); hashes=[r[0] for r in core.execute("SELECT content_hash FROM attachment_bodies").fetchall()]; core.close(); epochs={r[1] for r in known}; known&={(fingerprint(key(cfg,sid,epoch),body_hash),epoch) for body_hash in hashes for epoch in epochs}; valid=set(known); checked=True
+        received=[]
         for item in result["blobs"]:
             env=item["envelope"]
             if not isinstance(item["cursor"],int) or isinstance(item["cursor"],bool) or not cursor<item["cursor"]<=tail or env["workspace"]!=sid or not access_from(cfg,sid)<=env["epoch"]<=cfg["controls"][sid]["epoch"]: raise ValueError("blob replica envelope response mismatch")
-            if (env["blob"],env["epoch"]) not in known: data,body_hash=open_blob(env,key(cfg,sid,env["epoch"])); project_attachment_body(core_path(root),data,body_hash)
-            cursor=item["cursor"]; state.execute("INSERT OR REPLACE INTO blob_receipts VALUES (?,?,?,?)",(sid,env["blob"],env["epoch"],cursor)); after=cursor; total+=1
-        state.execute("INSERT OR REPLACE INTO meta VALUES (?,?)",(f"blob_cursor:{sid}",str(after))); state.commit()
-        if after>=tail: return total
+            cursor=item["cursor"]; received.append(item); identity=(env["blob"],env["epoch"])
+            if identity not in valid:
+                try: data,body_hash=open_blob(env,key(cfg,sid,env["epoch"]))
+                except ValueError: invalid.setdefault(identity,item["cursor"])
+                else: project_attachment_body(core_path(root),data,body_hash); known.add(identity); valid.add(identity); invalid.pop(identity,None)
+        for item in received:
+            env=item["envelope"]; identity=(env["blob"],env["epoch"])
+            if identity in valid: state.execute("INSERT OR REPLACE INTO blob_receipts VALUES (?,?,?,?)",(sid,*identity,item["cursor"]))
+        after=min(invalid.values())-1 if invalid else cursor; total+=len(received); state.execute("INSERT OR REPLACE INTO meta VALUES (?,?)",(f"blob_cursor:{sid}",str(after))); state.commit()
+        if cursor>=tail:
+            if invalid: raise ValueError(f"invalid blob replica: no valid delivery copy for {len(invalid)} object(s)")
+            return total
         if not result["blobs"]: raise ValueError("relay blob tail cannot be reached")
 def pull(cfg,state,root=None):
     root=local_root(root)

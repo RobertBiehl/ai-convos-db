@@ -59,14 +59,21 @@ def registration_proof(device,challenge,root_public,cert):
 def row_proof(device,user,workspace,epoch,row,previous=None,authorization_workspace=None,content_hash=None):
     claim={"row_kind":row["kind"],"row_id":row["id"],"encoding_v":row["v"],"content_hash":content_hash if content_hash is not None else digest(row),"previous_revision":previous,"state":row["state"]}; body={"v":1,"kind":"row.proof","workspace":workspace,"authorization_workspace":authorization_workspace or workspace,**claim,"revision":digest({"v":1,**claim}),"author_user_id":user,"author_device_id":device["id"],"authorization_epoch":epoch}; body["signature"]=b64(_priv(Ed25519PrivateKey,device["sign_private"]).sign(canon(body))); return body
 
-def verify_row_proof(value,row,cert,root_public):
+def verify_row_proof_header(value,cert,root_public):
     try:
         signed={k:v for k,v in value.items() if k!="signature"}; device=verified_certificate(canon(cert),root_public)["device"]; previous=value["previous_revision"]
         claim={k:value[k] for k in ("row_kind","row_id","encoding_v","content_hash","previous_revision","state")}
-        if set(row)!={"v","kind","id","state","data"} or row["kind"] not in SEMANTIC_FIELDS_V1 or not isinstance(row["id"],str) or not row["id"] or row["v"]!=1 or row["state"] not in ("active","deleted") or row["kind"] in PROVENANCE_FIELDS_V1 and row["state"]!="active" or row["data"] is not None and (row["state"]!="active" or set(row["data"])!=set(SEMANTIC_FIELDS_V1[row["kind"]])) or row["state"]=="deleted" and row["data"] is not None: raise ValueError
-        if set(value)!=ROW_PROOF_FIELDS or value["v"]!=1 or value["kind"]!="row.proof" or any(not isinstance(value[k],str) or not value[k] for k in ("workspace","authorization_workspace")) or (value["row_kind"],value["row_id"],value["encoding_v"],value["content_hash"],value["state"])!=(row["kind"],row["id"],row["v"],digest(row),row["state"]) or value["revision"]!=digest({"v":1,**claim}) or previous is not None and (not isinstance(previous,str) or len(previous)!=64 or any(c not in "0123456789abcdef" for c in previous) or previous==value["revision"]) or not isinstance(value["authorization_epoch"],int) or isinstance(value["authorization_epoch"],bool) or value["authorization_epoch"]<1 or (cert["user"],device["id"],public_id(root_public),public_id(device["sign_public"]))!=(value["author_user_id"],value["author_device_id"],value["author_user_id"],value["author_device_id"]): raise ValueError
+        hex64=lambda v:isinstance(v,str) and len(v)==64 and not any(c not in "0123456789abcdef" for c in v)
+        if set(value)!=ROW_PROOF_FIELDS or value["v"]!=1 or value["kind"]!="row.proof" or any(not isinstance(value[k],str) or not value[k] for k in ("workspace","authorization_workspace","row_id")) or value["row_kind"] not in SEMANTIC_FIELDS_V1 or value["encoding_v"]!=1 or not hex64(value["content_hash"]) or value["state"] not in ("active","deleted") or value["row_kind"] in PROVENANCE_FIELDS_V1 and value["state"]!="active" or value["revision"]!=digest({"v":1,**claim}) or previous is not None and (not hex64(previous) or previous==value["revision"]) or not isinstance(value["authorization_epoch"],int) or isinstance(value["authorization_epoch"],bool) or value["authorization_epoch"]<1 or (cert["user"],device["id"],public_id(root_public),public_id(device["sign_public"]))!=(value["author_user_id"],value["author_device_id"],value["author_user_id"],value["author_device_id"]): raise ValueError
         _pub(Ed25519PublicKey,device["sign_public"]).verify(unb64(value["signature"]),canon(signed)); return value
     except (InvalidSignature,KeyError,TypeError,ValueError) as e: raise ValueError("invalid row proof") from e
+
+def verify_row_proof(value,row,cert,root_public):
+    try:
+        verify_row_proof_header(value,cert,root_public)
+        if set(row)!={"v","kind","id","state","data"} or row["kind"] not in SEMANTIC_FIELDS_V1 or not isinstance(row["id"],str) or not row["id"] or row["v"]!=1 or row["state"] not in ("active","deleted") or row["kind"] in PROVENANCE_FIELDS_V1 and row["state"]!="active" or row["data"] is not None and (row["state"]!="active" or set(row["data"])!=set(SEMANTIC_FIELDS_V1[row["kind"]])) or row["state"]=="deleted" and row["data"] is not None or (value["row_kind"],value["row_id"],value["encoding_v"],value["content_hash"],value["state"])!=(row["kind"],row["id"],row["v"],digest(row),row["state"]): raise ValueError
+        return value
+    except (KeyError,TypeError,ValueError) as e: raise ValueError("invalid row proof") from e
 
 def semantic_proof(root,user,device,workspace,epoch,row,previous=None):
     parents=[] if previous is None else previous if isinstance(previous,list) else [previous]; ancestors=[] if not parents else [parents[0]["revision"],*sorted({a for p in parents for a in [p["revision"],*p["ancestors"]]}-{parents[0]["revision"]})]; claim={"object_kind":row["kind"],"object_id":row["id"],"encoding_v":row["v"],"content_hash":digest(row),"previous_revision":ancestors[0] if ancestors else None,"ancestors":ancestors,"state":row["state"]}; body={"v":1,"kind":"semantic.proof","workspace":workspace,**claim,"revision":digest({"v":1,**claim}),"author_user_id":user,"author_device_id":device,"authorization_epoch":epoch,"root_public":root["sign_public"]}; body["signature"]=b64(_priv(Ed25519PrivateKey,root["sign_private"]).sign(canon(body))); return body
@@ -104,15 +111,15 @@ def open_event(envelope, key, sign_public):
     if (value["id"], value["author"], value["seq"], value["parents"]) != (header["event"], header["author"], header["seq"], header["parents"]): raise ValueError("Envelope header mismatch")
     return value
 
-def seal_replica(row,proof,workspace,epoch,key,uploader,content_hash=None):
+def seal_replica(row,proof,workspace,epoch,key,uploader,content_hash=None,lineage=()):
     if proof["content_hash"]!=(content_hash if content_hash is not None else digest(row)): raise ValueError("row replica proof mismatch")
-    nonce=os.urandom(12); header={"v":1,"kind":"row.replica","workspace":workspace,"replica":fingerprint(key,digest(proof)),"epoch":epoch,"uploader":uploader,"nonce":b64(nonce)}; return {**header,"ciphertext":b64(AESGCM(key).encrypt(nonce,canon({"row":row,"proof":proof}),canon(header)))}
+    nonce=os.urandom(12); header={"v":1,"kind":"row.replica","workspace":workspace,"replica":fingerprint(key,digest(proof)),"epoch":epoch,"uploader":uploader,"nonce":b64(nonce)}; return {**header,"ciphertext":b64(AESGCM(key).encrypt(nonce,canon({"row":row,"proof":proof,"lineage":list(lineage)}),canon(header)))}
 
 def open_replica(value,key):
     try:
         if set(value)!={"v","kind","workspace","replica","epoch","uploader","nonce","ciphertext"} or value["v"]!=1 or value["kind"]!="row.replica": raise ValueError
         header={k:value[k] for k in ("v","kind","workspace","replica","epoch","uploader","nonce")}; body=json.loads(AESGCM(key).decrypt(unb64(value["nonce"]),unb64(value["ciphertext"]),canon(header)))
-        if set(body)!={"row","proof"} or value["replica"]!=fingerprint(key,digest(body["proof"])) or body["proof"]["content_hash"]!=digest(body["row"]): raise ValueError
+        if set(body)!={"row","proof","lineage"} or not isinstance(body["lineage"],list) or value["replica"]!=fingerprint(key,digest(body["proof"])) or body["proof"]["content_hash"]!=digest(body["row"]): raise ValueError
         return body
     except (InvalidTag,KeyError,TypeError,ValueError) as e: raise ValueError("invalid row replica") from e
 
