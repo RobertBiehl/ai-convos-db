@@ -1,10 +1,15 @@
 [project]
-name = "ai-convos-remote-server"
-version = "0.7.0"
-description = "Self-hosted opaque event relay for ai-convos-db"
+name = "convos-remote-server"
+version = "0.8.0"
+description = "Self-hosted opaque event relay for convos"
+readme = "README.md"
 license = "MIT"
 requires-python = ">=3.12"
 dependencies = ["cryptography>=42.0.0"]
+
+[project.urls]
+Documentation = "https://github.com/RobertBiehl/convos/blob/master/docs/remote.md"
+Repository = "https://github.com/RobertBiehl/convos"
 
 [project.scripts]
 convos-server = "ai_convos_remote_server:main"

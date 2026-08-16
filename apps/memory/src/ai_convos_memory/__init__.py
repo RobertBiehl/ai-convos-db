@@ -368,8 +368,8 @@ def remote_token(root):
     db=connect(root); value=db.execute("SELECT value FROM remote_meta WHERE key='ledger_id'").fetchone()[0]; db.close(); return value
 def remote_bridge(): return dict(v=2,objects={"memory.canonical"},records=remote_records,accept=remote_accept,token=remote_token)
 def _skill_source():
-    rel = Path("skills")/"agent-convos"/"SKILL.md"; root = Path(os.environ.get("CONVOS_PROJECT_ROOT", Path.home()/".convos")).expanduser()
-    roots = (root, Path(__file__).resolve().parents[4], Path(sysconfig.get_paths().get("data", ""))/"share"/"ai-convos-db", Path(site.getuserbase())/"share"/"ai-convos-db")
+    rel = Path("skills")/"convos"/"SKILL.md"; root = Path(os.environ.get("CONVOS_PROJECT_ROOT", Path.home()/".convos")).expanduser()
+    roots = (root, Path(__file__).resolve().parents[4], Path(sysconfig.get_paths().get("data", ""))/"share"/"convos", Path(site.getuserbase())/"share"/"convos")
     return next((p for r in roots if (p := r/rel).exists()), None)
 def _hook_valid(command, path):
     parts = shlex.split(command); return len(parts) == 4 and parts[0] == f"CONVOS_MEMORY_DB={path}" and Path(parts[1]).is_file() and os.access(parts[1], os.X_OK) and parts[2:] == ["memory", "runtime-hook"]
@@ -394,7 +394,7 @@ def _codex_hook_trust(command, cwd):
     process = None
     try:
         process = subprocess.Popen([binary,"app-server","--stdio"], cwd=cwd, text=True, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL); output = queue.Queue(); threading.Thread(target=_rpc_reader,args=(process.stdout,output),daemon=True).start()
-        process.stdin.write(json.dumps({"id":1,"method":"initialize","params":{"clientInfo":{"name":"ai-convos-memory","title":"ai-convos-memory","version":"0.7.0"}}})+"\n"); process.stdin.flush(); _rpc_wait(output, 1)
+        process.stdin.write(json.dumps({"id":1,"method":"initialize","params":{"clientInfo":{"name":"convos-memory","title":"convos-memory","version":"0.8.0"}}})+"\n"); process.stdin.flush(); _rpc_wait(output, 1)
         process.stdin.write(json.dumps({"method":"initialized","params":{}})+"\n"+json.dumps({"id":2,"method":"hooks/list","params":{"cwds":[cwd]}})+"\n"); process.stdin.flush(); result = _rpc_wait(output, 2)
         return next((h["trustStatus"] for row in result["data"] for h in row["hooks"] if h["command"] == command), "missing")
     except (OSError, ValueError, KeyError, TypeError, TimeoutError): return "unknown"
@@ -406,7 +406,7 @@ def _codex_hook_trust(command, cwd):
 def _health_data():
     scope, path = _scope(), _db_path().resolve(); claude = Path(os.environ.get("CLAUDE_CONFIG_DIR", Path.home()/".claude")).expanduser(); codex = Path(os.environ.get("CODEX_HOME", Path.home()/".codex")).expanduser()
     if not (skill := _skill_source()): raise ValueError("bundled agent skill is missing")
-    commands = [(source,h["command"]) for source,config in _hook_paths() for g in _hook_data(source, config)[1].get("SessionStart", []) for h in g.get("hooks", []) if _hook_valid(h.get("command", ""), path)]; hooks = len(commands); codex_command = next((c for s,c in commands if s == "codex"), None); trust = _codex_hook_trust(codex_command, scope); expected = _hash(skill.read_text()); skills = sum(p.exists() and _hash(p.read_text()) == expected for root in (codex, claude) if (p := root/"skills"/"agent-convos"/"SKILL.md"))
+    commands = [(source,h["command"]) for source,config in _hook_paths() for g in _hook_data(source, config)[1].get("SessionStart", []) for h in g.get("hooks", []) if _hook_valid(h.get("command", ""), path)]; hooks = len(commands); codex_command = next((c for s,c in commands if s == "codex"), None); trust = _codex_hook_trust(codex_command, scope); expected = _hash(skill.read_text()); skills = sum(p.exists() and _hash(p.read_text()) == expected for root in (codex, claude) if (p := root/"skills"/"convos"/"SKILL.md"))
     if not path.exists(): return dict(scope=scope,ledger=False,sources=0,active=0,canonicals=0,pending=0,hooks=hooks,trust=trust,skills=skills,ready=False,repairs=["convos memory enable"])
     scan_store(scope); db = sqlite3.connect(path.as_uri()+"?mode=ro", uri=True); sources, active = db.execute("SELECT COUNT(*),COALESCE(SUM(active),0) FROM sources WHERE scope=?", (scope,)).fetchone(); canonicals = db.execute("SELECT COUNT(*) FROM canonicals WHERE scope=?", (scope,)).fetchone()[0]; pending = db.execute("""SELECT COUNT(*) FROM sources s LEFT JOIN links l ON l.source=s.id WHERE ((s.active AND (l.source IS NULL OR l.applied_hash<>s.hash)) OR (NOT s.active AND l.source IS NOT NULL)) AND s.scope=?""", (scope,)).fetchone()[0]; db.close()
     trusted = trust in ("trusted","managed"); trust_repair = "install Codex to verify memory delivery" if trust == "unavailable" else "review Codex hooks with /hooks" if trust in ("untrusted","modified") else "verify Codex hook loading with /hooks"; ready = hooks == 2 and skills == 2 and trusted and not pending; repairs = ([] if hooks == 2 and skills == 2 else ["convos memory enable"]) + ([] if trusted or not codex_command else [trust_repair]) + ([] if not pending else ['ask Codex or Claude: "sync my memories"'])
@@ -519,7 +519,7 @@ def projection_data(target, scope):
     if pending := plan_data(scope=scope)["pending"]: raise ValueError(f"{len(pending)} pending source revision{'s' if len(pending) != 1 else ''}; reconcile scope before projection")
     rows = _current(scope)
     if not rows: raise ValueError(f"No canonical memories for scope {scope}")
-    content = "\n\n".join(["<!-- ai-convos-memory projection:v1 -->\n# Synchronized memories"] + [f"<!-- canonical:{r['id']} revision:{r['hash']} -->\n## {r['id']}\n\nScope: `{r['scope']}`\n\n{r['content']}" for r in rows]) + "\n"
+    content = "\n\n".join(["<!-- convos-memory projection:v1 -->\n# Synchronized memories"] + [f"<!-- canonical:{r['id']} revision:{r['hash']} -->\n## {r['id']}\n\nScope: `{r['scope']}`\n\n{r['content']}" for r in rows]) + "\n"
     digest, existing = _hash(content), _hash(path.read_text()) if path.exists() else None; db = connect(); known = db.execute("SELECT hash FROM projections WHERE provider='claude-code' AND target=?", (str(path),)).fetchone(); db.close()
     status = "create" if existing is None else "unchanged" if existing == digest else "update" if known and existing == known[0] else "drift"
     return dict(provider="claude-code", target=str(path), scope=scope, hash=digest, status=status, content=content)

@@ -12,7 +12,7 @@ def _loc(paths):
 
 
 def test_line_budget():
-    """Keep the cohesive archive-writing core under its explicit 1150-line budget."""
+    """Keep the cohesive archive-writing core under its explicit 1200-line budget."""
     root = Path(__file__).resolve().parents[1]
     paths = sorted((root / "src" / "ai_convos").glob("*.py"))
     assert paths, "No source files found"
@@ -41,5 +41,6 @@ def test_changegraph_is_read_only():
 
 def test_installable_product_versions_are_aligned():
     root = Path(__file__).resolve().parents[1]; files = [root/"pyproject.toml", *sorted((root/"apps").glob("*/pyproject.toml"))]
-    versions = {f.parent.name:tomllib.loads(f.read_text())["project"]["version"] for f in files}
-    assert set(versions.values()) == {"0.7.0"}, versions
+    projects = {f.parent.name:tomllib.loads(f.read_text())["project"] for f in files}
+    assert {p["name"] for p in projects.values()} == {"convos","convos-changegraph","convos-explore","convos-memory","convos-redact","convos-remote","convos-remote-server","convos-resume"}, projects
+    assert {p["version"] for p in projects.values()} == {"0.8.0"}, projects

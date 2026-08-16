@@ -1,6 +1,6 @@
-# ai-convos-explore
+# convos-explore
 
-Local semantic navigation for an `ai-convos-db` archive:
+Local semantic navigation for an `convos` archive:
 
 ```bash
 convos related CONVERSATION_OR_MESSAGE_ID
@@ -10,7 +10,7 @@ convos trail CONVERSATION_OR_MESSAGE_ID
 Install it with the core product:
 
 ```bash
-uv tool install "ai-convos-db[explore]"
+uv tool install "convos[explore]"
 ```
 
 A conversation target uses up to 32 recent embedded human turns as its

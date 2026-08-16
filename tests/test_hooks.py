@@ -223,7 +223,7 @@ def test_init_sets_up_core_and_installed_products(hooks, monkeypatch):
 def test_managed_files_are_atomic_private_and_reject_skill_symlinks(tmp_path, monkeypatch, unsafe_name, unsafe_kind):
     managed, fresh = tmp_path/"managed.json", tmp_path/"fresh.json"; managed.write_text("{}"); os.chmod(managed, 0o640); cli.atomic_json(managed, {"ready":True}); cli.atomic_json(fresh, {})
     assert json.loads(managed.read_text()) == {"ready":True} and os.stat(managed).st_mode&0o777 == 0o640 and os.stat(fresh).st_mode&0o777 == 0o600
-    codex, claude, outside = tmp_path/"codex", tmp_path/"claude", tmp_path/"outside"; targets = {"codex":codex/"skills"/"agent-convos"/"SKILL.md","claude":claude/"skills"/"agent-convos"/"SKILL.md"}; unsafe, safe = targets[unsafe_name], targets[{"codex":"claude","claude":"codex"}[unsafe_name]]; safe.parent.mkdir(parents=True); safe.write_text("unchanged")
+    codex, claude, outside = tmp_path/"codex", tmp_path/"claude", tmp_path/"outside"; targets = {"codex":codex/"skills"/"convos"/"SKILL.md","claude":claude/"skills"/"convos"/"SKILL.md"}; unsafe, safe = targets[unsafe_name], targets[{"codex":"claude","claude":"codex"}[unsafe_name]]; safe.parent.mkdir(parents=True); safe.write_text("unchanged")
     if unsafe_kind == "file": unsafe.parent.mkdir(parents=True); outside.write_text("sentinel"); unsafe.symlink_to(outside)
     else: unsafe.parent.parent.mkdir(parents=True); outside.mkdir(); unsafe.parent.symlink_to(outside) if unsafe_kind == "directory" else unsafe.parent.write_text("blocker")
     monkeypatch.setenv("CODEX_HOME", str(codex)); monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(claude)); result = CliRunner().invoke(cli.app, ["install-skills"])
@@ -231,8 +231,13 @@ def test_managed_files_are_atomic_private_and_reject_skill_symlinks(tmp_path, mo
 
 def test_install_skills_allows_one_shared_declared_destination(tmp_path, monkeypatch):
     codex, claude = tmp_path/"codex", tmp_path/"claude"; (codex/"skills").mkdir(parents=True); claude.mkdir(); (claude/"skills").symlink_to(codex/"skills", target_is_directory=True); monkeypatch.setenv("CODEX_HOME", str(codex)); monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(claude))
-    result = CliRunner().invoke(cli.app, ["install-skills"]); a, b = codex/"skills"/"agent-convos"/"SKILL.md", claude/"skills"/"agent-convos"/"SKILL.md"
+    result = CliRunner().invoke(cli.app, ["install-skills"]); a, b = codex/"skills"/"convos"/"SKILL.md", claude/"skills"/"convos"/"SKILL.md"
     assert result.exit_code == 0 and result.output.count("Installed ") == 2 and a.samefile(b) and a.read_text() == b.read_text()
+
+def test_install_skills_replaces_only_exact_legacy_skill(tmp_path, monkeypatch):
+    codex,claude=tmp_path/"codex",tmp_path/"claude"; monkeypatch.setenv("CODEX_HOME",str(codex)); monkeypatch.setenv("CLAUDE_CONFIG_DIR",str(claude)); source=(Path(__file__).resolve().parents[1]/"skills/convos/SKILL.md").read_text(); legacy=source.replace("name: convos","name: agent-convos",1).replace("# Convos","# Agent Convos",1); exact,modified=codex/"skills/agent-convos/SKILL.md",claude/"skills/agent-convos/SKILL.md"
+    exact.parent.mkdir(parents=True); exact.write_text(legacy); modified.parent.mkdir(parents=True); modified.write_text(legacy+"\ncustom\n"); result=CliRunner().invoke(cli.app,["install-skills"])
+    assert result.exit_code==0 and not exact.exists() and modified.read_text().endswith("custom\n") and (codex/"skills/convos/SKILL.md").read_text()==source and (claude/"skills/convos/SKILL.md").read_text()==source
 
 def test_doctor_reports_archive_ingest_and_hook_health(hooks, monkeypatch):
     _, data = hooks; claude = data/"claude"; claude.mkdir(parents=True); monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(claude)); monkeypatch.setattr(cli, "safari_cookie_domains", lambda: []); monkeypatch.setattr(cli, "chrome_cookie_domains", lambda: [])
@@ -246,8 +251,8 @@ def test_doctor_detects_current_stale_and_symlinked_skills(hooks, tmp_path, monk
     _, data = hooks; codex,claude=Path(os.environ["CODEX_HOME"]),tmp_path/"claude"; claude.mkdir(); monkeypatch.setenv("CLAUDE_CONFIG_DIR",str(claude)); monkeypatch.setattr(cli,"entry_points",lambda **_:[]); monkeypatch.setattr(cli,"safari_cookie_domains",lambda:[]); monkeypatch.setattr(cli,"chrome_cookie_domains",lambda:[]); runner=CliRunner()
     missing=runner.invoke(cli.app,["doctor"]).output; assert "skills: 0/2 current" in missing and "repair: convos install-skills" in missing
     assert runner.invoke(cli.app,["install-skills"]).exit_code==0; current=runner.invoke(cli.app,["doctor"]).output; assert "skills: 2/2 current" in current and "repair: convos install-skills" not in current
-    target=claude/"skills/agent-convos/SKILL.md"; target.write_text("stale"); assert "skills: 1/2 current" in runner.invoke(cli.app,["doctor"]).output
-    target.unlink(); target.symlink_to(codex/"skills/agent-convos/SKILL.md"); linked=runner.invoke(cli.app,["doctor"]).output; assert "skills: 1/2 current" in linked and "repair: convos install-skills" in linked
+    target=claude/"skills/convos/SKILL.md"; target.write_text("stale"); assert "skills: 1/2 current" in runner.invoke(cli.app,["doctor"]).output
+    target.unlink(); target.symlink_to(codex/"skills/convos/SKILL.md"); linked=runner.invoke(cli.app,["doctor"]).output; assert "skills: 1/2 current" in linked and "repair: convos install-skills" in linked
 
 def test_doctor_surfaces_schema_skew(hooks, monkeypatch):
     _, data = hooks; data.mkdir(); monkeypatch.setattr(cli, "safari_cookie_domains", lambda: []); monkeypatch.setattr(cli, "chrome_cookie_domains", lambda: [])

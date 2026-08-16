@@ -1,6 +1,6 @@
 # Cross-provider memory synchronization
 
-The optional `ai-convos-memory` product tracks exact revisions of Codex,
+The optional `convos-memory` product tracks exact revisions of Codex,
 Claude Code, and user-owned memories in a separate SQLite ledger, then builds a
 canonical local overlay through an agent-assisted synchronization workflow.
 
@@ -65,7 +65,7 @@ literal. Run `enable` after machine recovery to reinstall delivery.
 
 ## Encrypted multi-device delivery
 
-When both `ai-convos-memory` and `ai-convos-remote` are installed, the remote
+When both `convos-memory` and `convos-remote` are installed, the remote
 client discovers the memory adapter automatically. Its normal background sync
 publishes canonical revisions only to the user's personal workspace and
 projects incoming revisions into the private memory ledger. There is no second
@@ -116,21 +116,21 @@ observation, hook setting, or native provider file.
 ## Install
 
 ```bash
-uv tool install "ai-convos-db[memory]"
+uv tool install "convos[memory]"
 convos init
 ```
 
 The core extra is installation metadata, not an implementation boundary:
-`ai-convos-memory` remains independently versioned and its metadata enforces
+`convos-memory` remains independently versioned and its metadata enforces
 the compatible core range. For an unreleased source snapshot, install both
 products from the same Git revision:
 
 ```bash
-uv tool install --reinstall "git+https://github.com/RobertBiehl/ai-convos-db.git" \
-  --with "ai-convos-memory @ git+https://github.com/RobertBiehl/ai-convos-db.git#subdirectory=apps/memory"
+uv tool install --reinstall "git+https://github.com/RobertBiehl/convos.git" \
+  --with "convos-memory @ git+https://github.com/RobertBiehl/convos.git#subdirectory=apps/memory"
 ```
 
-Memory 0.7 supports `ai-convos-db>=0.7,<0.8`. The package metadata enforces
+Memory 0.8 supports `convos>=0.8,<0.9`. The package metadata enforces
 that contract, so an independently installed memory wheel cannot silently pair
 with an unsupported core CLI.
 `init` installs both agent skill copies, core capture hooks, and both agents'

@@ -11,6 +11,7 @@ read_when:
 Normative product boundaries for archive ownership, replication, recovery, and
 provenance live in [Product invariants](invariants.md). Implementation plans and
 older design notes yield to those rules unless they are deliberately revised.
+Canonical public and internal names live in the [Naming contract](naming.md).
 
 ## Overview
 
@@ -93,7 +94,7 @@ Capture hooks use the same exact-state rule. Their managed command pins the
 root. Health requires one exact handler in each provider event, preventing an
 old tool path, duplicate, or misplaced lifecycle handler from masquerading as
 working capture.
-The total `src/ai_convos/` core remains under the 1000-line budget enforced by
+The total `src/ai_convos/` core remains under the 1200-line budget enforced by
 `tests/test_budget.py`; every application has its own honest product budget.
 
 ### ParseResult Normalization
@@ -180,7 +181,7 @@ the prior payload under a deterministic history id with provenance metadata.
 User data (DuckDB + state) lives under `~/.convos` by default (override with `CONVOS_PROJECT_ROOT`).
 
 ```
-ai-convos-db/
+convos/
 ├── src/ai_convos/
 │   ├── __init__.py      # exports app
 │   ├── cli.py           # all logic

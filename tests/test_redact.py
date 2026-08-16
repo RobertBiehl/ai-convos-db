@@ -14,8 +14,8 @@ def app():
 
 def test_distribution_metadata_registration_and_remote_dependency():
     project=tomllib.loads((Path(__file__).parents[1]/"apps/redact/pyproject.toml").read_text())["project"]; remote=tomllib.loads((Path(__file__).parents[1]/"apps/remote/pyproject.toml").read_text())["project"]; core=tomllib.loads((Path(__file__).parents[1]/"pyproject.toml").read_text())["project"]
-    assert project["dependencies"][0]=="ai-convos-db>=0.7,<0.8" and project["entry-points"]["convos.commands"]=={"redact":"ai_convos_redact:register"} and project["entry-points"]["convos.doctor"]=={"redact":"ai_convos_redact:doctor_status"}
-    assert "ai-convos-redact>=0.7,<0.8" in remote["dependencies"] and core["optional-dependencies"]["redact"]==["ai-convos-redact>=0.7,<0.8"]
+    assert project["dependencies"][0]=="convos>=0.8,<0.9" and project["entry-points"]["convos.commands"]=={"redact":"ai_convos_redact:register"} and project["entry-points"]["convos.doctor"]=={"redact":"ai_convos_redact:doctor_status"}
+    assert "convos-redact>=0.8,<0.9" in remote["dependencies"] and core["optional-dependencies"]["redact"]==["convos-redact>=0.8,<0.9"]
     help_=CliRunner().invoke(app(),["redact","--help"]).output
     assert "scan" in help_ and "status" in help_
 

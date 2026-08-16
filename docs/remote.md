@@ -41,8 +41,8 @@ checkpoint with no unexplained sequence gap before publication becomes ready.
 Install the core and client applications together:
 
 ```bash
-uv tool install --reinstall "git+https://github.com/RobertBiehl/ai-convos-db.git" \
-  --with "ai-convos-remote @ git+https://github.com/RobertBiehl/ai-convos-db.git#subdirectory=apps/remote"
+uv tool install --reinstall "git+https://github.com/RobertBiehl/convos.git" \
+  --with "convos-remote @ git+https://github.com/RobertBiehl/convos.git#subdirectory=apps/remote"
 ```
 
 For a local checkout, `uv sync --all-extras` installs the same workspace.
@@ -58,7 +58,7 @@ proxy; device bearer tokens must not traverse an untrusted network over HTTP.
 
 ```bash
 uv tool install --reinstall \
-  "ai-convos-remote-server @ git+https://github.com/RobertBiehl/ai-convos-db.git#subdirectory=apps/remote_server"
+  "convos-remote-server @ git+https://github.com/RobertBiehl/convos.git#subdirectory=apps/remote_server"
 install -d -m 700 ~/.local/share/convos-server
 convos-server serve \
   --db ~/.local/share/convos-server/server.db \
@@ -128,15 +128,15 @@ pulling, and projection. Normal work never requires `convos remote sync`.
 
 ### Memory on multiple computers
 
-Install and enable `ai-convos-memory` on each computer if canonical agent memory
+Install and enable `convos-memory` on each computer if canonical agent memory
 should travel with the personal archive. The remote client discovers it as an
 optional adapter; the server and wire protocol need no memory-specific
 installation or account:
 
 ```bash
-uv tool install --reinstall "git+https://github.com/RobertBiehl/ai-convos-db.git" \
-  --with "ai-convos-memory @ git+https://github.com/RobertBiehl/ai-convos-db.git#subdirectory=apps/memory" \
-  --with "ai-convos-remote @ git+https://github.com/RobertBiehl/ai-convos-db.git#subdirectory=apps/remote"
+uv tool install --reinstall "git+https://github.com/RobertBiehl/convos.git" \
+  --with "convos-memory @ git+https://github.com/RobertBiehl/convos.git#subdirectory=apps/memory" \
+  --with "convos-remote @ git+https://github.com/RobertBiehl/convos.git#subdirectory=apps/remote"
 convos memory enable
 ```
 
@@ -185,7 +185,7 @@ binding. Once a conversation's working directory or any edit matches a policy,
 the complete conversation is routed to that workspace. Repository policy never
 silently slices turns or creates partial conversation history.
 
-The client requires `ai-convos-redact` and runs it inside the team `publish`
+The client requires `convos-redact` and runs it inside the team `publish`
 boundary before event signing and encryption. High-confidence credential spans
 become typed markers without secret-derived hashes; personal workspaces remain
 lossless. Team binary bodies are not read; their attachment records become

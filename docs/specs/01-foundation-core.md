@@ -27,7 +27,7 @@ production path: `cli.py` never imports it, and web fetching is urllib+cookies
 - Net: ~125 core LoC reclaimed, one heavy dependency dropped.
 
 Risk: if a Playwright-based `claude-code-web` source is genuinely planned, gate
-it behind an optional extra (`pip install ai-convos-db[web]`) instead of
+it behind an optional extra (`pip install convos[web]`) instead of
 deleting -- either way it leaves the core budget.
 
 ## 1. `convos sql` (read-only)
@@ -60,7 +60,7 @@ commands. One shared emitter takes a `list[dict]` and either pretty-prints text
 already has the row tuples; it just names them into dicts before emitting.
 
 This is the API surface every application and the agent skill consume. Update
-`skills/agent-convos/SKILL.md` to prefer `--jsonl` for programmatic use.
+`skills/convos/SKILL.md` to prefer `--jsonl` for programmatic use.
 
 **Exactness.** Pass-through of stored values -> exact.
 

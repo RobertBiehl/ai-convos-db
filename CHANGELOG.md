@@ -1,6 +1,15 @@
 # Changelog
 
-## Unreleased
+## 0.8.0
+
+- Rename the public product, repository, primary distribution, companion
+  distributions, and bundled skill to the `Convos` / `convos` family while
+  retaining stable internal Python import namespaces.
+- Make PyPI the primary installation path, include semantic retrieval in the
+  default distribution, and verify a clean wheel through an installed hybrid
+  query smoke test.
+- Lead the README with an agent-copyable setup prompt and the daily
+  Capture -> Recall -> Continue workflow.
 
 - Add explicit fresh-relay rehoming and team re-founding with retained signing
   identities, one shared encrypted origin-control bundle, portable row proofs,

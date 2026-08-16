@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-repo="https://github.com/RobertBiehl/ai-convos-db.git"
+repo="https://github.com/RobertBiehl/convos.git"
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]-$0}")" && pwd)"
 repo_root="$(cd "$script_dir/.." && pwd)"
-install_dir="${CONVOS_INSTALL_DIR:-$HOME/.local/share/ai-convos-db}"
+install_dir="${CONVOS_INSTALL_DIR:-$HOME/.local/share/convos}"
 bin_dir="${CONVOS_BIN_DIR:-$HOME/.local/bin}"
-uv_bin="$HOME/.local/share/uv/tools/ai-convos-db/bin"
+uv_bin="$HOME/.local/share/uv/tools/convos/bin"
 export UV_CACHE_DIR="${UV_CACHE_DIR:-$repo_root/.uv-cache}"
 
 ensure_path() {

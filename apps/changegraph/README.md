@@ -1,4 +1,4 @@
-# ai-convos-changegraph
+# convos-changegraph
 
 Change graph over the convos DB ([spec 02](../../docs/specs/02-change-graph.md)):
 *which conversation -- which prompt -- changed this file, or this line?*
@@ -6,8 +6,8 @@ Change graph over the convos DB ([spec 02](../../docs/specs/02-change-graph.md))
 Install it beside the core tool from GitHub:
 
 ```bash
-uv tool install --reinstall "git+https://github.com/RobertBiehl/ai-convos-db.git" \
-  --with "ai-convos-changegraph @ git+https://github.com/RobertBiehl/ai-convos-db.git#subdirectory=apps/changegraph"
+uv tool install --reinstall "git+https://github.com/RobertBiehl/convos.git" \
+  --with "convos-changegraph @ git+https://github.com/RobertBiehl/convos.git#subdirectory=apps/changegraph"
 ```
 
 It registers through the `convos.commands` entry-point group:
