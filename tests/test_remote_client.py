@@ -7,11 +7,11 @@ import ai_convos_memory as memory_module
 import ai_convos_remote as remote_client
 import ai_convos_remote.projection as projection_module
 from ai_convos.cli import ARCHIVE_COLUMNS, archive_state, capture_provenance, index_attachment_body, init_schema, project_archive_row, project_logical_row
-from ai_convos_remote import (_upload_batches, add_member, approve_device, approve_history, bind_origin, connect, control_body, create, doctor_status, fetch_lazy, grant_all, key, load, pull, publish, refresh, rehome_client, remove_device,
+from ai_convos_remote import (_upload_batches, add_member, approve_device, approve_history, bind_origin, connect, control_body, create, doctor_status, fetch_lazy, grant_all, key, load, pull, pull_origins, publish, refresh, rehome_client, remove_device,
                               request_device, request_history, rescue_bindings, setup_client, sync_once, upload, workspace)
 from ai_convos_remote.control import sign as control_sign, vote as device_vote
 from ai_convos_remote.projection import inspect_state, scan
-from ai_convos_remote.protocol import certificate, event, identity, logical_row, open_replica, seal_event, seal_key, seal_replica, sign_control, unb64
+from ai_convos_remote.protocol import certificate, event, identity, logical_row, open_blob, open_origin, open_replica, seal_blob, seal_event, seal_key, seal_origin, seal_replica, sign_control, unb64
 from ai_convos_remote_server import action, connect as server_connect
 
 
@@ -196,6 +196,20 @@ def test_later_uploader_copy_heals_poisoned_replica_across_pages(tmp_path,monkey
     with pytest.raises(ValueError,match="no valid delivery copy"): pull(cfg,state,b)
     assert state.execute("SELECT value FROM meta WHERE key=?",(f"replica_cursor:{ws}",)).fetchone()[0]==str(poison_cursor-1) and state.execute("SELECT lifecycle FROM sync_states WHERE workspace=?",(ws,)).fetchone()[0]=="blocked" and not state.execute("SELECT 1 FROM replica_receipts").fetchone(); action(server,{"op":"replica_upload_many","envelopes":[repaired]},cfg["token"]); pull(cfg,state,b); tail=server.execute("SELECT MAX(cursor) FROM row_replicas").fetchone()[0]
     assert state.execute("SELECT value FROM meta WHERE key=?",(f"replica_cursor:{ws}",)).fetchone()[0]==str(tail) and state.execute("SELECT COUNT(*) FROM replica_receipts").fetchone()[0]==1 and state.execute("SELECT lifecycle FROM sync_states WHERE workspace=?",(ws,)).fetchone()[0]=="ready"; pull(cfg,state,b); state.close(); db=sqlite3.connect(b/"memory/state.db"); assert db.execute("SELECT content FROM canonicals").fetchall()==[("healed delivery copy",)] and db.execute("SELECT COUNT(*) FROM remote_semantics").fetchone()[0]==1; db.close()
+
+
+def test_later_uploader_copy_heals_poisoned_blob_across_pages(tmp_path,monkeypatch):
+    server=server_connect(tmp_path/"server.db"); direct=transport(server); monkeypatch.setattr("ai_convos_remote.request",direct); monkeypatch.setattr("ai_convos_remote.drain_hooks",lambda:None); a,b=tmp_path/"a",tmp_path/"b"; _,recovery=setup_client("http://server","alice","laptop",root=a); setup_client("http://server","alice","desktop",recovery,root=b); path=a/"data/convos.db"; write_archive(path,"blob"); db=duckdb.connect(str(path)); db.execute("INSERT INTO messages VALUES ('m','c','user','file',NULL,'2026-01-01',NULL,'{}',NULL,NULL)"); source=tmp_path/"body.bin"; source.write_bytes(b"healed blob body"); db.execute("INSERT INTO attachments VALUES ('a','m','body.bin','application/octet-stream',?,?,NULL,'2026-01-01')",(source.stat().st_size,str(source))); index_attachment_body(db,"a",source,source.stat().st_size); db.close(); sync_once(a,True); cfg=load(b); ws=workspace(cfg,"Personal"); item=action(server,{"op":"blob_pull","workspace":ws},cfg["token"])["blobs"][0]; poison_cursor,original=item["cursor"],item["envelope"]; data,body_hash=open_blob(original,key(cfg,ws,original["epoch"])); repaired=seal_blob(data,ws,original["epoch"],key(cfg,ws,original["epoch"]),cfg["device"]["id"]); raw=bytearray(server.execute("SELECT ciphertext FROM blob_replicas").fetchone()[0]); raw[0]^=1; server.execute("UPDATE blob_replicas SET ciphertext=?",(bytes(raw),)); server.commit()
+    def paged(cfg,request_,auth=True): return direct(cfg,request_|({"limit":1} if request_["op"]=="blob_pull" else {}),auth)
+    monkeypatch.setattr("ai_convos_remote.request",paged); state=connect(b/"remote/state.db")
+    with pytest.raises(ValueError,match="no valid delivery copy"): pull(cfg,state,b)
+    assert state.execute("SELECT value FROM meta WHERE key=?",(f"blob_cursor:{ws}",)).fetchone()[0]==str(poison_cursor-1); action(server,{"op":"blob_upload","envelope":repaired},cfg["token"]); pull(cfg,state,b); state.close(); db=duckdb.connect(str(b/"data/convos.db"),read_only=True); assert db.execute("SELECT content_hash FROM attachment_bodies").fetchone()[0]==body_hash; db.close()
+
+
+def test_later_uploader_copy_heals_poisoned_origin_bundle(tmp_path,monkeypatch):
+    old=server_connect(tmp_path/"old.db"); monkeypatch.setattr("ai_convos_remote.request",transport(old)); a,b,c=tmp_path/"alice",tmp_path/"bob",tmp_path/"carol"; alice,_=setup_client("http://old","alice",root=a); setup_client("http://old","bob",root=b); origin=create(alice,"Origin","team",a); add_member(alice,origin,"bob",root=a); replicate_conversation(a,origin); pull(load(b),connect(b/"remote/state.db"),b)
+    fresh=server_connect(tmp_path/"fresh.db"); direct=transport(fresh); monkeypatch.setattr("ai_convos_remote.request",direct); bob,_=rehome_client(load(b),"http://fresh",b); setup_client("http://fresh","carol",root=c); replacement=create(bob,"Replacement","team",b); add_member(bob,replacement,"carol",root=b); bob=load(b); state=connect(b/"remote/state.db"); bind_origin(bob,state,replacement,origin,b); state.close(); carol=load(c); server_state=refresh(carol,c); raw=fresh.execute("SELECT envelope FROM origin_bundles").fetchone()[0]; original=json.loads(raw); body=open_origin(original,key(carol,replacement,original["epoch"])); repaired=seal_origin(body["controls"],replacement,original["epoch"],key(carol,replacement,original["epoch"]),carol["device"]["id"],body["rows"]); original["ciphertext"]=("A" if original["ciphertext"][0]!="A" else "B")+original["ciphertext"][1:]; fresh.execute("UPDATE origin_bundles SET envelope=?",(json.dumps(original),)); fresh.commit(); action(fresh,{"op":"origin_upload","envelope":repaired},carol["token"]); state=connect(c/"remote/state.db"); ws=next(w for w in server_state["workspaces"] if w["id"]==replacement)
+    assert pull_origins(carol,state,c,ws)=={origin} and state.execute("SELECT origin FROM origin_bindings WHERE workspace=?",(replacement,)).fetchone()[0]==origin; state.close()
 
 
 def test_fresh_remote_and_memory_state_recovers_signed_tombstone_without_content(tmp_path,monkeypatch):

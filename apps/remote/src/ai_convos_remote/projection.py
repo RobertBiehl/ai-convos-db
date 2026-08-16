@@ -8,7 +8,7 @@ from pathlib import Path
 from ai_convos.cli import ARCHIVE_COLUMNS as COLUMNS, PROVENANCE_KINDS as PROVENANCE, _insert_pages, index_attachment_body, init_schema, open_db, project_logical_rows, project_provenance, project_row_proofs, project_workspace_controls, provenance_records, set_attachment_path
 from ai_convos_changegraph.provenance import query as graph_query
 from .control import verify_state
-from .protocol import digest, fingerprint, logical_fact, logical_row, row_proof, seal_blob, seal_replica, semantic_proof, verify_row_proof, verify_semantic_proof
+from .protocol import digest, fingerprint, logical_fact, logical_row, row_proof, seal_blob, seal_replica, semantic_proof, verify_row_proof, verify_row_proof_header, verify_semantic_proof
 
 STATE_VERSION="1"
 STATE = """
@@ -231,7 +231,15 @@ def row_replicas(db_path,cfg,workspace,records,keys,known=(),origins=(),origin_e
                 if field in payload and (source_id:=mapped.get((parent,payload[field],origin,user))): payload[field]=source_id
             keep(logical_fact({**record,"entity":source,"payload":payload}),p)
         for raw,*values in (db.execute(f"SELECT CAST(c.body AS VARCHAR),p.workspace_id,p.authorization_workspace_id,p.row_kind,p.source_row_id,p.encoding_v,p.content_hash,p.revision,p.previous_revision,p.state,p.author_user_id,p.author_device_id,p.authorization_epoch,p.signature FROM remote.row_conflicts c JOIN remote.row_proofs p ON p.id=c.proof_id WHERE p.workspace_id IN ({marks})",scopes).fetchall() if retained else []): keep(json.loads(raw),proof(values))
-        delivery=lambda p:p["authorization_epoch"] if p["authorization_workspace"]==workspace else (origin_epochs or {})[p["workspace"]]; candidates=[(row,p,content_hash,epoch,fingerprint(keys[epoch],digest(p))) for row,p,content_hash in bodies.values() for epoch in [delivery(p)] if epoch in keys]; known=set(inventory([(r[4],r[3]) for r in candidates])) if inventory else set(known); return [seal_replica(row,p,workspace,epoch,keys[epoch],cfg["device"]["id"],content_hash) for row,p,content_hash,epoch,replica in candidates if replica not in known]
+        heads={(p["workspace"],p["row_kind"],p["row_id"],p["author_user_id"]):p for row,p,content_hash in bodies.values() if p["kind"]=="row.proof"}; histories={}; ids={k[2] for k in heads}; users={k[3] for k in heads}; [histories.setdefault((p["workspace"],p["row_kind"],p["row_id"],p["author_user_id"],p["revision"]),p) for values in (db.execute(f"SELECT workspace_id,authorization_workspace_id,row_kind,source_row_id,encoding_v,content_hash,revision,previous_revision,state,author_user_id,author_device_id,authorization_epoch,signature FROM remote.row_proofs WHERE workspace_id IN ({marks}) AND source_row_id IN (SELECT UNNEST(?)) AND author_user_id IN (SELECT UNNEST(?))",(*scopes,list(ids),list(users))).fetchall() if heads else []) for p in [proof(values)]]
+        def lineage(p):
+            out=[]; revision=p["previous_revision"]; seen=set()
+            while revision:
+                parent=histories.get((p["workspace"],p["row_kind"],p["row_id"],p["author_user_id"],revision))
+                if not parent or revision in seen: raise ValueError(f"row proof lineage unavailable: {p['row_kind']}:{p['row_id']}")
+                out.append(parent); seen.add(revision); revision=parent["previous_revision"]
+            return out
+        delivery=lambda p:p["authorization_epoch"] if p["authorization_workspace"]==workspace else (origin_epochs or {})[p["workspace"]]; candidates=[(row,p,content_hash,epoch,fingerprint(keys[epoch],digest(p))) for row,p,content_hash in bodies.values() for epoch in [delivery(p)] if epoch in keys]; known=set(inventory([(r[4],r[3]) for r in candidates])) if inventory else set(known); return [seal_replica(row,p,workspace,epoch,keys[epoch],cfg["device"]["id"],content_hash,lineage(p) if p["kind"]=="row.proof" else ()) for row,p,content_hash,epoch,replica in candidates if replica not in known]
     finally: db.close()
 def blob_replicas(db_path,cfg,workspace,records,keys,known=(),origins=(),origin_epochs=None,retained=True):
     if cfg["workspaces"][workspace]["kind"]!="personal": return []
@@ -244,10 +252,23 @@ def blob_replicas(db_path,cfg,workspace,records,keys,known=(),origins=(),origin_
         if path.is_symlink() or not path.is_file() or path.stat().st_size!=size or size>32*1024**2 or file_hash(path)!=body_hash: raise ValueError("retained attachment body is inconsistent")
         out.append(seal_blob(path.read_bytes(),workspace,epoch,keys[epoch],cfg["device"]["id"]))
     return out
+def proof_signer(proof,workspace,controls):
+    allowed={workspace,*[c["workspace"] for c in controls]}; candidates=[{k:r[k] for k in ("user","root_public","device","certificate")} for c in controls if proof["workspace"] in allowed and c["workspace"]==proof["authorization_workspace"] and c["epoch"]==proof["authorization_epoch"] and proof["author_device_id"] in c["devices"] for r in [c["devices"][proof["author_device_id"]]]]; return candidates[0] if candidates and all(c==candidates[0] for c in candidates) else (_ for _ in ()).throw(ValueError("row proof authorization unavailable"))
 def verified_replica(body,workspace,controls,user):
-    row,proof=body["row"],body["proof"]
-    if proof.get("kind")=="semantic.proof": verify_semantic_proof(proof,row,user); return row,proof,None
-    allowed={workspace,*[c["workspace"] for c in controls]}; candidates=[{k:r[k] for k in ("user","root_public","device","certificate")} for c in controls if proof["workspace"] in allowed and c["workspace"]==proof["authorization_workspace"] and c["epoch"]==proof["authorization_epoch"] and proof["author_device_id"] in c["devices"] for r in [c["devices"][proof["author_device_id"]]]]; signer_=candidates[0] if candidates and all(c==candidates[0] for c in candidates) else (_ for _ in ()).throw(ValueError("row proof authorization unavailable")); verify_row_proof(proof,row,signer_["certificate"],signer_["root_public"]); return row,proof,signer_
+    row,proof,lineage=body["row"],body["proof"],body.get("lineage")
+    if proof.get("kind")=="semantic.proof":
+        if lineage: raise ValueError("semantic proof has row lineage")
+        verify_semantic_proof(proof,row,user); return row,proof,None,[]
+    signer_=proof_signer(proof,workspace,controls); verify_row_proof(proof,row,signer_["certificate"],signer_["root_public"]); verified=[]
+    if lineage is not None:
+        if not isinstance(lineage,list) or len(lineage)!=len({p.get("revision") for p in lineage}): raise ValueError("invalid row proof lineage")
+        expected=proof["previous_revision"]
+        for parent in lineage:
+            parent_signer=proof_signer(parent,workspace,controls); verify_row_proof_header(parent,parent_signer["certificate"],parent_signer["root_public"])
+            if (parent["revision"],parent["workspace"],parent["row_kind"],parent["row_id"],parent["author_user_id"])!=(expected,proof["workspace"],proof["row_kind"],proof["row_id"],proof["author_user_id"]): raise ValueError("invalid row proof lineage")
+            verified.append((parent,parent_signer)); expected=parent["previous_revision"]
+        if expected is not None: raise ValueError("incomplete row proof lineage")
+    return row,proof,signer_,verified
 def temp_rows(db,name,columns,rows): db.execute(f"CREATE OR REPLACE TEMP TABLE {name} AS SELECT x.* FROM UNNEST(from_json(?,?)) t(x)",(json.dumps([dict(zip(columns,row)) for row in rows]),json.dumps([{c:"VARCHAR" for c in columns}])))
 def apply_row_replicas(db_path,bodies,workspace,controls,recover=None,local_user=None,db=None,root=None):
     if not bodies: return []
@@ -255,8 +276,8 @@ def apply_row_replicas(db_path,bodies,workspace,controls,recover=None,local_user
     if not indexes: return accepted
     names=("workspace","authorization_workspace","row_kind","row_id","encoding_v","content_hash","revision","previous_revision","state","author_user_id","author_device_id","authorization_epoch","signature"); proof=lambda values:{"v":1,"kind":"row.proof",**dict(zip(names,values))}; own=db is None; db=db or open_db(db_path); own and init_schema(db); db.execute("BEGIN")
     try:
-        items=[values[i] for i in indexes]; columns=("workspace","kind","row_id","author","revision"); temp_rows(db,"incoming",columns,[tuple(p[k] for k in ("workspace","row_kind","row_id","author_user_id","revision")) for row,p,signer_ in items]); old={tuple(r) for r in db.execute("SELECT p.workspace_id,p.row_kind,p.source_row_id,p.author_user_id,p.revision FROM remote.row_proofs p JOIN incoming i ON (p.workspace_id,p.row_kind,p.source_row_id,p.author_user_id,p.revision)=(i.workspace,i.kind,i.row_id,i.author,i.revision)").fetchall()}; project_workspace_controls(db,controls); groups={}
-        [groups.setdefault((p["author_user_id"],p["author_device_id"]),(signer_,[]))[1].append(p) for row,p,signer_ in items]; [project_row_proofs(db,proofs,signer_["root_public"],signer_["certificate"]) for signer_,proofs in groups.values()]; fresh=[(digest(p),json.dumps(row,sort_keys=True,separators=(",",":"))) for row,p,signer_ in items if (*((p[k] for k in ("workspace","row_kind","row_id","author_user_id"))),p["revision"]) not in old]; fresh and _insert_pages(db,"remote.row_conflicts",fresh,("proof_id","body"),mode=" OR IGNORE"); projected=[]; chosen={}; resolved=[]
+        items=[values[i] for i in indexes]; columns=("workspace","kind","row_id","author","revision"); temp_rows(db,"incoming",columns,[tuple(p[k] for k in ("workspace","row_kind","row_id","author_user_id","revision")) for row,p,signer_,lineage in items]); old={tuple(r) for r in db.execute("SELECT p.workspace_id,p.row_kind,p.source_row_id,p.author_user_id,p.revision FROM remote.row_proofs p JOIN incoming i ON (p.workspace_id,p.row_kind,p.source_row_id,p.author_user_id,p.revision)=(i.workspace,i.kind,i.row_id,i.author,i.revision)").fetchall()}; project_workspace_controls(db,controls); groups={}
+        [groups.setdefault((p["author_user_id"],p["author_device_id"]),(signer_,[]))[1].append(p) for row,head,head_signer,lineage in items for p,signer_ in [*lineage,(head,head_signer)]]; [project_row_proofs(db,proofs,signer_["root_public"],signer_["certificate"]) for signer_,proofs in groups.values()]; fresh=[(digest(p),json.dumps(row,sort_keys=True,separators=(",",":"))) for row,p,signer_,lineage in items if (*((p[k] for k in ("workspace","row_kind","row_id","author_user_id"))),p["revision"]) not in old]; fresh and _insert_pages(db,"remote.row_conflicts",fresh,("proof_id","body"),mode=" OR IGNORE"); projected=[]; chosen={}; resolved=[]
         fields="p.workspace_id,p.authorization_workspace_id,p.row_kind,p.source_row_id,p.encoding_v,p.content_hash,p.revision,p.previous_revision,p.state,p.author_user_id,p.author_device_id,p.authorization_epoch,p.signature"; chains={}
         for r in db.execute(f"SELECT p.id,CAST(c.body AS VARCHAR),{fields} FROM remote.row_proofs p JOIN (SELECT DISTINCT workspace,kind,row_id,author FROM incoming) i ON (p.workspace_id,p.row_kind,p.source_row_id,p.author_user_id)=(i.workspace,i.kind,i.row_id,i.author) LEFT JOIN remote.row_conflicts c ON c.proof_id=p.id").fetchall(): chains.setdefault((r[2],r[4],r[5],r[11]),{})[r[8]]=(r[0],json.loads(r[1]) if r[1] else None,proof(r[2:]))
         for scope,nodes in chains.items():
@@ -266,7 +287,7 @@ def apply_row_replicas(db_path,bodies,workspace,controls,recover=None,local_user
                 if row is not None and not (p["author_user_id"]==local_user and recover=="adopt"): projected.append((row,p,pid,p["author_user_id"]==local_user and recover=="native"))
         if resolved: temp_rows(db,"resolved_scopes",columns[:4],resolved); db.execute("DELETE FROM remote.row_conflicts c USING remote.row_proofs p,resolved_scopes r WHERE c.proof_id=p.id AND (p.workspace_id,p.row_kind,p.source_row_id,p.author_user_id)=(r.workspace,r.kind,r.row_id,r.author)")
         project_logical_rows(db,projected)
-        db.execute("COMMIT"); results=[(*((p[k] for k in ("workspace","row_kind","row_id","author_user_id"))),p["revision"]) not in old and chosen.get(tuple(p[k] for k in ("workspace","row_kind","row_id","author_user_id")))==p["revision"] for row,p,signer_ in items]; [accepted.__setitem__(i,value) for i,value in zip(indexes,results)]; return accepted
+        db.execute("COMMIT"); results=[(*((p[k] for k in ("workspace","row_kind","row_id","author_user_id"))),p["revision"]) not in old and chosen.get(tuple(p[k] for k in ("workspace","row_kind","row_id","author_user_id")))==p["revision"] for row,p,signer_,lineage in items]; [accepted.__setitem__(i,value) for i,value in zip(indexes,results)]; return accepted
     except BaseException: db.execute("ROLLBACK"); raise
     finally: own and db.close()
 def author_user(value,authors): return (authors or {}).get(value["author"]) or (_ for _ in ()).throw(ValueError("verified author user required"))
