@@ -1068,7 +1068,7 @@ def embed_cmd(batch: int = typer.Option(32, "-b")):
 
 @app.command()
 def doctor(verbose: bool = typer.Option(False, "-v")):
-    typer.echo(f"convos: {version('ai-convos-db')}")
+    typer.echo(f"convos: {version('convos')}")
     pending = len(list(HOOK_DIR.glob("*.json"))) + len(list(HOOK_DIR.glob("*.work"))); state = json.loads(HOOK_STATE.read_text()) if HOOK_STATE.exists() else {}; last = max((v[0] for v in state.values()), default=0)
     dirty = len(json.loads(HOOK_EMBED_DIRTY.read_text())) if HOOK_EMBED_DIRTY.exists() else 0; claims = len(list(DATA_DIR.glob(f".{HOOK_EMBED_DIRTY.name}.*")))
     typer.echo(f"ingest: pending={pending}, embedding_ids={dirty}, embedding_claims={claims}, last={datetime.fromtimestamp(last/1e9).isoformat(timespec='seconds') if last else 'never'}")
@@ -1100,15 +1100,14 @@ def doctor(verbose: bool = typer.Option(False, "-v")):
                                "__Secure-next-auth.session-token.1", "cf_clearance", "__cf_bm"] if k in keys]
             typer.echo(f"{name}: chatgpt cookies={len(cg)} keys={','.join(sig) if sig else 'none'}")
 
-def _skill_paths():
-    rel = Path("skills")/"agent-convos"/"SKILL.md"; shares = [Path(p)/"share"/"ai-convos-db" for p in (sysconfig.get_paths().get("data",""),site.getuserbase())]; roots = [PROJECT_ROOT,Path(__file__).resolve().parents[2],*shares]; skill = next((r/rel for r in roots if (r/rel).exists()),roots[-1]/rel); homes = [Path(os.environ.get("CODEX_HOME",Path.home()/".codex")),Path(os.environ.get("CLAUDE_CONFIG_DIR",Path.home()/".claude"))]; return rel,skill,homes,[home/rel for home in homes]
+def _skill_paths(): rel = Path("skills")/"convos"/"SKILL.md"; shares = [Path(p)/"share"/"convos" for p in (sysconfig.get_paths().get("data",""),site.getuserbase())]; roots = [PROJECT_ROOT,Path(__file__).resolve().parents[2],*shares]; skill = next((r/rel for r in roots if (r/rel).exists()),roots[-1]/rel); homes = [Path(os.environ.get("CODEX_HOME",Path.home()/".codex")),Path(os.environ.get("CLAUDE_CONFIG_DIR",Path.home()/".claude"))]; return rel,skill,homes,[home/rel for home in homes]
 @app.command()
 def install_skills():
-    rel, skill, homes, dests = _skill_paths()
+    rel, skill, homes, dests = _skill_paths(); olds = [home/"skills"/"agent-convos"/"SKILL.md" for home in homes]
     if not skill.exists(): typer.echo(f"Missing skill: {skill}", err=True); raise typer.Exit(1)
-    text = skill.read_text(); resolved = [Path(os.path.realpath(p)) for p in dests]
+    text = skill.read_text(); legacy = text.replace("name: convos","name: agent-convos",1).replace("# Convos","# Agent Convos",1); resolved = [Path(os.path.realpath(p)) for p in dests]
     if unsafe := next((p for home,p,target in zip(homes,dests,resolved) if p.is_symlink() or p.exists() and not p.is_file() or any(q.is_symlink() and resolved.count(target)<2 or q.exists() and not q.is_dir() for q in [home/Path(*rel.parts[:i]) for i in range(1,len(rel.parts))])), None): typer.echo(f"Refusing unsafe managed file: {unsafe}", err=True); raise typer.Exit(1)
-    for dest in dests: atomic_write(dest, text); typer.echo(f"Installed {dest}")
+    for dest,old in zip(dests,olds): atomic_write(dest, text); typer.echo(f"Installed {dest}"); (old.unlink(),typer.echo(f"Removed legacy {old}")) if old.is_file() and not old.is_symlink() and old.read_text()==legacy else None
 
 def _capture_command(source): root=Path(os.environ.get("CONVOS_PROJECT_ROOT",PROJECT_ROOT)).expanduser().resolve(); return f"{f'CONVOS_PROJECT_ROOT={shlex.quote(str(root))} ' if root!=Path.home()/'.convos' else ''}{shlex.quote(str(Path(sys.executable).with_name('convos')))} capture {source}"
 def _managed_hook(h, source): return h.get("command", "").endswith("convos remote hook") or h.get("command", "").endswith((f" hook {source}", f" capture {source}")) and h.get("statusMessage") in ("Updating conversation archive", "Saving conversation to Convos")

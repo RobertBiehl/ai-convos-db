@@ -1,9 +1,9 @@
 ---
-name: agent-convos
-description: Retrieve prior AI conversation context, keep the local archive current, and synchronize Codex/Claude memories through the optional canonical overlay. Use whenever the user asks to recall, find, continue, summarize, compare, or verify information from past ChatGPT, Claude, Claude Code, or Codex conversations, including earlier plans, decisions, commands, evidence, work sessions, or provider memories.
+name: convos
+description: Give agents queryable memory from prior AI conversations, keep the local archive current, and synchronize Codex/Claude memories through the optional canonical overlay. Use whenever the user asks to recall, find, continue, summarize, compare, or verify information from past ChatGPT, Claude, Claude Code, or Codex conversations, including earlier plans, decisions, commands, evidence, work sessions, or provider memories.
 ---
 
-# Agent Convos
+# Convos
 
 Retrieve with these commands:
 

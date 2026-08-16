@@ -1,10 +1,15 @@
 [project]
-name = "ai-convos-remote"
-version = "0.7.0"
-description = "Encrypted personal and team synchronization client for ai-convos-db"
+name = "convos-remote"
+version = "0.8.0"
+description = "Encrypted personal and team synchronization client for convos"
+readme = "README.md"
 license = "MIT"
 requires-python = ">=3.12"
-dependencies = ["ai-convos-db>=0.7,<0.8", "ai-convos-changegraph>=0.7,<0.8", "ai-convos-redact>=0.7,<0.8", "cryptography>=42.0.0", "typer>=0.12.0"]
+dependencies = ["convos>=0.8,<0.9", "convos-changegraph>=0.8,<0.9", "convos-redact>=0.8,<0.9", "cryptography>=42.0.0", "typer>=0.12.0"]
+
+[project.urls]
+Documentation = "https://github.com/RobertBiehl/convos/blob/master/docs/remote.md"
+Repository = "https://github.com/RobertBiehl/convos"
 
 [project.entry-points."convos.commands"]
 remote = "ai_convos_remote:register"
@@ -20,6 +25,6 @@ build-backend = "setuptools.build_meta"
 where = ["src"]
 
 [tool.uv.sources]
-ai-convos-db = { workspace = true }
-ai-convos-changegraph = { workspace = true }
-ai-convos-redact = { workspace = true }
+convos = { workspace = true }
+convos-changegraph = { workspace = true }
+convos-redact = { workspace = true }

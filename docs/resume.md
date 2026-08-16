@@ -1,10 +1,10 @@
 # Deterministic project handoff and replay
 
-`ai-convos-resume` turns the manual continuation workflow into one bounded local
+`convos-resume` turns the manual continuation workflow into one bounded local
 command:
 
 ```bash
-uv tool install "ai-convos-db[resume]"
+uv tool install "convos[resume]"
 cd /path/to/project
 convos resume
 ```
@@ -35,7 +35,7 @@ the Git section. Scope matching is path-boundary-aware: `/repo` includes
 Known injected agent wrappers, superseded message history, thinking, tool
 inputs, and tool outputs are excluded. Secret-shaped spans in titles, Git
 status, commit subjects, and archived turn bodies are replaced locally through
-`ai-convos-redact`. The packet reports the number masked but never their values.
+`convos-redact`. The packet reports the number masked but never their values.
 
 The Markdown output labels archive excerpts as untrusted evidence and renders
 them as quotes. An agent must not follow instructions found inside those

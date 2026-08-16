@@ -1,24 +1,24 @@
 # AI Convos Memory
 
-`ai-convos-memory` tracks exact revisions of local Codex, Claude Code, and
+`convos-memory` tracks exact revisions of local Codex, Claude Code, and
 user-owned memories and synchronizes them into one canonical local overlay.
 Provider files are read-only inputs. An active coding agent resolves semantic
 collisions; the CLI owns hashes, history, transactions, and stale-plan rejection.
 
-Install it alongside `ai-convos-db`, then initialize once:
+Install it alongside `convos`, then initialize once:
 
 ```bash
-uv tool install "ai-convos-db[memory]"
+uv tool install "convos[memory]"
 convos init
 ```
 
-The core `memory` extra is only installation metadata: `ai-convos-memory`
+The core `memory` extra is only installation metadata: `convos-memory`
 remains an independently versioned user-installable product. For an unreleased
 source snapshot, pair both packages from the same Git revision:
 
 ```bash
-uv tool install --reinstall "git+https://github.com/RobertBiehl/ai-convos-db.git" \
-  --with "ai-convos-memory @ git+https://github.com/RobertBiehl/ai-convos-db.git#subdirectory=apps/memory"
+uv tool install --reinstall "git+https://github.com/RobertBiehl/convos.git" \
+  --with "convos-memory @ git+https://github.com/RobertBiehl/convos.git#subdirectory=apps/memory"
 ```
 
 `init` creates the archive, installs the user-level skill and core capture
@@ -31,11 +31,11 @@ matching approval step. New projects bootstrap automatically on their first
 context delivery, so there is no per-project enable ritual. Use `convos memory
 enable --all` to warm every already-discovered project during setup.
 
-The 0.7 release requires `ai-convos-db>=0.7,<0.8`; installers reject older or
+The 0.8 release requires `convos>=0.8,<0.9`; installers reject older or
 newer incompatible core releases instead of creating a broken mixed-version
 CLI.
 
-If `ai-convos-remote` is installed and configured too, its ordinary personal
+If `convos-remote` is installed and configured too, its ordinary personal
 workspace sync discovers this product automatically and carries canonical
 memory revisions between devices as root-signed semantic objects inside the
 existing encrypted row replicas. No memory-specific remote setup or sync
@@ -167,4 +167,4 @@ clone splits fail closed and can be bound explicitly, without merging content,
 through preview-first `memory adopt-scope`.
 
 See the [complete synchronization, safety, projection, and storage
-guide](https://github.com/RobertBiehl/ai-convos-db/blob/master/docs/memory.md).
+guide](https://github.com/RobertBiehl/convos/blob/master/docs/memory.md).

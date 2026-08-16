@@ -1,10 +1,10 @@
 # Local secret protection
 
-`ai-convos-redact` provides two related guarantees:
+`convos-redact` provides two related guarantees:
 
 - `convos redact scan` finds high-confidence secret shapes in the local archive
   without printing or storing their values.
-- `ai-convos-remote` requires the package and applies its policy to every team
+- `convos-remote` requires the package and applies its policy to every team
   record inside `publish`, before the event is signed or encrypted.
 
 Personal workspace synchronization remains lossless. The relay never performs
@@ -15,12 +15,12 @@ scanning because it never receives plaintext.
 Install the scanner on its own:
 
 ```bash
-uv tool install "ai-convos-db[redact]"
+uv tool install "convos[redact]"
 convos redact scan
 convos redact scan -f json
 ```
 
-Installing `ai-convos-remote` brings the same package as a required dependency;
+Installing `convos-remote` brings the same package as a required dependency;
 team protection is not an optional runtime switch. Inspect what automatic team
 projection has removed:
 

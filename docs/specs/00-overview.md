@@ -13,7 +13,7 @@ Supersedes the 2026-05-02 six-option pitch. Detailed specs:
 [01-foundation-core](01-foundation-core.md), [02-change-graph](02-change-graph.md).
 
 Decided 2026-06-06:
-- Keep the single-file, ~1000-LoC core. Big features ship as separate
+- Keep the single-file, <1200-line core. Big features ship as separate
   installable **applications** that sit cleanly on top of core. Package
   boundaries represent products; internal modules do not become packages to
   evade a budget.
@@ -31,7 +31,7 @@ says it in one line: *"sync and search the local convo DB to update or retrieve
 conversation context."*
 
 So **core = ingest everything + store it faithfully + retrieve it**, for humans
-and agents. Nothing else earns a place in the 1000-LoC budget.
+and agents. Nothing else earns a place in the 1200-line budget.
 
 ## The boundary rule
 
@@ -73,7 +73,7 @@ separately from the app's logic.
 ## Dependency picture
 
 ```
-                          CORE  (single file, < 1000 LoC)
+                          CORE  (single file, < 1200 lines)
   ingest                  store / schema             retrieve
   parse_* / fetch_*  -->  conversations          --> search (BM25)
   sync                    messages   [+parent_id]     query  (hybrid)
@@ -122,7 +122,7 @@ changegraph = "ai_convos_changegraph:register"
 
 Core also exposes a tiny **public read API** so apps don't reach into privates:
 `get_db(read_only=True)`, the schema (documented in `docs/database.md`), and the
-`--json`/`sql` surface. **App contract:** depend on `ai-convos-db`, leave the
+`--json`/`sql` surface. **App contract:** depend on `convos`, leave the
 core schema stable, and stay within the product budget declared in
 `test_budget.py`.
 
@@ -131,28 +131,20 @@ these after schema, skill, and capture-hook setup. This lifecycle is only for
 local, idempotent, non-destructive readiness; it must not download models,
 configure remotes, enroll devices, request credentials, or contact services.
 
-## Budget plan
+## Budget
 
-- **Now:** 998 / 1000 token-aware LoC (`cli.py` 868, `browser.py` 125, init/main 5).
-- **Reclaim first:** `browser.py` is dead in the production path -- `cli.py`
-  never imports it, and all web fetching is urllib+cookies. Its only live use is
-  `validate_schema` / `EXPECTED_SCHEMAS` in `tests/test_integrations.py`. Move
-  those into the test suite, delete the Playwright code, and drop the
-  `playwright` dependency. Result: core ~**873 / 1000** (~127 headroom) and one
-  heavy dependency gone.
-- **Spend (core):** `sql` ~5, `json`/`jsonl` ~20, `parent_id` ~6, plugin seam
-  ~6 -> ~37 LoC. Fits comfortably.
-- **Apps:** each installable product is one package under `apps/<name>/`
-  (outside the core budget glob, which is `src/ai_convos/*.py`). Small apps
-  default to 200 token-aware lines. Larger cohesive products declare one honest
-  explicit limit rather than splitting implementation modules into packages.
+The token-aware core count must remain below 1200 lines and is enforced by
+`tests/test_budget.py`; new core work must reduce or repack existing code before
+it consumes the remaining margin. Each installable product under `apps/` has
+its own explicit honest budget, and internal modules never become packages just
+to evade either boundary.
 
 ## Sequencing
 
 - **M1 - Foundation (core).** browser cleanup -> `--json`/`--jsonl` + `convos
   sql` -> `messages.parent_id` + plugin seam. Small, exact, unblocks every app.
 - **M2 - Change-graph.** core capture (`file_edits.old_content` plus typed
-  provenance) -> read-only app package `ai-convos-changegraph` (`blame` /
+  provenance) -> read-only app package `convos-changegraph` (`blame` /
   `timeline` / `at`).
 - **M3 - semantic navigation.** Explore ships related-conversation and
   exact-turn trail navigation locally.

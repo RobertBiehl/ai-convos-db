@@ -1,15 +1,24 @@
-# AI Convos DB
-[![Stars](https://img.shields.io/github/stars/RobertBiehl/ai-convos-db?style=flat)](https://github.com/RobertBiehl/ai-convos-db/stargazers)
-[![Forks](https://img.shields.io/github/forks/RobertBiehl/ai-convos-db?style=flat)](https://github.com/RobertBiehl/ai-convos-db/forks)
-[![Issues](https://img.shields.io/github/issues/RobertBiehl/ai-convos-db?style=flat)](https://github.com/RobertBiehl/ai-convos-db/issues)
+# Convos
+
+[![Tests](https://github.com/RobertBiehl/convos/actions/workflows/tests.yml/badge.svg)](https://github.com/RobertBiehl/convos/actions/workflows/tests.yml)
+[![PyPI](https://img.shields.io/pypi/v/convos?style=flat)](https://pypi.org/project/convos/)
 [![License](https://img.shields.io/badge/license-MIT-blue?style=flat)](LICENSE)
 
-## Quick install
-```bash
-uv tool install "git+https://github.com/RobertBiehl/ai-convos-db.git"
+**Queryable memory for coding agents, backed by exact conversation evidence.**
+
+Convos captures Claude Code and Codex work automatically, recalls relevant
+decisions across ChatGPT, Claude, Claude Code, and Codex, then gives agents the
+exact turns they need to continue.
+
+## Give this to your agent
+
+```text
+Install Convos from PyPI with `uv tool install convos` (use pipx only if uv is unavailable), run `convos init`, then run `convos doctor` and repair any reported skill or hook issue. Run `convos embed` so semantic retrieval is ready, use `convos query "why did we make this decision?"` to find a relevant past conversation, and verify the strongest result with `convos read CONVERSATION_ID --around MESSAGE_ID`. Do not configure web sync, credentials, or a remote service unless I ask.
 ```
 
-Local-first memory for coding agents. Capture Claude Code and Codex work automatically, retrieve decisions across providers, and optionally synchronize encrypted personal or team memory through a self-hosted relay.
+The daily agent workflow is **Capture -> Recall -> Continue**: lifecycle hooks
+capture completed local turns, hybrid retrieval finds the right prior work, and
+bounded reads provide exact evidence instead of generated recollections.
 
 ## Why this exists
 
@@ -35,18 +44,21 @@ Local-first memory for coding agents. Capture Claude Code and Codex work automat
 
 ## Install
 
-Install from GitHub with uv (adds `convos` to PATH in an isolated environment):
+Install from PyPI with uv, initialize local capture, and prepare semantic recall:
 
 ```bash
-uv tool install "git+https://github.com/RobertBiehl/ai-convos-db.git"
+uv tool install convos
+convos init
+convos embed
+convos doctor
 ```
 
-`pipx install "git+https://github.com/RobertBiehl/ai-convos-db.git"` is also supported.
+`pipx install convos` is also supported.
 
 Upgrade later with:
 
 ```bash
-uv tool install --reinstall "git+https://github.com/RobertBiehl/ai-convos-db.git"
+uv tool upgrade convos
 convos install-skills
 ```
 
@@ -58,7 +70,7 @@ skill and capture hooks, imports existing local Codex and Claude Code sessions,
 and performs safe local setup for installed products. That first local scan is
 incremental on later runs and never probes ChatGPT or Claude web. With the
 Memory extra installed, the same command turns on automatic memory delivery for
-the current project. It never downloads an optional model, configures a remote
+the current project. It never downloads the retrieval model, configures a remote
 service, or deletes data. Codex asks you to review new or changed hooks once
 through `/hooks`. Refresh only the skill with:
 
@@ -69,8 +81,7 @@ convos install-skills
 Optionally add code-change provenance without expanding the core CLI package:
 
 ```bash
-uv tool install --reinstall "git+https://github.com/RobertBiehl/ai-convos-db.git" \
-  --with "ai-convos-changegraph @ git+https://github.com/RobertBiehl/ai-convos-db.git#subdirectory=apps/changegraph"
+uv tool install --with convos-changegraph convos
 ```
 
 This adds `convos blame`, `timeline`, `at`, `graph`, and `browse`.
@@ -79,7 +90,7 @@ Navigate semantically from any exact conversation or turn without sending
 archive text to a generation service:
 
 ```bash
-uv tool install "ai-convos-db[explore]"
+uv tool install "convos[explore]"
 convos related CONVERSATION_OR_MESSAGE_ID
 convos trail CONVERSATION_OR_MESSAGE_ID
 ```
@@ -93,7 +104,7 @@ and DOT output. See [semantic conversation exploration](docs/explore.md).
 Audit an archive for high-confidence credentials without printing their values:
 
 ```bash
-uv tool install "ai-convos-db[redact]"
+uv tool install "convos[redact]"
 convos redact scan
 ```
 
@@ -108,7 +119,7 @@ Resume a project from live repository state and exact archived evidence without
 asking a model to invent a summary:
 
 ```bash
-uv tool install "ai-convos-db[resume]"
+uv tool install "convos[resume]"
 cd /path/to/project
 convos resume
 ```
@@ -132,7 +143,7 @@ Track and reconcile Codex and Claude Code memories through a canonical local
 overlay without rewriting either provider's generated state:
 
 ```bash
-uv tool install "ai-convos-db[memory]"
+uv tool install "convos[memory]"
 convos init
 ```
 
@@ -180,8 +191,8 @@ available for automation without being required for routine use.
 For an unreleased Git snapshot, install both products from the same revision:
 
 ```bash
-uv tool install --reinstall "git+https://github.com/RobertBiehl/ai-convos-db.git" \
-  --with "ai-convos-memory @ git+https://github.com/RobertBiehl/ai-convos-db.git#subdirectory=apps/memory"
+uv tool install --reinstall "git+https://github.com/RobertBiehl/convos.git" \
+  --with "convos-memory @ git+https://github.com/RobertBiehl/convos.git#subdirectory=apps/memory"
 ```
 
 The encrypted remote uses one optional client package and one independently
@@ -245,7 +256,7 @@ convos read f2b9c5a9 --around 01ab -n 20 -f jsonl
 Replay one conversation with its captured tool and edit evidence:
 
 ```bash
-uv tool install "ai-convos-db[resume]"
+uv tool install "convos[resume]"
 convos replay CONVERSATION_ID
 convos replay CONVERSATION_ID --around MESSAGE_ID -f json
 ```
@@ -273,7 +284,7 @@ Local Claude Code and Codex sessions can be ingested after each completed turn:
 ```bash
 convos install-hooks             # repair or refresh hooks installed by init
 convos install-hooks --status
-convos install-hooks --remove    # remove only ai-convos-db hook handlers
+convos install-hooks --remove    # remove only convos hook handlers
 ```
 
 Start a new agent session after installing hooks. In Codex, review the user
@@ -378,5 +389,5 @@ PRs welcome. Keep changes small and focused. See `AGENTS.md` for architecture an
 
 ## Agent usage
 
-Agents should use the CLI only. See `skills/agent-convos/SKILL.md`.
+Agents should use the CLI only. See `skills/convos/SKILL.md`.
 For setup and usage with Codex/Claude, see `docs/skills-setup.md`.

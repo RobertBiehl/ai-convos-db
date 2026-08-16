@@ -46,7 +46,7 @@ conversation ingestion in a separate transaction, so Git failure can be
 retried without losing the conversation archive. This happens for hooks and
 ordinary sync whether or not Changegraph or Remote is installed.
 
-## APPLICATION: `ai-convos-changegraph`
+## APPLICATION: `convos-changegraph`
 
 Installs via the plugin seam (see [00](00-overview.md)). Core initializes and
 writes the compact `provenance` schema because it is a stable archive contract.

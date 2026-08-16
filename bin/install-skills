@@ -5,14 +5,16 @@ target="${1:-both}"
 case "$target" in codex|claude|both) ;; *) echo "usage: $0 [codex|claude|both]" >&2; exit 1 ;; esac
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-skill="$root/skills/agent-convos/SKILL.md"
+skill="$root/skills/convos/SKILL.md"
 [ -f "$skill" ] || { echo "missing skill: $skill" >&2; exit 1; }
 
 install() {
   base="$1"
-  mkdir -p "$base/agent-convos"
-  cp -f "$skill" "$base/agent-convos/SKILL.md"
-  echo "Installed to $base/agent-convos"
+  mkdir -p "$base/convos"
+  cp -f "$skill" "$base/convos/SKILL.md"
+  legacy="$base/agent-convos/SKILL.md"
+  if [ ! -L "$legacy" ] && [ -f "$legacy" ] && cmp -s "$legacy" <(sed -e '0,/name: convos/s//name: agent-convos/' -e '0,/# Convos/s//# Agent Convos/' "$skill"); then rm "$legacy"; echo "Removed legacy $legacy"; fi
+  echo "Installed to $base/convos"
 }
 
 codex_base="${CODEX_HOME:-$HOME/.codex}/skills"

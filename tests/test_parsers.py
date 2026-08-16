@@ -647,12 +647,12 @@ class TestInstallSkills:
     def test_writes_bundled_skill_to_both_targets(self, tmp_path, monkeypatch):
         """install_skills resolves the bundled SKILL.md and installs it to codex + claude dirs."""
         from ai_convos.cli import install_skills
-        src = Path(__file__).resolve().parents[1] / "skills" / "agent-convos" / "SKILL.md"
+        src = Path(__file__).resolve().parents[1] / "skills" / "convos" / "SKILL.md"
         assert src.exists(), "bundled skill missing from repo source tree"
         monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
         monkeypatch.setenv("CODEX_HOME", str(tmp_path / ".codex"))
         monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "custom-claude"))
         install_skills()
-        dests = [tmp_path / ".codex" / "skills" / "agent-convos" / "SKILL.md",
-                 tmp_path / "custom-claude" / "skills" / "agent-convos" / "SKILL.md"]
+        dests = [tmp_path / ".codex" / "skills" / "convos" / "SKILL.md",
+                 tmp_path / "custom-claude" / "skills" / "convos" / "SKILL.md"]
         assert all(d.read_text() == src.read_text() for d in dests)

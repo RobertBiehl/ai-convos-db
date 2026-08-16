@@ -16,7 +16,7 @@ def test_memory_product_import_does_not_reenter_core_plugins():
     assert result.returncode == 0 and result.stderr == ""
 def test_memory_distribution_metadata_and_public_help():
     root = Path(__file__).resolve().parents[1]; project = tomllib.loads((root/"apps"/"memory"/"pyproject.toml").read_text())["project"]; core = tomllib.loads((root/"pyproject.toml").read_text())["project"]
-    assert project["readme"] == "README.md" and set(project["urls"]) == {"Documentation","Repository"} and "ai-convos-db>=0.7,<0.8" in project["dependencies"] and project["entry-points"]["convos.init"] == {"memory":"ai_convos_memory:initialize"} and project["entry-points"]["convos.remote"] == {"memory":"ai_convos_memory:remote_bridge"} and memory_module.remote_bridge()["v"] == 2 and memory_module.remote_bridge()["objects"] == {"memory.canonical"} and set(memory_module.remote_bridge()) == {"v","objects","records","accept","token"} and core["optional-dependencies"]["memory"] == ["ai-convos-memory>=0.7,<0.8"]
+    assert project["readme"] == "README.md" and set(project["urls"]) == {"Documentation","Repository"} and "convos>=0.8,<0.9" in project["dependencies"] and project["entry-points"]["convos.init"] == {"memory":"ai_convos_memory:initialize"} and project["entry-points"]["convos.remote"] == {"memory":"ai_convos_memory:remote_bridge"} and memory_module.remote_bridge()["v"] == 2 and memory_module.remote_bridge()["objects"] == {"memory.canonical"} and set(memory_module.remote_bridge()) == {"v","objects","records","accept","token"} and core["optional-dependencies"]["memory"] == ["convos-memory>=0.8,<0.9"]
     commands=typer.main.get_command(memory).commands; public={name for name,command in commands.items() if not command.hidden}; hidden={name for name,command in commands.items() if command.hidden}
     assert {"status","audit","sync","review","remember","forget","backup","restore","enable","disable","current","history"} <= public
     assert {"scan","plan","apply","reconcile","context","install-hook","project","runtime-hook","adopt-scope"} <= hidden
@@ -344,16 +344,16 @@ def test_doctor_reports_delivery_and_scoped_ledger_health(tmp_path, monkeypatch)
     assert "memory: attention" in doctor_status() and "ledger=missing" in doctor_status() and "repair: convos memory enable" in doctor_status()
     home=CliRunner().invoke(memory,[]); assert home.exit_code==0 and f"Memory is not enabled for `{repo}`" in home.output and "Run `convos memory enable`" in home.output and all(word not in home.output for word in ("ledger","canonical","hooks=","skills="))
     codex_memory(codex, scope=str(repo)); scan_store(); plan = plan_data(True, scope=str(repo)); apply_data({"version":1,"plan":plan["plan"],"scope":str(repo),"resolutions":[{"source":plan["pending"][0]["source"],"action":"distinct"}]})
-    source = (Path(__file__).resolve().parents[1]/"skills"/"agent-convos"/"SKILL.md").read_text()
-    for root in (tmp_path/"codex-home", tmp_path/"claude-home"): skill = root/"skills"/"agent-convos"/"SKILL.md"; skill.parent.mkdir(parents=True); skill.write_text(source)
+    source = (Path(__file__).resolve().parents[1]/"skills"/"convos"/"SKILL.md").read_text()
+    for root in (tmp_path/"codex-home", tmp_path/"claude-home"): skill = root/"skills"/"convos"/"SKILL.md"; skill.parent.mkdir(parents=True); skill.write_text(source)
     context_hook_config(); monkeypatch.setattr(memory_module, "_codex_hook_trust", lambda *_:"trusted")
     result = doctor_status(); assert f"memory: ready, scope={repo}" in result and "sources=1, active=1, canonicals=1, pending=0, hooks=2/2, codex_trust=trusted, skills=2/2" in result and "repair:" not in result
     home = CliRunner().invoke(memory, []); assert home.exit_code == 0 and f"Memory is ready for `{repo}`: 1 memory available." in home.output and "Automatic delivery is active in Codex and Claude." in home.output and all(word not in home.output for word in ("source","canonical","ledger","hooks=","skills=","trust"))
     monkeypatch.setattr(memory_module, "_codex_hook_trust", lambda *_:"untrusted"); result = doctor_status(); home=CliRunner().invoke(memory,[]); assert "memory: attention" in result and "codex_trust=untrusted" in result and "repair: review Codex hooks with /hooks" in result and "Memory needs attention" in home.output and "Next: Review Codex hooks with /hooks." in home.output
     monkeypatch.setattr(memory_module, "_codex_hook_trust", lambda *_:"trusted")
-    (tmp_path/"codex-home"/"skills"/"agent-convos"/"SKILL.md").write_text("stale")
+    (tmp_path/"codex-home"/"skills"/"convos"/"SKILL.md").write_text("stale")
     result = doctor_status(); home=CliRunner().invoke(memory,[]); assert "memory: attention" in result and "skills=1/2" in result and "repair: convos memory enable" in result and "Next: Run `convos memory enable`." in home.output
-    (tmp_path/"codex-home"/"skills"/"agent-convos"/"SKILL.md").write_text(source)
+    (tmp_path/"codex-home"/"skills"/"convos"/"SKILL.md").write_text(source)
     config = tmp_path/"claude-home"/"settings.json"; data = json.loads(config.read_text()); data["hooks"]["SessionStart"][0]["hooks"][0]["command"] = f"CONVOS_MEMORY_DB={tmp_path/'memory.db'} /missing/convos memory runtime-hook"; config.write_text(json.dumps(data))
     result = doctor_status(); home=CliRunner().invoke(memory,[]); assert "memory: attention" in result and "hooks=1/2" in result and "repair: convos memory enable" in result and "Next: Run `convos memory enable`." in home.output
     context_hook_config()

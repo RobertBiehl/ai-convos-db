@@ -18,3 +18,5 @@ jobs:
           enable-cache: true
       - run: uv sync --all-extras
       - run: uv run pytest -m "not integration" -q
+      - run: uv build --wheel
+      - run: bash scripts/smoke-wheel.sh dist/convos-*.whl

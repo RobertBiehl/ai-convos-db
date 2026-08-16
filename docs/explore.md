@@ -1,6 +1,6 @@
 # Semantic conversation exploration
 
-The optional `ai-convos-explore` product turns an exact conversation or message
+The optional `convos-explore` product turns an exact conversation or message
 into a local semantic neighborhood:
 
 ```bash
