@@ -6,7 +6,6 @@ from importlib.metadata import entry_points
 from pathlib import Path
 
 from ai_convos.cli import ARCHIVE_COLUMNS as COLUMNS, PROVENANCE_KINDS as PROVENANCE, _insert_pages, index_attachment_body, init_schema, open_db, project_logical_rows, project_provenance, project_row_proofs, project_workspace_controls, provenance_records, set_attachment_path
-from ai_convos_changegraph.provenance import query as graph_query
 from .control import verify_state
 from .protocol import digest, fingerprint, logical_fact, logical_row, row_proof, seal_blob, seal_replica, semantic_proof, verify_row_proof, verify_row_proof_header, verify_semantic_proof
 
@@ -343,7 +342,3 @@ def project_many(db_path,state,items,local_device=None,root=None,commit=True,aut
     finally:
         if db: db.close()
     return len(items)
-def query(db_path,name,arg=None):
-    db=open_db(db_path,True)
-    try: return graph_query(db,name,arg)
-    finally: db.close()

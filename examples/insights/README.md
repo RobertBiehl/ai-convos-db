@@ -42,18 +42,3 @@ convos sql "SELECT (SELECT COUNT(*) FROM messages) messages, (SELECT COUNT(*) FR
 
 Use SQL for known fields, joins, dates, and counts. Text discovery is usually
 better through `query` or `search`.
-
-## Connect prompts to files and checkpoints
-
-With the provenance application installed:
-
-```bash
-convos remote graph file_history --arg src/service.py
-convos remote graph conversation_changes --arg CONVERSATION_ID
-convos remote graph commit_conversations --arg GIT_COMMIT
-convos remote graph checkpoint_diff --arg CHECKPOINT_A..CHECKPOINT_B
-convos remote graph current_activity --arg /path/to/checkout
-convos remote graph repository_activity --arg REPOSITORY_ID
-```
-
-These views remain local and operate without server availability.

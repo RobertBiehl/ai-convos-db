@@ -116,7 +116,7 @@ observation, hook setting, or native provider file.
 ## Install
 
 ```bash
-uv tool install "convos[memory]"
+uv tool install convos --with "convos-memory @ git+https://github.com/RobertBiehl/convos.git#subdirectory=apps/memory"
 convos init
 ```
 

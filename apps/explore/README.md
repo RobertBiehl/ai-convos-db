@@ -10,7 +10,7 @@ convos trail CONVERSATION_OR_MESSAGE_ID
 Install it with the core product:
 
 ```bash
-uv tool install "convos[explore]"
+uv tool install convos --with "convos-explore @ git+https://github.com/RobertBiehl/convos.git#subdirectory=apps/explore"
 ```
 
 A conversation target uses up to 32 recent embedded human turns as its

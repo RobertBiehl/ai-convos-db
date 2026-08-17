@@ -8,7 +8,7 @@ collisions; the CLI owns hashes, history, transactions, and stale-plan rejection
 Install it alongside `convos`, then initialize once:
 
 ```bash
-uv tool install "convos[memory]"
+uv tool install convos --with "convos-memory @ git+https://github.com/RobertBiehl/convos.git#subdirectory=apps/memory"
 convos init
 ```
 

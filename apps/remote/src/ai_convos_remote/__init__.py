@@ -10,7 +10,7 @@ _pending=[]
 def register(app): _pending.append(app) if "remote" not in globals() else app.add_typer(remote,name="remote")
 from ai_convos.cli import PROJECT_ROOT, archive_changes as core_archive_changes, archive_state as core_archive_state, drain_hooks, durable_replace, init_schema, install_hooks, open_db, project_attachment_body, project_workspace_controls
 from .control import CONTROL_V, approved, electorate, proposal as device_proposal, record as control_record, sign as control_sign, state_hash, verify_proposal, verify_state, vote as device_vote
-from .projection import SIGNED, TABLES, apply_row_replicas, attest_rows, blob_replicas, bridge_replicas, bridge_stamp, connect, control_chain, cutover_state, event_support, inspect_state, project, project_many, query as graph_query, read_state, relocate_attachments, reset_history, row_replicas, scan, sequence, stored_controls, verify_history
+from .projection import SIGNED, TABLES, apply_row_replicas, attest_rows, blob_replicas, bridge_replicas, bridge_stamp, connect, control_chain, cutover_state, event_support, inspect_state, project, project_many, read_state, relocate_attachments, reset_history, row_replicas, scan, sequence, stored_controls, verify_history
 from .protocol import (b64, certificate, digest, event, fingerprint, identity, open_blob, open_event, open_key, open_origin, open_replica, public, public_id, recover,
                        recovery_bundle, registration_proof, seal_event, seal_key, seal_origin, seal_replica, sign_control, signer, unb64, verify_certificate)
 from .service import edit_hooks, enable
@@ -519,6 +519,4 @@ def doctor_status():
     except Exception as e: return f"remote: unavailable ({e})"
 @remote.command("doctor")
 def doctor_cmd(): typer.echo(doctor_status())
-@remote.command("graph")
-def graph_cmd(view:str,arg:Optional[str]=None): typer.echo(json.dumps(graph_query(core_path(),view,arg),default=str))
 [register(app) for app in _pending]; _pending.clear()
