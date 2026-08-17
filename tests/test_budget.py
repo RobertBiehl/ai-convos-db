@@ -43,4 +43,12 @@ def test_installable_product_versions_are_aligned():
     root = Path(__file__).resolve().parents[1]; files = [root/"pyproject.toml", *sorted((root/"apps").glob("*/pyproject.toml"))]
     projects = {f.parent.name:tomllib.loads(f.read_text())["project"] for f in files}
     assert {p["name"] for p in projects.values()} == {"convos","convos-changegraph","convos-explore","convos-memory","convos-redact","convos-remote","convos-remote-server","convos-resume"}, projects
-    assert {p["version"] for p in projects.values()} == {"0.8.0"}, projects
+    assert {p["version"] for p in projects.values()} == {"0.8.1"}, projects
+    assert not any(d.startswith("convos-changegraph") for d in projects["remote"]["dependencies"])
+
+
+def test_release_has_one_trusted_publisher_per_public_product():
+    workflow = (Path(__file__).resolve().parents[1]/".github/workflows/release.yml").read_text(); public={"convos","convos-redact","convos-remote","convos-remote-server"}
+    assert set(re.findall(r"packages-dir: dist/([^/]+)/",workflow)) == public
+    assert set(re.findall(r"^\s+name: (pypi(?:-[a-z-]+)?)$",workflow,re.M)) == {"pypi","pypi-redact","pypi-remote","pypi-remote-server"}
+    assert workflow.count("skip-existing: true") == len(public)

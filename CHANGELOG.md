@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.8.1
+
+- Publish Convos, Redact, Remote, and Remote Server through isolated trusted
+  publisher environments with independently staged wheel and source artifacts.
+- Make partial PyPI release retries safe and keep unreleased workspace products
+  out of the public upload set and core package extras.
+- Remove Remote's incidental Changegraph dependency and diagnostic command;
+  encrypted synchronization and local recall remain independent product pillars.
+
 ## 0.8.0
 
 - Rename the public product, repository, primary distribution, companion

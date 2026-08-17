@@ -4,7 +4,7 @@
 command:
 
 ```bash
-uv tool install "convos[resume]"
+uv tool install convos --with "convos-resume @ git+https://github.com/RobertBiehl/convos.git#subdirectory=apps/resume"
 cd /path/to/project
 convos resume
 ```

@@ -9,9 +9,9 @@ read_when:
 
 # Encrypted remote
 
-The optional remote application synchronizes signed encrypted events. The relay
+The Remote application synchronizes signed encrypted events. The relay
 never receives conversation plaintext, file paths, repository names, embeddings,
-attachments, or workspace keys. Search and graph queries remain local.
+attachments, or workspace keys. Recall and archive queries remain local.
 
 The next storage and recovery architecture is specified in
 [Remote state v1](remote-state-v1.md). It makes canonical provenance part of
@@ -36,13 +36,12 @@ Epoch-changing controls also pin the relay history boundary: the exact tail and
 latest `(sequence, event_id)` for every author. Recovery must reach every signed
 checkpoint with no unexplained sequence gap before publication becomes ready.
 
-## Install from this repository
+## Install
 
 Install the core and client applications together:
 
 ```bash
-uv tool install --reinstall "git+https://github.com/RobertBiehl/convos.git" \
-  --with "convos-remote @ git+https://github.com/RobertBiehl/convos.git#subdirectory=apps/remote"
+uv tool install convos --with convos-remote
 ```
 
 For a local checkout, `uv sync --all-extras` installs the same workspace.
@@ -57,8 +56,7 @@ The relay is a single process backed by SQLite. Run it behind an HTTPS reverse
 proxy; device bearer tokens must not traverse an untrusted network over HTTP.
 
 ```bash
-uv tool install --reinstall \
-  "convos-remote-server @ git+https://github.com/RobertBiehl/convos.git#subdirectory=apps/remote_server"
+uv tool install convos-remote-server
 install -d -m 700 ~/.local/share/convos-server
 convos-server serve \
   --db ~/.local/share/convos-server/server.db \
@@ -285,8 +283,6 @@ active device and history proposals.
 ```bash
 convos doctor
 convos remote doctor
-convos remote graph repository_activity --arg REPOSITORY_ID
-convos remote graph conversation_changes --arg CONVERSATION_ID
 convos remote fetch                 # materialize deferred large events
 convos remote sync                  # explicit repair/backfill only
 ```

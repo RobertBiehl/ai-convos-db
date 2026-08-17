@@ -5,7 +5,6 @@ import duckdb
 from ai_convos.cli import capture_provenance, init_schema
 from ai_convos.cli import repository
 from ai_convos_remote import add_member, connect, create, load, publish, setup_client, upload
-from ai_convos_remote.projection import query
 
 
 def port():
@@ -80,7 +79,7 @@ def test_real_http_team_policy_across_different_checkout_paths(tmp_path):
             except Exception: pass
             if found: break
             time.sleep(.2)
-        assert found; activity=query(b/"data/convos.db","repository_activity",rid); assert activity and activity[0]["repository"]==rid
+        assert found; check=duckdb.connect(str(b/"data/convos.db"),read_only=True); activity=check.execute("SELECT COUNT(*) FROM provenance.files f JOIN provenance.file_edit_files x ON x.file_id=f.id WHERE f.repository=?",[rid]).fetchone()[0]; check.close(); assert activity==1
         raw=(tmp_path/"server.db").read_bytes().decode(errors="ignore"); assert str(repo_a) not in raw and str(repo_b) not in raw and "change backend" not in raw
     finally:
         [w.terminate() for w in workers]; [w.wait(timeout=3) for w in workers]; server.terminate(); server.wait(timeout=3)

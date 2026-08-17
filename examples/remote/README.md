@@ -17,7 +17,7 @@ one device, and waits for automatic delivery to the other without calling
 
 The team scenario links a Git repository once, clones it under an unrelated
 absolute path for another user, and proves that the relevant prompt, edit, and
-graph activity arrive automatically. Both scenarios inspect the relay database
+provenance arrive automatically. Both scenarios inspect the relay database
 to confirm their prompt and checkout paths are absent from server storage.
 
 Add `--keep` to preserve the generated directory for inspection. Without it,

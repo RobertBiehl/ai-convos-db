@@ -69,19 +69,45 @@ minute on macOS; later reinstalls reuse the built package.
 skill and capture hooks, imports existing local Codex and Claude Code sessions,
 and performs safe local setup for installed products. That first local scan is
 incremental on later runs and never probes ChatGPT or Claude web. With the
-Memory extra installed, the same command turns on automatic memory delivery for
-the current project. It never downloads the retrieval model, configures a remote
-service, or deletes data. Codex asks you to review new or changed hooks once
+Memory product installed, the same command turns on automatic memory delivery
+for the current project. It never downloads the retrieval model, configures a
+remote service, or deletes data. Codex asks you to review new or changed hooks once
 through `/hooks`. Refresh only the skill with:
 
 ```bash
 convos install-skills
 ```
 
+## Encrypted Remote
+
+Install the Remote client beside Convos to carry the same encrypted archive
+between personal devices or into team workspaces:
+
+```bash
+uv tool install convos --with convos-remote
+```
+
+The relay is a separate, independently deployable package and never receives
+conversation plaintext, repository names, file paths, embeddings, attachments,
+or workspace keys:
+
+```bash
+uv tool install convos-remote-server
+```
+
+See [self-hosting, recovery, team policy, and installation](docs/remote.md) and
+the runnable synthetic [personal and team scenarios](examples/remote/README.md).
+
+## Additional workspace products
+
+Redact is published on PyPI because it is part of Remote's team boundary. The
+other applications below remain source-only while their public product surface
+is still being shaped.
+
 Optionally add code-change provenance without expanding the core CLI package:
 
 ```bash
-uv tool install --with convos-changegraph convos
+uv tool install convos --with "convos-changegraph @ git+https://github.com/RobertBiehl/convos.git#subdirectory=apps/changegraph"
 ```
 
 This adds `convos blame`, `timeline`, `at`, `graph`, and `browse`.
@@ -90,7 +116,7 @@ Navigate semantically from any exact conversation or turn without sending
 archive text to a generation service:
 
 ```bash
-uv tool install "convos[explore]"
+uv tool install convos --with "convos-explore @ git+https://github.com/RobertBiehl/convos.git#subdirectory=apps/explore"
 convos related CONVERSATION_OR_MESSAGE_ID
 convos trail CONVERSATION_OR_MESSAGE_ID
 ```
@@ -119,7 +145,7 @@ Resume a project from live repository state and exact archived evidence without
 asking a model to invent a summary:
 
 ```bash
-uv tool install "convos[resume]"
+uv tool install convos --with "convos-resume @ git+https://github.com/RobertBiehl/convos.git#subdirectory=apps/resume"
 cd /path/to/project
 convos resume
 ```
@@ -143,7 +169,7 @@ Track and reconcile Codex and Claude Code memories through a canonical local
 overlay without rewriting either provider's generated state:
 
 ```bash
-uv tool install "convos[memory]"
+uv tool install convos --with "convos-memory @ git+https://github.com/RobertBiehl/convos.git#subdirectory=apps/memory"
 convos init
 ```
 
@@ -195,16 +221,14 @@ uv tool install --reinstall "git+https://github.com/RobertBiehl/convos.git" \
   --with "convos-memory @ git+https://github.com/RobertBiehl/convos.git#subdirectory=apps/memory"
 ```
 
-The encrypted remote uses one optional client package and one independently
-installable server package, so the local archive stays server-free by default.
+The encrypted remote uses one client package and one independently installable
+server package, so the local archive stays server-free by default.
 When the memory and remote clients are both present, personal background sync
 automatically carries canonical memory revisions in the same end-to-end
 encrypted event stream; concurrent semantic changes remain reviewable instead
 of becoming last-write-wins. User-owned forget operations also remove safe
 remote-only copies and the author's prior relay ciphertext while preserving
-local or provider divergence. Neither optional package depends on the other.
-See [self-hosting, recovery, team policy, and installation](docs/remote.md).
-Runnable synthetic scenarios are in [`examples/remote`](examples/remote/README.md).
+local or provider divergence. Neither product depends on the other.
 See [`examples/insights`](examples/insights/README.md) for local decision,
 comparison, archive-statistics, and prompt-to-change query recipes.
 
@@ -256,7 +280,7 @@ convos read f2b9c5a9 --around 01ab -n 20 -f jsonl
 Replay one conversation with its captured tool and edit evidence:
 
 ```bash
-uv tool install "convos[resume]"
+uv tool install convos --with "convos-resume @ git+https://github.com/RobertBiehl/convos.git#subdirectory=apps/resume"
 convos replay CONVERSATION_ID
 convos replay CONVERSATION_ID --around MESSAGE_ID -f json
 ```
