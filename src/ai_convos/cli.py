@@ -1,35 +1,34 @@
 #!/usr/bin/env python3
-import base64, json, time, zipfile, hashlib, struct, sqlite3, subprocess, ssl, urllib.request, re, os, sysconfig, site, csv, sys, shutil, shlex, fcntl, signal, tempfile
-from importlib.metadata import entry_points, version
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timedelta, timezone
-from functools import lru_cache
-from pathlib import Path; from typing import Optional
-from hashlib import pbkdf2_hmac
-from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
-
-import duckdb, typer
+import base64, json, time, zipfile, hashlib, struct, sqlite3, subprocess, ssl, urllib.request, re, os, sysconfig, site, csv, sys, shutil, shlex, fcntl, signal, tempfile, duckdb, typer
+from importlib.metadata import entry_points, version; from concurrent.futures import ThreadPoolExecutor, as_completed; from datetime import datetime, timedelta, timezone; from functools import lru_cache; from pathlib import Path; from typing import Optional; from hashlib import pbkdf2_hmac; from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 
 app = typer.Typer(help="AI Conversations DB - searchable archive for Claude, ChatGPT, and Codex")
 def find_root(): return Path(r).expanduser() if (r := os.environ.get("CONVOS_PROJECT_ROOT")) else Path.home()/".convos"
-PROJECT_ROOT = find_root()
-DATA_DIR, DB_PATH = PROJECT_ROOT / "data", PROJECT_ROOT / "data" / "convos.db"
-STATE_PATH = DATA_DIR / "sync_state.json"
+PROJECT_ROOT = find_root(); DATA_DIR, DB_PATH = PROJECT_ROOT / "data", PROJECT_ROOT / "data" / "convos.db"; STATE_PATH = DATA_DIR / "sync_state.json"
 HOOK_DIR, HOOK_STATE, HOOK_EMBED_DIRTY, HOOK_FTS_DIRTY, _NOISE = DATA_DIR/"hook_inbox", DATA_DIR/"hook_state.json", DATA_DIR/"hook_embeddings_dirty", DATA_DIR/"hook_fts_dirty", " AND NOT regexp_matches(content,'^(Base directory for this skill:|# AGENTS\\.md instructions for|<(codex_internal_context|environment_context|local-command-caveat|recommended_plugins|skill)( |>))')"
 CHATGPT_BURST, CHATGPT_RATE = 20, 8/15  # conservative policy below the observed ~200-detail failure point
 
 # ---- db helpers ----
 def open_db(path=None,read_only=False,wait=30):
-    path=Path(path or DB_PATH); path.parent.mkdir(parents=True,exist_ok=True)
+    path=Path(path or DB_PATH); path.parent.mkdir(parents=True,exist_ok=True); deadline=time.monotonic()+wait
     if read_only and not path.exists(): return None
-    deadline=time.monotonic()+wait
     while True:
         try: return duckdb.connect(str(path),read_only=read_only)
         except Exception as e:
             if "Conflicting lock is held" not in str(e): raise
             if time.monotonic()<deadline: time.sleep(.05); continue
             raise ValueError(f"Database stayed locked by another convos process for {wait:g} seconds.") from e
-def get_db(read_only:bool=False): return open_db(read_only=read_only)
+class _LockedDB:
+    def __init__(self,db,lock): self.db,self.lock=db,lock
+    def __getattr__(self,name): return getattr(self.db,name)
+    def close(self):
+        try: return self.db.close()
+        finally: self.lock.close()
+def get_db(read_only:bool=False,wait=30):
+    HOOK_DIR.mkdir(parents=True,exist_ok=True); lock=(HOOK_DIR/".db.lock").open("w"); fcntl.flock(lock,fcntl.LOCK_SH if read_only else fcntl.LOCK_EX)
+    try: db=open_db(read_only=read_only,wait=wait)
+    except BaseException: lock.close(); raise
+    return _LockedDB(db,lock) if db is not None else (lock.close() or None)
 
 def load_state():
     try: return json.loads(STATE_PATH.read_text()) if STATE_PATH.exists() else {}
@@ -895,7 +894,7 @@ def flush_fts():
             if not HOOK_FTS_DIRTY.exists(): return False
             claim = HOOK_FTS_DIRTY.with_name(f".{HOOK_FTS_DIRTY.name}.{os.getpid()}"); os.replace(HOOK_FTS_DIRTY, claim)
         try:
-            conn = open_db(wait=0)
+            conn = get_db(wait=0)
             try: rebuild_fts_index(conn)
             finally: conn.close()
         except BaseException: HOOK_FTS_DIRTY.touch(); raise

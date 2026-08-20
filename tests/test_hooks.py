@@ -82,6 +82,12 @@ def test_search_uses_last_fts_snapshot_when_refresh_is_locked(hooks):
     finally: hold.stdin.close(); hold.wait(timeout=5)
     assert result.exit_code == 0 and json.loads(result.stdout)[0]["content"] == "remember alpha" and "using last indexed snapshot" in result.stderr and (data/"hook_fts_dirty").exists()
 
+def test_core_connections_share_process_lock(hooks):
+    _,data=hooks; data.mkdir(); db=duckdb.connect(str(data/"convos.db")); cli.init_schema(db); db.close(); env={**os.environ,"CONVOS_PROJECT_ROOT":str(data.parent)}; hold=POPEN([sys.executable,"-c","from ai_convos.cli import get_db; c=get_db(); print('ready',flush=True); input(); c.close()"],env=env,stdin=subprocess.PIPE,stdout=subprocess.PIPE,text=True); done=threading.Event()
+    try:
+        assert hold.stdout.readline().strip()=="ready"; waiter=threading.Thread(target=lambda:(cli.get_db(True).close(),done.set())); waiter.start(); assert not done.wait(.1); hold.stdin.write("\n"); hold.stdin.flush(); assert done.wait(5); waiter.join()
+    finally: hold.stdin.close(); hold.wait(timeout=5)
+
 def test_sync_defers_fts_and_embeddings(hooks, tmp_path, monkeypatch):
     _, data = hooks; src = tmp_path/"import.json"; src.write_text("[]"); monkeypatch.setenv("CONVOS_IMPORT_PATHS", str(src)); monkeypatch.setattr(cli, "STATE_PATH", data/"sync_state.json")
     result = cli.ParseResult(convs=[dict(id="sync-c", source="chatgpt", title="T", created_at=None, updated_at=None, model=None, cwd=None, git_branch=None, project_id=None, metadata="{}")], msgs=[dict(id="sync-m", conversation_id="sync-c", role="user", content="alpha", thinking=None, created_at=None, model=None, metadata="{}", parent_id=None)])

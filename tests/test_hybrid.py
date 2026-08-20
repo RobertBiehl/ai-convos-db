@@ -202,9 +202,9 @@ def test_db_waits_for_writer(tmp_path, monkeypatch, read_only):
     def connect(path, read_only=False):
         calls["n"] += 1
         if calls["n"] < 3: raise duckdb.IOException("Conflicting lock is held")
-        return "conn"
+        return type("Connection",(),{"close":lambda _:None})()
     monkeypatch.setattr(cli.duckdb, "connect", connect)
-    assert cli.get_db(read_only=read_only) == "conn"
+    conn=cli.get_db(read_only=read_only); conn.close()
     assert calls["n"] == 3
 
 
