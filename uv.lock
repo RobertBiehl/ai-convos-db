@@ -153,7 +153,7 @@ requires-dist = [
     { name = "convos-remote-server", marker = "extra == 'dev'", editable = "apps/remote_server" },
     { name = "convos-resume", marker = "extra == 'dev'", editable = "apps/resume" },
     { name = "cryptography", specifier = ">=42.0.0" },
-    { name = "duckdb", specifier = ">=1.0.0" },
+    { name = "duckdb", specifier = ">=1.2.0" },
     { name = "huggingface-hub", specifier = ">=0.20.0" },
     { name = "llama-cpp-python", specifier = ">=0.3.0" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.0.0" },
@@ -175,7 +175,7 @@ dependencies = [
 [package.metadata]
 requires-dist = [
     { name = "convos", editable = "." },
-    { name = "duckdb", specifier = ">=1.0.0" },
+    { name = "duckdb", specifier = ">=1.2.0" },
     { name = "typer", specifier = ">=0.12.0" },
 ]
 
