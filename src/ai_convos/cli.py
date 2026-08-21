@@ -1,35 +1,34 @@
 #!/usr/bin/env python3
-import base64, json, time, zipfile, hashlib, struct, sqlite3, subprocess, ssl, urllib.request, re, os, sysconfig, site, csv, sys, shutil, shlex, fcntl, signal, tempfile
-from importlib.metadata import entry_points, version
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timedelta, timezone
-from functools import lru_cache
-from pathlib import Path; from typing import Optional
-from hashlib import pbkdf2_hmac
-from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
-
-import duckdb, typer
+import base64, json, time, zipfile, hashlib, struct, sqlite3, subprocess, ssl, urllib.request, re, os, sysconfig, site, csv, sys, shutil, shlex, fcntl, signal, tempfile, duckdb, typer
+from importlib.metadata import entry_points, version; from concurrent.futures import ThreadPoolExecutor, as_completed; from datetime import datetime, timedelta, timezone; from functools import lru_cache; from pathlib import Path; from typing import Optional; from hashlib import pbkdf2_hmac; from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 
 app = typer.Typer(help="AI Conversations DB - searchable archive for Claude, ChatGPT, and Codex")
 def find_root(): return Path(r).expanduser() if (r := os.environ.get("CONVOS_PROJECT_ROOT")) else Path.home()/".convos"
-PROJECT_ROOT = find_root()
-DATA_DIR, DB_PATH = PROJECT_ROOT / "data", PROJECT_ROOT / "data" / "convos.db"
-STATE_PATH = DATA_DIR / "sync_state.json"
+PROJECT_ROOT = find_root(); DATA_DIR, DB_PATH = PROJECT_ROOT / "data", PROJECT_ROOT / "data" / "convos.db"; STATE_PATH = DATA_DIR / "sync_state.json"
 HOOK_DIR, HOOK_STATE, HOOK_EMBED_DIRTY, HOOK_FTS_DIRTY, _NOISE = DATA_DIR/"hook_inbox", DATA_DIR/"hook_state.json", DATA_DIR/"hook_embeddings_dirty", DATA_DIR/"hook_fts_dirty", " AND NOT regexp_matches(content,'^(Base directory for this skill:|# AGENTS\\.md instructions for|<(codex_internal_context|environment_context|local-command-caveat|recommended_plugins|skill)( |>))')"
 CHATGPT_BURST, CHATGPT_RATE = 20, 8/15  # conservative policy below the observed ~200-detail failure point
 
 # ---- db helpers ----
 def open_db(path=None,read_only=False,wait=30):
-    path=Path(path or DB_PATH); path.parent.mkdir(parents=True,exist_ok=True)
+    path=Path(path or DB_PATH); path.parent.mkdir(parents=True,exist_ok=True); deadline=time.monotonic()+wait
     if read_only and not path.exists(): return None
-    deadline=time.monotonic()+wait
     while True:
         try: return duckdb.connect(str(path),read_only=read_only)
         except Exception as e:
             if "Conflicting lock is held" not in str(e): raise
             if time.monotonic()<deadline: time.sleep(.05); continue
             raise ValueError(f"Database stayed locked by another convos process for {wait:g} seconds.") from e
-def get_db(read_only:bool=False): return open_db(read_only=read_only)
+class _LockedDB:
+    def __init__(self,db,lock): self.db,self.lock=db,lock
+    def __getattr__(self,name): return getattr(self.db,name)
+    def close(self):
+        try: return self.db.close()
+        finally: self.lock.close()
+def get_db(read_only:bool=False,wait=30):
+    HOOK_DIR.mkdir(parents=True,exist_ok=True); lock=(HOOK_DIR/".db.lock").open("w"); fcntl.flock(lock,fcntl.LOCK_SH if read_only else fcntl.LOCK_EX)
+    try: db=open_db(read_only=read_only,wait=wait)
+    except BaseException: lock.close(); raise
+    return _LockedDB(db,lock) if db is not None else (lock.close() or None)
 
 def load_state():
     try: return json.loads(STATE_PATH.read_text()) if STATE_PATH.exists() else {}
@@ -86,6 +85,7 @@ CREATE TABLE IF NOT EXISTS archive_state(singleton BOOLEAN PRIMARY KEY,archive_i
 CREATE TABLE IF NOT EXISTS archive_changes(kind VARCHAR,entity VARCHAR,generation UBIGINT,PRIMARY KEY(kind,entity));
 """
 ARCHIVE_COLUMNS={"conversations":["id","source","title","created_at","updated_at","model","cwd","git_branch","project_id","metadata"],"messages":["id","conversation_id","role","content","thinking","created_at","model","metadata","parent_id"],"tool_calls":["id","message_id","tool_name","input","output","status","duration_ms","created_at"],"attachments":["id","message_id","filename","mime_type","size","path","url","created_at"],"artifacts":["id","conversation_id","artifact_type","title","content","language","created_at","version"],"file_edits":["id","message_id","file_path","edit_type","content","created_at","old_content"]}
+_MSG_UPDATES=",".join(f"{c}=excluded.{c}" for c in ARCHIVE_COLUMNS["messages"][1:])+",embedding=excluded.embedding"; _MSG_UPS=f"INSERT INTO messages ({','.join(ARCHIVE_COLUMNS['messages'])},embedding) SELECT x.*,m.embedding FROM (VALUES ({','.join('?'*len(ARCHIVE_COLUMNS['messages']))})) x({','.join(ARCHIVE_COLUMNS['messages'])}) LEFT JOIN messages m ON m.id=x.id AND m.content IS NOT DISTINCT FROM x.content ON CONFLICT(id) DO UPDATE SET {_MSG_UPDATES}"
 PROVENANCE_KINDS={"repository.observed","file.observed","file.version","edit.observed","git.checkpoint","checkpoint.link"}
 def provenance_digest(v): return hashlib.sha256(v if isinstance(v,bytes) else json.dumps(v,sort_keys=True,separators=(",",":"),ensure_ascii=True,allow_nan=False).encode()).hexdigest()
 def _archive_touch(db,rows=()): generation=(db.execute("UPDATE archive_state SET generation=generation+1 WHERE singleton RETURNING generation").fetchone() or [0])[0]; rows and _insert_pages(db,"archive_changes",[(kind,entity,generation) for kind,entity in rows],mode=" OR REPLACE"); return generation
@@ -183,11 +183,11 @@ def project_archive_row(db,table,columns,values,origin=None,touch=True):
     if table not in ARCHIVE_COLUMNS or columns!=ARCHIVE_COLUMNS[table] or len(values)!=len(columns): raise ValueError("record schema/entity mismatch")
     required=("workspace_id","author_user_id","author_device_id","source_row_id","source_event_id","content_key","observed_at")
     if origin and set(origin) not in (set(required),set(required)|{"proof_id"}): raise ValueError("record origin schema mismatch")
-    updates=",".join(f"{c}=excluded.{c}" for c in columns[1:])+(f",embedding=CASE WHEN {table}.content IS DISTINCT FROM excluded.content THEN NULL ELSE {table}.embedding END" if table=="messages" else ""); db.execute(f"INSERT INTO {table} ({','.join(columns)}) VALUES ({','.join('?'*len(columns))}) ON CONFLICT(id) DO UPDATE SET {updates}",values)
+    updates=_MSG_UPDATES if table=="messages" else ",".join(f"{c}=excluded.{c}" for c in columns[1:]); db.execute(_MSG_UPS,values) if table=="messages" else db.execute(f"INSERT INTO {table} ({','.join(columns)}) VALUES ({','.join('?'*len(columns))}) ON CONFLICT(id) DO UPDATE SET {updates}",values)
     if origin: db.execute("INSERT OR REPLACE INTO remote.row_origins VALUES (?,?,?,?,?,?,?,?,?,?)",(table,values[0],*(origin[k] for k in required),origin.get("proof_id")))
     touch and _archive_touch(db,[(table,values[0])])
-def _insert_pages(db,target,rows,columns=None,conflict="",mode=""): schema={r[0]:r[1] for r in db.execute(f"DESCRIBE {target}").fetchall()}; columns=columns or list(schema); shape=json.dumps([{c:schema[c] for c in columns}]); norm=lambda c,v:json.loads(v) if schema[c]=="JSON" and isinstance(v,str) else v; [db.execute(f"INSERT{mode} INTO {target} ({','.join(columns)}) SELECT x.* FROM UNNEST(from_json(?,?)) t(x){conflict}",(json.dumps([{c:norm(c,v) for c,v in zip(columns,row)} for row in page],default=str,ensure_ascii=True,allow_nan=False),shape)) for page in (rows[i:i+500] for i in range(0,len(rows),500))]
-def project_archive_rows(db,table,columns,rows): required=("workspace_id","author_user_id","author_device_id","source_row_id","source_event_id","content_key","observed_at"); values=[r[0] for r in rows]; origins=[(table,v[0],*(o[k] for k in required),o.get("proof_id")) for v,o in rows if o]; updates=','.join(f"{c}=excluded.{c}" for c in columns[1:])+(f",embedding=CASE WHEN {table}.content IS DISTINCT FROM excluded.content THEN NULL ELSE {table}.embedding END" if table=="messages" else ""); table in ARCHIVE_COLUMNS and columns==ARCHIVE_COLUMNS[table] and not any(len(v)!=len(columns) or o and set(o) not in (set(required),set(required)|{"proof_id"}) for v,o in rows) or (_ for _ in ()).throw(ValueError("record schema/entity mismatch")); _insert_pages(db,table,values,columns,f" ON CONFLICT(id) DO UPDATE SET {updates}"); origins and _insert_pages(db,"remote.row_origins",origins,mode=" OR REPLACE")
+def _insert_pages(db,target,rows,columns=None,conflict="",mode="",embedding=False): schema={r[0]:r[1] for r in db.execute(f"DESCRIBE {target}").fetchall()}; columns=columns or list(schema); shape=json.dumps([{c:schema[c] for c in columns}]); norm=lambda c,v:json.loads(v) if schema[c]=="JSON" and isinstance(v,str) else v; extra=",embedding" if embedding else ""; source="SELECT x.*,m.embedding FROM UNNEST(from_json(?,?)) t(x) LEFT JOIN messages m ON m.id=x.id AND m.content IS NOT DISTINCT FROM x.content" if embedding else "SELECT x.* FROM UNNEST(from_json(?,?)) t(x)"; [db.execute(f"INSERT{mode} INTO {target} ({','.join(columns)}{extra}) {source}{conflict}",(json.dumps([{c:norm(c,v) for c,v in zip(columns,row)} for row in page],default=str,ensure_ascii=True,allow_nan=False),shape)) for page in (rows[i:i+500] for i in range(0,len(rows),500))]
+def project_archive_rows(db,table,columns,rows): required=("workspace_id","author_user_id","author_device_id","source_row_id","source_event_id","content_key","observed_at"); values=[r[0] for r in rows]; origins=[(table,v[0],*(o[k] for k in required),o.get("proof_id")) for v,o in rows if o]; updates=_MSG_UPDATES if table=="messages" else ','.join(f"{c}=excluded.{c}" for c in columns[1:]); table in ARCHIVE_COLUMNS and columns==ARCHIVE_COLUMNS[table] and not any(len(v)!=len(columns) or o and set(o) not in (set(required),set(required)|{"proof_id"}) for v,o in rows) or (_ for _ in ()).throw(ValueError("record schema/entity mismatch")); _insert_pages(db,table,values,columns,f" ON CONFLICT(id) DO UPDATE SET {updates}",embedding=table=="messages"); origins and _insert_pages(db,"remote.row_origins",origins,mode=" OR REPLACE")
 def project_row_proofs(db,proofs,root_public,certificate):
     if not proofs: return []
     fields=("workspace","authorization_workspace","row_kind","row_id","encoding_v","content_hash","revision","previous_revision","state","author_user_id","author_device_id","authorization_epoch","signature"); expected={"v","kind",*fields}; signer=(proofs[0]["author_user_id"],proofs[0]["author_device_id"]); packed=json.dumps(certificate,sort_keys=True,separators=(",",":"),ensure_ascii=True,allow_nan=False)
@@ -803,7 +803,6 @@ def parse_codex(codex_dir: Path, files: list[Path] | None = None) -> ParseResult
         convs=[s["conv"] for s in sessions], msgs=[m for s in sessions for m in s["msgs"]],
         tools=[t for s in sessions for t in s["tools"]], attachs=[a for s in sessions for a in s["attachs"]], edits=[e for s in sessions for e in s["edits"]])
 
-_MSG_UPS = "INSERT INTO messages VALUES (?,?,?,?,?,?,?,?,NULL,?) ON CONFLICT(id) DO UPDATE SET conversation_id=excluded.conversation_id, role=excluded.role, content=excluded.content, thinking=excluded.thinking, created_at=excluded.created_at, model=excluded.model, metadata=excluded.metadata, parent_id=excluded.parent_id, embedding=CASE WHEN messages.content IS DISTINCT FROM excluded.content THEN NULL ELSE messages.embedding END"
 _CONV_UPS = "INSERT INTO conversations VALUES (?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET source=excluded.source,title=excluded.title,created_at=CASE WHEN conversations.created_at IS NULL OR excluded.created_at < conversations.created_at THEN excluded.created_at ELSE conversations.created_at END,updated_at=CASE WHEN conversations.updated_at IS NULL OR excluded.updated_at > conversations.updated_at THEN excluded.updated_at ELSE conversations.updated_at END,model=COALESCE(excluded.model,conversations.model),cwd=COALESCE(excluded.cwd,conversations.cwd),git_branch=COALESCE(excluded.git_branch,conversations.git_branch),project_id=COALESCE(excluded.project_id,conversations.project_id),metadata=excluded.metadata"
 
 def upsert(conn, r: ParseResult):
@@ -818,7 +817,7 @@ def upsert(conn, r: ParseResult):
     for m in r.msgs:
         vals = list(m.values()); old = old_msgs.get(m["id"])
         if old and old[2:5] != tuple(vals[2:5]): hist = list(old); hist[0] = gen_id("history", f"messages:{m['id']}:{json.dumps(hist[2:5], default=str)}"); meta = json.loads(hist[7] or "{}"); hist[7] = json.dumps({**meta, "history_of":m["id"], "superseded_at":datetime.now().isoformat()}); changed_msgs.add(hist[0]); conn.execute("INSERT INTO messages VALUES (?,?,?,?,?,?,?,?,?,?) ON CONFLICT DO NOTHING", hist)
-        conn.execute(_MSG_UPS, vals)
+    [conn.execute(_MSG_UPS,list(m.values())) for m in r.msgs]
     historical=[]
     def replace_preserving(table, rows):
         if not rows: return
@@ -895,7 +894,7 @@ def flush_fts():
             if not HOOK_FTS_DIRTY.exists(): return False
             claim = HOOK_FTS_DIRTY.with_name(f".{HOOK_FTS_DIRTY.name}.{os.getpid()}"); os.replace(HOOK_FTS_DIRTY, claim)
         try:
-            conn = open_db(wait=0)
+            conn = get_db(wait=0)
             try: rebuild_fts_index(conn)
             finally: conn.close()
         except BaseException: HOOK_FTS_DIRTY.touch(); raise
@@ -1267,9 +1266,10 @@ def sync(watch: bool = typer.Option(False, "-w"), interval: int = typer.Option(3
                     if saved := j.get("saved"):
                         c, m, t, a, e, n, u = [sum(s[i] for s in saved) for i in range(7)]; changed_ids = set()
                     elif r is not None:
-                        conn = get_db(); conn.execute("BEGIN")
-                        try: c, m, t, a, e, n, u, changed_ids = upsert(conn, r); conn.execute("COMMIT")
-                        finally: conn.close()
+                        with (HOOK_DIR/".lock").open("w") as lock:
+                            fcntl.flock(lock, fcntl.LOCK_EX); conn = get_db(); conn.execute("BEGIN")
+                            try: c, m, t, a, e, n, u, changed_ids = upsert(conn, r); conn.execute("COMMIT")
+                            finally: conn.close()
                     else: continue
                     total = [total[i]+v for i, v in enumerate([c, m, t, a, e])]
                     newc, updc = newc+n, updc+u

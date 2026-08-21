@@ -1,4 +1,4 @@
-import json, os, signal, subprocess, sys, time
+import json, os, signal, subprocess, sys, threading, time
 from pathlib import Path
 import duckdb, pytest
 from typer.testing import CliRunner
@@ -82,6 +82,12 @@ def test_search_uses_last_fts_snapshot_when_refresh_is_locked(hooks):
     finally: hold.stdin.close(); hold.wait(timeout=5)
     assert result.exit_code == 0 and json.loads(result.stdout)[0]["content"] == "remember alpha" and "using last indexed snapshot" in result.stderr and (data/"hook_fts_dirty").exists()
 
+def test_core_connections_share_process_lock(hooks):
+    _,data=hooks; data.mkdir(); db=duckdb.connect(str(data/"convos.db")); cli.init_schema(db); db.close(); env={**os.environ,"CONVOS_PROJECT_ROOT":str(data.parent)}; hold=POPEN([sys.executable,"-c","from ai_convos.cli import get_db; c=get_db(); print('ready',flush=True); input(); c.close()"],env=env,stdin=subprocess.PIPE,stdout=subprocess.PIPE,text=True); done=threading.Event()
+    try:
+        assert hold.stdout.readline().strip()=="ready"; waiter=threading.Thread(target=lambda:(cli.get_db(True).close(),done.set())); waiter.start(); assert not done.wait(.1); hold.stdin.write("\n"); hold.stdin.flush(); assert done.wait(5); waiter.join()
+    finally: hold.stdin.close(); hold.wait(timeout=5)
+
 def test_sync_defers_fts_and_embeddings(hooks, tmp_path, monkeypatch):
     _, data = hooks; src = tmp_path/"import.json"; src.write_text("[]"); monkeypatch.setenv("CONVOS_IMPORT_PATHS", str(src)); monkeypatch.setattr(cli, "STATE_PATH", data/"sync_state.json")
     result = cli.ParseResult(convs=[dict(id="sync-c", source="chatgpt", title="T", created_at=None, updated_at=None, model=None, cwd=None, git_branch=None, project_id=None, metadata="{}")], msgs=[dict(id="sync-m", conversation_id="sync-c", role="user", content="alpha", thinking=None, created_at=None, model=None, metadata="{}", parent_id=None)])
@@ -141,6 +147,23 @@ def test_sync_checkpoints_chatgpt_pages_and_retries_only_unfinished(hooks, monke
     fail["bad"] = False; cli.sync(False,300,False,False,False,False); conn = duckdb.connect(str(data/"convos.db"),read_only=True); assert {r[0] for r in conn.execute("SELECT content FROM messages").fetchall()}=={*(f"ok{i}" for i in range(20)),"bad"}; conn.close()
     saved = json.loads(cli.STATE_PATH.read_text())["web"]["chatgpt"]
     assert details==[*(f"ok{i}" for i in range(20)),"bad","bad"] and saved["frontiers"]=={"default":{"account":"acct","updated":300,"id":"ok0"}} and len(saved["coverage"])==21 and cid0 in saved["coverage"]
+
+def test_sync_serializes_streamed_checkpoint_and_completed_source(hooks, tmp_path, monkeypatch):
+    _, data = hooks; src = tmp_path/"import.json"; src.write_text("[]"); monkeypatch.setenv("CONVOS_IMPORT_PATHS",str(src)); monkeypatch.setattr(cli,"STATE_PATH",data/"sync_state.json")
+    row=lambda cid,mid,text:cli.ParseResult([dict(id=cid,source="chatgpt",title="T",created_at=None,updated_at=None,model=None,cwd=None,git_branch=None,project_id=None,metadata="{}")],[dict(id=mid,conversation_id=cid,role="user",content=text,thinking=None,created_at=None,model=None,metadata="{}",parent_id=None)])
+    local,web=row("import-c","import-m","local"),row("web-c","web-m","web"); started,active,attempted,overlap=(threading.Event() for _ in range(4)); real,flock=cli.upsert,cli.fcntl.flock
+    def guarded(conn,result):
+        if result.convs and result.convs[0]["id"]=="web-c":
+            active.set()
+            try: out=real(conn,result); started.set(); assert attempted.wait(2); return out
+            finally: active.clear()
+        if active.is_set(): overlap.set(); attempted.set()
+        return real(conn,result)
+    def serialized(fd,op):
+        if active.is_set() and threading.current_thread() is threading.main_thread(): attempted.set()
+        return flock(fd,op)
+    monkeypatch.setattr(cli,"upsert",guarded); monkeypatch.setattr(cli.fcntl,"flock",serialized); monkeypatch.setattr(cli,"parse_source",lambda _:started.wait(2) and local); monkeypatch.setattr(cli,"chatgpt_profiles",lambda _:[None]); monkeypatch.setattr(cli,"chatgpt_cookie_base",lambda *a,**k:({},"https://chatgpt.com")); monkeypatch.setattr(cli,"chatgpt_headers",lambda *a,**k:{}); monkeypatch.setattr(cli,"fetch_json",lambda *a,**k:{"items":[{"id":"web","update_time":1}]}); monkeypatch.setattr(cli,"fetch_chatgpt",lambda *a,**k:k["sink"](web) and cli.ParseResult()); monkeypatch.setattr(cli,"get_cookies",lambda *_:{})
+    cli.sync(False,300,False,False,False,False); db=duckdb.connect(str(data/"convos.db"),read_only=True); assert not overlap.is_set() and set(db.execute("SELECT content FROM messages").fetchall())=={("local",),("web",)}; db.close()
 
 def test_sync_rolls_back_interrupted_chatgpt_checkpoint(hooks, monkeypatch):
     _, data = hooks; monkeypatch.setattr(cli,"STATE_PATH",data/"sync_state.json"); old = {"browser":"safari","head":"default:old:100","frontiers":{"default":{"account":"acct","updated":100}},"coverage":[]}; cli.atomic_json(cli.STATE_PATH,{"web":{"chatgpt":old}}); cid = cli.gen_id("chatgpt","c1"); mid = cli.gen_id("chatgpt","m1")
